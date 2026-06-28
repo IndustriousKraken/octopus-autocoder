@@ -163,6 +163,20 @@ impl DaemonPaths {
         self.alert_state_dir().join(format!("{workspace_basename}.json"))
     }
 
+    /// `<state>/push-block/` — per-workspace push-block markers. A failed
+    /// branch push whose completed work is preserved on the agent branch
+    /// records a marker here (keyed to the workspace, NOT a change directory —
+    /// the carried changes are already archived).
+    pub fn push_block_dir(&self) -> PathBuf {
+        self.state.join("push-block")
+    }
+
+    /// `<state>/push-block/<workspace_basename>.json` — push-block marker for
+    /// the named workspace.
+    pub fn push_block_path(&self, workspace_basename: &str) -> PathBuf {
+        self.push_block_dir().join(format!("{workspace_basename}.json"))
+    }
+
     /// `<state>/pending-audit-runs/` — durable mirror of each repo's
     /// in-memory on-demand audit-run queue (`pending_audit_runs`). One
     /// file per workspace, named `<workspace-basename>.json`. Lives under
@@ -634,6 +648,7 @@ mod tests {
             features: crate::config::FeaturesConfig::default(),
             canonical_rag: None,
             models: None,
+            journal_log: None,
         }
     }
 

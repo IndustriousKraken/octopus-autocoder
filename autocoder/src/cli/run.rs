@@ -46,6 +46,18 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         .context("resolving daemon data paths")?;
     paths::ensure_directories(&daemon_paths)
         .context("creating daemon data directories")?;
+    // Point the unified rotated log sink at `<logs>/journal.*.log` now that the
+    // logs directory is resolved (the global subscriber was installed earlier
+    // with a no-op file writer). Best-effort: a failure logs a WARN and leaves
+    // the stderr/journal sink as the sole destination.
+    let journal_max_files = cfg
+        .journal_log
+        .as_ref()
+        .and_then(|j| j.max_files)
+        .unwrap_or(crate::logging::DEFAULT_JOURNAL_MAX_FILES);
+    if let Err(e) = crate::logging::attach_journal(&daemon_paths.logs, journal_max_files) {
+        tracing::warn!("could not attach the unified journal log file (stderr/journal sink still active): {e:#}");
+    }
     tracing::info!(
         state = %daemon_paths.state.display(),
         cache = %daemon_paths.cache.display(),
@@ -241,7 +253,20 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     {
         tracing::warn!("{warn}");
     }
-    crate::sandbox::init_global(sandbox_mechanism, allow_unsandboxed, global_sandbox_toggles);
+    // The daemon's own config file holds the deployment's credentials (Anthropic
+    // key, GitHub PAT, provider/chatops tokens). Mask its REAL path (canonicalized
+    // to resolve symlinks + a relative spelling) for every sandboxed agent so it
+    // cannot read or edit them. Operators place config in varying locations
+    // (`~/.config/autocoder/`, `~/autocoder/config.yaml`, `/etc/autocoder/`), so
+    // this is resolved at runtime, not hardcoded.
+    let own_secret_paths: Vec<std::path::PathBuf> =
+        vec![std::fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone())];
+    crate::sandbox::init_global(
+        sandbox_mechanism,
+        allow_unsandboxed,
+        global_sandbox_toggles,
+        own_secret_paths,
+    );
 
     // a014: capture the operator's ACTIVATED login-shell environment and seed
     // it (credential-filtered) for every agentic subprocess, so shell-init-

@@ -543,3 +543,192 @@ async fn failure_alert_posted_then_suppressed_within_24h() {
 
     alert_mock.assert_async().await;
 }
+
+/// push-failure-preserves-completed-work: a push failure after a change is
+/// committed writes a workspace-keyed push-block marker (slug + tip) and leaves
+/// the completed work intact on the agent branch (never reset).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_failure_writes_marker_and_preserves_work() {
+    let (_dir, ws) = fixture_workspace_with_broken_remote("pushblock-write");
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    add_committed_change(&ws, "needs-push", "push-block fixture");
+
+    let executor = CompletingExecutorWithDiff {
+        artifact_name: "PB_ART.txt".into(),
+        artifact_text: "x".into(),
+    };
+    let github = GithubConfig {
+        token_env: "X".into(),
+        token: None,
+        owner_tokens: None,
+        fork_owner: None,
+        recreate_fork_on_reinit: false,
+        command_authorization: Default::default(),
+    };
+    let _hook = test_hooks::lock();
+
+    // Push fails (broken remote) AFTER the change is committed + archived.
+    let res = execute_one_pass(
+        &paths,
+        &ws,
+        &fixture_repo(&ws),
+        &executor,
+        &github,
+        None,
+        None,
+        2400u64,
+        u32::MAX,
+        u32::MAX,
+        0,
+        Some(10),
+        &crate::audits::AuditRegistry::default(),
+        None,
+        &std::collections::HashMap::new(),
+        &std::sync::Mutex::new(Vec::new()),
+    )
+    .await;
+    assert!(res.is_err(), "broken-remote push must fail the iteration");
+
+    let marker = crate::push_block::read(&paths, &ws)
+        .expect("push failure must write a push-block marker");
+    assert!(
+        marker.change_slugs.iter().any(|s| s == "needs-push"),
+        "marker records the carried change slug: {:?}",
+        marker.change_slugs
+    );
+    assert!(!marker.tip_commit.is_empty(), "marker records the branch tip");
+
+    // The completed work is preserved on the agent branch: its tip still equals
+    // the recorded marker tip (the push failure did NOT reset the branch).
+    let agent = fixture_repo(&ws).agent_branch;
+    let live_tip = crate::git::rev_parse(&ws, &agent).unwrap();
+    assert_eq!(
+        live_tip, marker.tip_commit,
+        "agent branch must be preserved (not reset) after a push failure"
+    );
+}
+
+/// push-failure-preserves-completed-work: with a matching push-block marker
+/// present, the next pass resumes at the push step and NEVER re-runs the
+/// executor (the work is already committed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_block_resume_skips_executor() {
+    use crate::executor::ResumeHandle;
+    use async_trait::async_trait;
+
+    // Iteration-2 executor: its `run` must never be called on a resume.
+    struct PanicOnRun;
+    #[async_trait]
+    impl Executor for PanicOnRun {
+        async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+            panic!("executor must not run while a push-block hold is active");
+        }
+        async fn resume(&self, _h: ResumeHandle, _a: &str) -> Result<ExecutorOutcome> {
+            unreachable!()
+        }
+    }
+
+    let (_dir, ws) = fixture_workspace_with_broken_remote("pushblock-resume");
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    add_committed_change(&ws, "needs-push", "push-block fixture");
+    let github = GithubConfig {
+        token_env: "X".into(),
+        token: None,
+        owner_tokens: None,
+        fork_owner: None,
+        recreate_fork_on_reinit: false,
+        command_authorization: Default::default(),
+    };
+    let _hook = test_hooks::lock();
+
+    // Iteration 1: complete the change, push fails → marker written.
+    let exec1 = CompletingExecutorWithDiff {
+        artifact_name: "PB_ART.txt".into(),
+        artifact_text: "x".into(),
+    };
+    let r1 = execute_one_pass(
+        &paths, &ws, &fixture_repo(&ws), &exec1, &github, None, None,
+        2400u64, u32::MAX, u32::MAX, 0, Some(10),
+        &crate::audits::AuditRegistry::default(), None,
+        &std::collections::HashMap::new(), &std::sync::Mutex::new(Vec::new()),
+    )
+    .await;
+    assert!(r1.is_err());
+    assert!(crate::push_block::exists(&paths, &ws), "iter 1 writes the marker");
+
+    // Iteration 2: marker present + tip matches → resume path. PanicOnRun proves
+    // the executor is not invoked. Push fails again (broken remote) → Err, marker
+    // refreshed and retained.
+    let r2 = execute_one_pass(
+        &paths, &ws, &fixture_repo(&ws), &PanicOnRun, &github, None, None,
+        2400u64, u32::MAX, u32::MAX, 0, Some(10),
+        &crate::audits::AuditRegistry::default(), None,
+        &std::collections::HashMap::new(), &std::sync::Mutex::new(Vec::new()),
+    )
+    .await;
+    assert!(r2.is_err(), "push still fails on the resume retry");
+    assert!(
+        crate::push_block::exists(&paths, &ws),
+        "marker retained while the push keeps failing"
+    );
+}
+
+/// push-failure-preserves-completed-work: a STALE marker (its tip no longer
+/// matches the agent branch — e.g. a stale post-merge branch) is removed and the
+/// pass proceeds normally (recreate + run executor), rather than wrongly
+/// preserving and force-pushing stale work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_push_block_marker_is_cleared_and_pass_proceeds() {
+    let (_dir, ws) = fixture_workspace_with_broken_remote("pushblock-stale");
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    add_committed_change(&ws, "needs-push", "push-block fixture");
+
+    // Plant a marker whose tip will NOT match the live agent branch.
+    crate::push_block::write(
+        &paths,
+        &ws,
+        &crate::push_block::PushBlock {
+            tip_commit: "0000000000000000000000000000000000000000".into(),
+            change_slugs: vec!["already-merged".into()],
+            reason: "stale".into(),
+            blocked_at: chrono::Utc::now(),
+        },
+    )
+    .unwrap();
+
+    let executor = CompletingExecutorWithDiff {
+        artifact_name: "PB_ART.txt".into(),
+        artifact_text: "x".into(),
+    };
+    let github = GithubConfig {
+        token_env: "X".into(),
+        token: None,
+        owner_tokens: None,
+        fork_owner: None,
+        recreate_fork_on_reinit: false,
+        command_authorization: Default::default(),
+    };
+    let _hook = test_hooks::lock();
+
+    let res = execute_one_pass(
+        &paths, &ws, &fixture_repo(&ws), &executor, &github, None, None,
+        2400u64, u32::MAX, u32::MAX, 0, Some(10),
+        &crate::audits::AuditRegistry::default(), None,
+        &std::collections::HashMap::new(), &std::sync::Mutex::new(Vec::new()),
+    )
+    .await;
+    assert!(res.is_err(), "broken-remote push still fails the iteration");
+
+    // The stale marker was cleared and the normal flow ran (recreate + executor),
+    // so the marker now reflects the freshly-processed change, not the stale one.
+    let marker = crate::push_block::read(&paths, &ws).expect("normal flow re-failed the push");
+    assert_ne!(
+        marker.tip_commit, "0000000000000000000000000000000000000000",
+        "stale marker must have been replaced by a fresh one"
+    );
+    assert!(
+        marker.change_slugs.iter().any(|s| s == "needs-push"),
+        "fresh marker carries the reprocessed change: {:?}",
+        marker.change_slugs
+    );
+}

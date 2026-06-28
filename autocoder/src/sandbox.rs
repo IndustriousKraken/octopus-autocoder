@@ -188,7 +188,10 @@ pub fn engine_deny_read_paths(home: &Path) -> Vec<String> {
 // …) work without enumeration, EXCEPT this bounded set of sensitive paths
 // which is masked. Two categories: credential paths (read-protection) AND
 // shell-init/persistence paths (write-protection). The other-CLI-store subset
-// is NOT here — it is added dynamically and governed by `os_hide`.
+// is NOT here — it is added dynamically and governed by `os_hide`. The daemon's
+// OWN resolved config + secrets paths are likewise added dynamically (from
+// `RunSandbox::own_secret_paths`, resolved at startup) and masked unconditionally
+// — they cannot be hardcoded here because operators place config at varying paths.
 // ---------------------------------------------------------------------------
 
 /// Default mask-list entries, relative to `$HOME`. Masks apply even inside
@@ -409,6 +412,14 @@ pub struct SandboxPlan {
     /// CLI with no project scratch. Applied AFTER the workspace bind so the
     /// overlay wins.
     pub workspace_scratch: Vec<PathBuf>,
+    /// The directory holding the per-repository workspaces (the run workspace's
+    /// parent), bound READ-ONLY under the denylist so the executor's read-write
+    /// home does NOT extend write access to SIBLING repositories' workspaces.
+    /// The role's OWN workspace bind (above) is nested deeper and re-grants its
+    /// posture, so siblings are read-only while the own workspace keeps its rw
+    /// (executor) / ro (read-only role) posture. `None` under strict mode (home
+    /// already masked) or when the parent would be the home itself.
+    pub siblings_ro: Option<PathBuf>,
 }
 
 /// The program + args + explicit env of the strategy-built inner command,
@@ -512,6 +523,13 @@ pub fn systemd_run_argv(plan: &SandboxPlan, inner: &InnerCommand) -> Vec<OsStrin
             prop(&mut argv, "ReadWritePaths", plan.home.as_os_str());
             for e in mask {
                 prop(&mut argv, "InaccessiblePaths", e.path.as_os_str());
+            }
+            // Sibling workspaces read-only: bind the workspaces-parent ro. The
+            // own workspace's `ReadWritePaths` (above) is a deeper path, so
+            // systemd's most-specific-wins keeps it writable inside this ro
+            // parent — siblings stay read-only.
+            if let Some(par) = &plan.siblings_ro {
+                prop(&mut argv, "BindReadOnlyPaths", par.as_os_str());
             }
         }
         FsPolicy::Allowlist {
@@ -624,6 +642,15 @@ pub fn bwrap_argv(plan: &SandboxPlan, inner: &InnerCommand) -> Vec<OsString> {
                     argv.push(e.path.as_os_str().to_os_string());
                 }
             }
+            // Sibling workspaces read-only: ro-bind the workspaces-parent. The
+            // own workspace `--bind` comes LATER (below), and bwrap is
+            // last-mount-wins for overlapping paths, so the own workspace keeps
+            // its rw/ro posture while siblings stay read-only.
+            if let Some(par) = &plan.siblings_ro {
+                push(&mut argv, "--ro-bind");
+                argv.push(par.as_os_str().to_os_string());
+                argv.push(par.as_os_str().to_os_string());
+            }
         }
         FsPolicy::Allowlist {
             self_stores,
@@ -731,6 +758,21 @@ pub fn seatbelt_profile(plan: &SandboxPlan) -> String {
                     "(deny file-read* file-write* (subpath {}))\n",
                     sb_quote(&e.path)
                 ));
+            }
+            // Sibling workspaces read-only: deny writes to the workspaces-parent,
+            // then (executor) re-allow writes to the OWN workspace. Last-match-wins,
+            // so the own workspace stays writable while siblings are write-denied.
+            if let Some(par) = &plan.siblings_ro {
+                out.push_str(&format!(
+                    "(deny file-write* (subpath {}))\n",
+                    sb_quote(par)
+                ));
+                if plan.workspace_writable {
+                    out.push_str(&format!(
+                        "(allow file-write* (subpath {}))\n",
+                        sb_quote(&plan.workspace)
+                    ));
+                }
             }
             // Capability-drop analogs.
             out.push_str("(deny process-info*)\n");
@@ -977,6 +1019,10 @@ pub struct RunSandbox {
     pub mask_add: Vec<String>,
     /// a013: default mask-list entries the operator removed (exposed).
     pub mask_remove: Vec<String>,
+    /// The daemon's OWN config (+ secrets) file paths, always masked (read- AND
+    /// write-protected) regardless of `mask_remove`, so a spawned agent cannot
+    /// read or edit the deployment's credentials.
+    pub own_secret_paths: Vec<PathBuf>,
 }
 
 impl Default for RunSandbox {
@@ -992,6 +1038,7 @@ impl Default for RunSandbox {
             strict_mode: false,
             mask_add: Vec::new(),
             mask_remove: Vec::new(),
+            own_secret_paths: Vec::new(),
         }
     }
 }
@@ -1007,6 +1054,7 @@ impl RunSandbox {
         cli: CliKind,
         workspace_writable: bool,
         toggles: crate::config::SandboxToggles,
+        own_secret_paths: Vec<PathBuf>,
     ) -> Self {
         Self {
             enforce: true,
@@ -1019,6 +1067,7 @@ impl RunSandbox {
             strict_mode: toggles.strict_mode,
             mask_add: toggles.mask_add,
             mask_remove: toggles.mask_remove,
+            own_secret_paths,
         }
     }
 
@@ -1069,6 +1118,10 @@ impl RunSandbox {
                 }
             }
         }
+        // The daemon's OWN config + secrets paths are masked unconditionally —
+        // NOT subject to `mask_remove` — so an agent can never read or edit the
+        // deployment's credentials (or disable its own sandbox via the config).
+        paths.extend(self.own_secret_paths.iter().cloned());
         dedup_paths(paths)
             .into_iter()
             .filter_map(|p| {
@@ -1140,6 +1193,19 @@ impl RunSandbox {
         // A read-only role's workspace is read-only, but its CLI may need a
         // project-local scratch dir; overlay that subtree writable+ephemeral.
         let workspace_scratch = self.workspace_scratch_dirs(workspace);
+        // Under the denylist (exposed read-write home), bind the workspaces-parent
+        // read-only so the executor's home-rw does NOT extend write access to
+        // sibling repositories' workspaces. Skipped under strict mode (home is
+        // already masked) and when the parent would be the home itself (binding
+        // that read-only would defeat the denylist's home-rw exposure).
+        let siblings_ro = if self.uses_denylist() {
+            workspace
+                .parent()
+                .filter(|par| !home.starts_with(par))
+                .map(|par| par.to_path_buf())
+        } else {
+            None
+        };
         SandboxPlan {
             workspace: workspace.to_path_buf(),
             workspace_writable: self.workspace_writable,
@@ -1149,6 +1215,7 @@ impl RunSandbox {
             // when the relay is configured; the plan builder itself adds none.
             extra_ro_paths: Vec::new(),
             workspace_scratch,
+            siblings_ro,
         }
     }
 
@@ -1185,6 +1252,11 @@ struct GlobalSandbox {
     /// The global (`executor.sandbox`) resolved toggles — the fallback when
     /// no per-repo override is active.
     global_toggles: SandboxToggles,
+    /// The daemon's OWN resolved config (and any secrets) file paths, masked
+    /// for every sandboxed role so a spawned agent cannot read or edit the
+    /// deployment's credentials. Resolved at startup from the loaded config,
+    /// not a hardcoded location (operators place config in varying paths).
+    own_secret_paths: Vec<PathBuf>,
 }
 
 static GLOBAL: OnceLock<GlobalSandbox> = OnceLock::new();
@@ -1199,10 +1271,12 @@ pub fn init_global(
     mechanism: Option<SandboxMechanism>,
     allow_unsandboxed: bool,
     global_toggles: SandboxToggles,
+    own_secret_paths: Vec<PathBuf>,
 ) {
     let _ = GLOBAL.set(GlobalSandbox {
         mechanism,
         allow_unsandboxed,
+        own_secret_paths,
         global_toggles,
     });
 }
@@ -1249,7 +1323,14 @@ pub fn current_run_sandbox(cli: CliKind, workspace_writable: bool) -> RunSandbox
                 .ok()
                 .and_then(|a| a.clone())
                 .unwrap_or_else(|| g.global_toggles.clone());
-            RunSandbox::for_role(g.mechanism, g.allow_unsandboxed, cli, workspace_writable, toggles)
+            RunSandbox::for_role(
+                g.mechanism,
+                g.allow_unsandboxed,
+                cli,
+                workspace_writable,
+                toggles,
+                g.own_secret_paths.clone(),
+            )
         }
     }
 }
@@ -1379,6 +1460,7 @@ mod tests {
             policy: FsPolicy::Denylist { mask },
             extra_ro_paths: Vec::new(),
             workspace_scratch: Vec::new(),
+            siblings_ro: None,
         }
     }
 
@@ -1401,7 +1483,66 @@ mod tests {
             home,
             extra_ro_paths: Vec::new(),
             workspace_scratch: Vec::new(),
+            siblings_ro: None,
         }
+    }
+
+    /// B+D: the daemon's OWN resolved config path is masked for a denylist
+    /// role, AND `mask_remove` cannot expose it (it's a non-removable
+    /// credential-protection guarantee).
+    #[test]
+    fn denylist_masks_daemon_own_config_even_against_mask_remove() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = home.path().join("autocoder-config.yaml");
+        std::fs::write(&cfg, "token: secret\n").unwrap();
+        let ws = home.path().join(".cache/autocoder/workspaces/repo-x");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let run = RunSandbox {
+            workspace_writable: true,
+            // Operator (or attacker) tries to expose it — must not work.
+            mask_remove: vec![cfg.to_string_lossy().into_owned()],
+            own_secret_paths: vec![cfg.clone()],
+            ..Default::default()
+        };
+        let mask = run.resolve_mask_list(home.path());
+        assert!(
+            mask.iter().any(|e| e.path == cfg),
+            "daemon's own config must be masked despite mask_remove: {mask:?}"
+        );
+        let plan = run.build_plan_with_home(&ws, home.path(), OsStr::new("claude"));
+        let argv = osv(&systemd_run_argv(&plan, &inner()));
+        assert!(
+            argv.iter().any(|a| a == &format!("--property=InaccessiblePaths={}", cfg.display())),
+            "systemd argv must mask the daemon config: {argv:?}"
+        );
+    }
+
+    /// B+D: under the denylist the workspaces-parent is bound read-only while the
+    /// executor's own workspace stays read-write — siblings are read-only.
+    #[test]
+    fn denylist_binds_sibling_workspaces_readonly() {
+        let home = PathBuf::from("/home/u");
+        let parent = home.join(".cache/autocoder/workspaces");
+        let ws = parent.join("repo-x");
+        let run = RunSandbox {
+            workspace_writable: true,
+            ..Default::default()
+        };
+        let plan = run.build_plan_with_home(&ws, &home, OsStr::new("claude"));
+        assert_eq!(plan.siblings_ro.as_deref(), Some(parent.as_path()));
+
+        // systemd: parent ro, own workspace rw.
+        let sd = osv(&systemd_run_argv(&plan, &inner()));
+        assert!(sd.iter().any(|a| a == &format!("--property=BindReadOnlyPaths={}", parent.display())));
+        assert!(sd.iter().any(|a| a == &format!("--property=ReadWritePaths={}", ws.display())));
+
+        // bwrap: --ro-bind parent ... then --bind ws (own rw wins, last mount).
+        let bw = osv(&bwrap_argv(&plan, &inner()));
+        let ro_at = bw.iter().position(|a| a == &parent.to_string_lossy());
+        let rw_at = bw.iter().rposition(|a| a == &ws.to_string_lossy());
+        assert!(ro_at.is_some() && rw_at.is_some(), "parent ro-bind + own ws bind present: {bw:?}");
+        assert!(ro_at.unwrap() < rw_at.unwrap(), "own workspace bind must come after the parent ro-bind so it wins");
     }
 
     /// A sample mask: a directory (`~/.ssh`) AND a file inside an exposed tree
@@ -1815,6 +1956,7 @@ mod tests {
             CliKind::Claude,
             false,
             crate::config::SandboxToggles::default(),
+         Vec::new(),
         );
         assert!(run_on.uses_denylist());
         let mask_on = run_on.resolve_mask_list(home.path());
@@ -1836,6 +1978,7 @@ mod tests {
             CliKind::Claude,
             false,
             off.clone(),
+         Vec::new(),
         );
         let mask_off = run_off.resolve_mask_list(home.path());
         assert!(
@@ -1857,6 +2000,7 @@ mod tests {
             CliKind::Claude,
             false,
             strict_on,
+         Vec::new(),
         );
         match &run_strict_on
             .build_plan_with_home(&ws, home.path(), OsStr::new("claude"))
@@ -1887,6 +2031,7 @@ mod tests {
             CliKind::Claude,
             false,
             strict_off,
+         Vec::new(),
         );
         match &run_strict_off
             .build_plan_with_home(&ws, home.path(), OsStr::new("claude"))
@@ -1914,7 +2059,7 @@ mod tests {
             engine_deny: false,
             ..Default::default()
         };
-        let run = RunSandbox::for_role(None, true, CliKind::Claude, true, toggles);
+        let run = RunSandbox::for_role(None, true, CliKind::Claude, true, toggles, Vec::new());
         assert!(run.engine_deny_paths().is_empty());
     }
 
@@ -2008,7 +2153,7 @@ mod tests {
             ..Default::default()
         };
         let run =
-            RunSandbox::for_role(Some(SandboxMechanism::Bwrap), false, CliKind::Claude, true, toggles);
+            RunSandbox::for_role(Some(SandboxMechanism::Bwrap), false, CliKind::Claude, true, toggles, Vec::new());
         let mask = run.resolve_mask_list(h);
 
         // The removed default (.ssh) is exposed; the credentials FILE is still
@@ -2120,6 +2265,7 @@ mod tests {
             },
             extra_ro_paths: Vec::new(),
             workspace_scratch: Vec::new(),
+            siblings_ro: None,
         };
         let p = seatbelt_profile(&plan);
         assert!(p.contains("(deny default)"));
@@ -2151,6 +2297,7 @@ mod tests {
             CliKind::Claude,
             true,
             crate::config::SandboxToggles::default(),
+         Vec::new(),
         );
         assert!(exec.uses_denylist());
         assert!(matches!(
@@ -2167,6 +2314,7 @@ mod tests {
             CliKind::Claude,
             false,
             crate::config::SandboxToggles::default(),
+         Vec::new(),
         );
         assert!(ro.uses_denylist());
         let ro_plan = ro.build_plan_with_home(&ws, h, OsStr::new("claude"));
@@ -2187,6 +2335,7 @@ mod tests {
             CliKind::Claude,
             true,
             strict_toggles,
+         Vec::new(),
         );
         assert!(!strict.uses_denylist());
         let plan = strict.build_plan_with_home(&ws, h, OsStr::new("claude"));
@@ -2212,6 +2361,7 @@ mod tests {
             CliKind::Opencode,
             false,
             crate::config::SandboxToggles::default(),
+         Vec::new(),
         );
         let plan = ro.build_plan_with_home(&ws, h, OsStr::new("opencode"));
         assert_eq!(plan.workspace_scratch, vec![scratch.clone()]);
@@ -2251,6 +2401,7 @@ mod tests {
             CliKind::Claude,
             false,
             crate::config::SandboxToggles::default(),
+         Vec::new(),
         );
         assert!(
             ro_claude
@@ -2267,6 +2418,7 @@ mod tests {
             CliKind::Opencode,
             true,
             crate::config::SandboxToggles::default(),
+         Vec::new(),
         );
         assert!(
             exec.build_plan_with_home(&ws, h, OsStr::new("opencode"))
@@ -2347,6 +2499,7 @@ mod tests {
             CliKind::Claude,
             true,
             crate::config::SandboxToggles::default(),
+         Vec::new(),
         );
         let plan = run.build_plan_with_home(&ws, h, OsStr::new("true"));
 
@@ -2395,6 +2548,7 @@ mod tests {
             CliKind::Claude,
             true,
             crate::config::SandboxToggles::default(),
+         Vec::new(),
         );
         let plan = run.build_plan_with_home(&ws, h, OsStr::new("true"));
         let _ = run_wrapped(
@@ -2446,6 +2600,7 @@ mod tests {
             CliKind::Claude,
             false,
             crate::config::SandboxToggles::default(),
+         Vec::new(),
         );
         let plan = run.build_plan_with_home(&ws, h, link.as_os_str());
 
@@ -2513,6 +2668,7 @@ mod tests {
             CliKind::Opencode,
             false,
             crate::config::SandboxToggles::default(),
+         Vec::new(),
         );
         let plan = run.build_plan_with_home(&ws, h, OsStr::new("true"));
 
@@ -2545,6 +2701,110 @@ mod tests {
         }
     }
 
+    // B+D 3.1: the daemon's own config is unreadable AND unwritable from inside
+    // the sandbox, even via a plain `cat`/redirect (enforced by the kernel).
+    #[test]
+    fn enforced_daemon_config_masked() {
+        if detect_mechanism().is_none() {
+            eprintln!("skipping: no sandbox mechanism");
+            return;
+        }
+        let home = test_home();
+        let h = home.path();
+        let ws = h.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let cfg = h.join("autocoder-config.yaml");
+        std::fs::write(&cfg, "github_token: ghp_SECRET\n").unwrap();
+
+        let run = RunSandbox::for_role(
+            detect_mechanism(),
+            false,
+            CliKind::Claude,
+            true, // executor (rw home + rw workspace) — the most-exposed role
+            crate::config::SandboxToggles::default(),
+            vec![cfg.clone()],
+        );
+        let plan = run.build_plan_with_home(&ws, h, OsStr::new("true"));
+
+        let read = run_wrapped(&plan, "cat", &[&cfg.to_string_lossy()]);
+        assert!(!read.status.success(), "reading the daemon config must fail");
+        assert!(
+            !String::from_utf8_lossy(&read.stdout).contains("ghp_SECRET"),
+            "the secret must not leak through the mask"
+        );
+        let write = run_wrapped(
+            &plan,
+            "sh",
+            &["-c", &format!("echo PWN > {}", cfg.display())],
+        );
+        assert!(!write.status.success(), "writing the daemon config must fail");
+        assert_eq!(
+            std::fs::read_to_string(&cfg).unwrap(),
+            "github_token: ghp_SECRET\n",
+            "the host config must be untouched"
+        );
+    }
+
+    // B+D 3.2: a sibling workspace is readable but NOT writable/deletable, while
+    // the executor's own workspace stays writable (enforced).
+    #[test]
+    fn enforced_sibling_workspace_readonly() {
+        if detect_mechanism().is_none() {
+            eprintln!("skipping: no sandbox mechanism");
+            return;
+        }
+        let home = test_home();
+        let h = home.path();
+        let parent = h.join("workspaces");
+        let own = parent.join("repo-self");
+        let sibling = parent.join("repo-other");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("f"), "SIB").unwrap();
+
+        let run = RunSandbox::for_role(
+            detect_mechanism(),
+            false,
+            CliKind::Claude,
+            true, // executor
+            crate::config::SandboxToggles::default(),
+            Vec::new(),
+        );
+        let plan = run.build_plan_with_home(&own, h, OsStr::new("true"));
+        assert_eq!(plan.siblings_ro.as_deref(), Some(parent.as_path()));
+
+        // Read a sibling: allowed.
+        let read = run_wrapped(&plan, "cat", &[&sibling.join("f").to_string_lossy()]);
+        assert!(read.status.success(), "reading a sibling workspace must succeed");
+        // Write a sibling: denied.
+        let wsib = run_wrapped(
+            &plan,
+            "sh",
+            &["-c", &format!("echo X > {}", sibling.join("f").display())],
+        );
+        assert!(!wsib.status.success(), "writing a sibling workspace must fail");
+        assert_eq!(std::fs::read_to_string(sibling.join("f")).unwrap(), "SIB");
+        // Delete a sibling file: denied.
+        let dsib = run_wrapped(
+            &plan,
+            "sh",
+            &["-c", &format!("rm -f {}", sibling.join("f").display())],
+        );
+        assert!(!dsib.status.success(), "deleting a sibling workspace file must fail");
+        assert!(sibling.join("f").exists());
+        // Write within the OWN workspace: allowed.
+        let wown = run_wrapped(
+            &plan,
+            "sh",
+            &["-c", &format!("echo OK > {}", own.join("mine").display())],
+        );
+        assert!(
+            wown.status.success(),
+            "writing the own workspace must succeed: {:?}",
+            String::from_utf8_lossy(&wown.stderr)
+        );
+    }
+
     // task 5.5: strict mode masks ALL of home for the executor (even the
     // toolchain), while keeping the workspace writable.
     #[test]
@@ -2564,7 +2824,7 @@ mod tests {
             strict_mode: true,
             ..Default::default()
         };
-        let run = RunSandbox::for_role(detect_mechanism(), false, CliKind::Claude, true, toggles);
+        let run = RunSandbox::for_role(detect_mechanism(), false, CliKind::Claude, true, toggles, Vec::new());
         let plan = run.build_plan_with_home(&ws, h, OsStr::new("true"));
 
         // Strict = allowlist: even the toolchain under home is masked.
@@ -2604,6 +2864,7 @@ mod tests {
             CliKind::Claude,
             true,
             crate::config::SandboxToggles::default(),
+         Vec::new(),
         );
         let plan = run.build_plan_with_home(&ws, h, OsStr::new("python3"));
         // Exit 0 only if a raw packet socket opened (which the dropped

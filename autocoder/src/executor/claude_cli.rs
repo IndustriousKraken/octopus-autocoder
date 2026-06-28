@@ -1894,17 +1894,32 @@ fn persist_run_log(
         );
         return;
     }
+    // APPEND (not truncate) under a run-divider so a re-invocation for the same
+    // change preserves the prior run's transcript instead of erasing it. A
+    // leading blank line separates this run from a prior one already on disk.
+    use std::io::Write;
+    let sep = std::fs::metadata(&path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
     let body = format!(
-        "=== PROMPT ({p} bytes) ===\n{prompt}\n=== STDOUT ({n} bytes) ===\n{stdout}\n=== STDERR ({m} bytes) ===\n{stderr}\n",
+        "{lead}{prefix}{ts} ===\n=== PROMPT ({p} bytes) ===\n{prompt}\n=== STDOUT ({n} bytes) ===\n{stdout}\n=== STDERR ({m} bytes) ===\n{stderr}\n",
+        lead = if sep { "\n" } else { "" },
+        prefix = crate::executor::event_log::RUN_LOG_DIVIDER_PREFIX,
+        ts = chrono::Utc::now().to_rfc3339(),
         p = prompt.len(),
         n = outcome.stdout.len(),
         m = outcome.stderr.len(),
         stdout = outcome.stdout,
         stderr = outcome.stderr,
     );
-    match std::fs::write(&path, body) {
-        Ok(()) => tracing::info!(path = %path.display(), "run log written"),
-        Err(e) => tracing::warn!(path = %path.display(), "writing run log failed: {e}"),
+    match std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .and_then(|mut f| f.write_all(body.as_bytes()))
+    {
+        Ok(()) => tracing::info!(path = %path.display(), "run log appended"),
+        Err(e) => tracing::warn!(path = %path.display(), "appending run log failed: {e}"),
     }
 }
 

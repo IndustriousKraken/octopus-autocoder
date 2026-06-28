@@ -62,6 +62,36 @@ pub async fn execute_one_pass(
         }
     };
 
+    // Push-block resume (orchestrator-cli "Branch-push failure preserves
+    // completed work via a push-block hold"): a prior pass committed work whose
+    // branch push failed; the branch was preserved (not recreated). If the marker
+    // is present AND the live agent-branch tip still matches it, resume at the
+    // push step — never re-run the executor. A stale marker (tip moved / branch
+    // gone) is removed and the pass proceeds normally. Checked here, before any
+    // branch mutation, so the preserved commits are never overwritten.
+    if let Some(marker) = crate::push_block::read(paths, workspace) {
+        let live_tip = git::rev_parse(workspace, &repo.agent_branch).ok();
+        if live_tip.as_deref() == Some(marker.tip_commit.as_str()) {
+            return resume_push_block(
+                paths,
+                workspace,
+                repo,
+                github_cfg,
+                reviewer,
+                revision_cap,
+                chatops_ctx,
+                &mut guard,
+                marker,
+            )
+            .await;
+        }
+        tracing::info!(
+            url = %repo.url,
+            "push-block marker is stale (agent-branch tip no longer matches); removing it and proceeding normally"
+        );
+        let _ = crate::push_block::clear(paths, workspace);
+    }
+
     // Run the PR-comment revision dispatcher BEFORE the open-PR
     // short-circuit so revisions reach open PRs. A v1 simplification:
     // when `revision_cap` is `0`, the feature is disabled entirely.
@@ -163,6 +193,41 @@ pub async fn execute_one_pass(
     };
     let _ = guard.set_stage(busy_marker::Stage::Push);
     if let Err(e) = git::push_force_with_lease(workspace, &repo.agent_branch, push_remote) {
+        // The changes are committed + archived on the agent branch but the push
+        // failed. Preserve the completed work: write a push-block marker anchored
+        // to the branch tip so the next pass resumes at the push step instead of
+        // recreating the branch and re-implementing (orchestrator-cli "Branch-push
+        // failure preserves completed work via a push-block hold"). Audit-only
+        // passes (no processed changes) keep the old behavior — their commits are
+        // cheap to regenerate.
+        if !processed.is_empty() {
+            match git::rev_parse(workspace, &repo.agent_branch) {
+                Ok(tip) => {
+                    let marker = crate::push_block::PushBlock {
+                        tip_commit: tip,
+                        change_slugs: processed.clone(),
+                        reason: format!("{e:#}"),
+                        blocked_at: chrono::Utc::now(),
+                    };
+                    match crate::push_block::write(paths, workspace, &marker) {
+                        Ok(()) => tracing::warn!(
+                            url = %repo.url,
+                            slugs = ?processed,
+                            "branch push failed; preserved completed work on {} via push-block hold (no re-implementation next pass)",
+                            repo.agent_branch
+                        ),
+                        Err(we) => tracing::warn!(
+                            url = %repo.url,
+                            "failed to write push-block marker (work still on branch): {we:#}"
+                        ),
+                    }
+                }
+                Err(re) => tracing::warn!(
+                    url = %repo.url,
+                    "branch push failed and the agent-branch tip could not be resolved for a push-block marker ({re:#}); work remains on the branch but the next pass will recreate it"
+                ),
+            }
+        }
         handle_predictable_failure(
             paths,
             workspace,
@@ -203,6 +268,99 @@ pub async fn execute_one_pass(
         tracing::warn!(
             url = %repo.url,
             "failed to clear alert-state on success: {e:#}"
+        );
+    }
+    // Defensive: a clean push leaves no push-block hold. (A matching marker
+    // would have routed through resume_push_block; a stale one was cleared
+    // pre-walk.) Idempotent — a no-op when no marker exists.
+    let _ = crate::push_block::clear(paths, workspace);
+    Ok(())
+}
+
+/// Resume a preserved push from a prior pass whose branch push failed (the
+/// push-block marker is present and the agent-branch tip still matches it). The
+/// completed work stays on the branch — the executor is NEVER re-run. Retry the
+/// push only; on success open a PR derived from the carried change slugs and
+/// remove the marker; on failure refresh the marker reason and re-alert (the work
+/// stays preserved). See orchestrator-cli "Branch-push failure preserves
+/// completed work via a push-block hold".
+#[allow(clippy::too_many_arguments)]
+async fn resume_push_block(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    reviewer: Option<&CodeReviewer>,
+    revision_cap: u32,
+    chatops_ctx: Option<&ChatOpsContext>,
+    guard: &mut busy_marker::BusyGuard,
+    marker: crate::push_block::PushBlock,
+) -> Result<()> {
+    tracing::info!(
+        url = %repo.url,
+        slugs = ?marker.change_slugs,
+        "push-block hold: retrying push of preserved work on {} (no re-implementation)",
+        repo.agent_branch
+    );
+    let push_remote = if github_cfg.fork_owner.is_some() {
+        "fork"
+    } else {
+        "origin"
+    };
+    let _ = guard.set_stage(busy_marker::Stage::Push);
+    if let Err(e) = git::push_force_with_lease(workspace, &repo.agent_branch, push_remote) {
+        // Still blocked. Refresh the marker's reason and re-alert (the work stays
+        // preserved on the branch; the next pass retries the cheap push again).
+        let updated = crate::push_block::PushBlock {
+            reason: format!("{e:#}"),
+            ..marker
+        };
+        let _ = crate::push_block::write(paths, workspace, &updated);
+        handle_predictable_failure(
+            paths,
+            workspace,
+            &repo.url,
+            chatops_ctx,
+            chatops_ctx
+                .map(|c| c.failure_alerts_enabled)
+                .unwrap_or(false),
+            AlertCategory::BranchPushFailure,
+            &e,
+        )
+        .await;
+        return Err(e);
+    }
+    // Push succeeded. Open the PR from the carried slugs (body derived from the
+    // archived changes' commits — the reviewer/gates already ran in the original
+    // pass), then remove the hold and reset alert throttles.
+    let _ = guard.set_stage(busy_marker::Stage::Pr);
+    open_pull_request(
+        paths,
+        repo,
+        github_cfg,
+        &marker.change_slugs,
+        false,
+        None,
+        reviewer,
+        revision_cap,
+        false,
+        &[],
+        chatops_ctx,
+        workspace,
+        None,
+        None,
+    )
+    .await?;
+    if let Err(e) = crate::push_block::clear(paths, workspace) {
+        tracing::warn!(
+            url = %repo.url,
+            "failed to clear push-block marker after a successful resume push: {e:#}"
+        );
+    }
+    if let Err(e) = AlertState::clear(paths, workspace) {
+        tracing::warn!(
+            url = %repo.url,
+            "failed to clear alert-state on resume success: {e:#}"
         );
     }
     Ok(())
