@@ -350,6 +350,24 @@ pub fn branch_force_move(workspace: &Path, branch: &str, target: &str) -> Result
     Ok(())
 }
 
+/// `git rm --cached <path>` — remove a file from the git index (stop tracking
+/// it) without deleting it from disk. Idempotent: if the path is not tracked,
+/// git exits non-zero which is mapped to Ok (the desired state is already met).
+pub fn rm_cached(workspace: &Path, path: &str) -> Result<()> {
+    // Ignore exit-1 ("not in index") — that is the desired end state.
+    match run_git(workspace, "rm --cached", &["rm", "--cached", path]) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("did not match any files") || msg.contains("pathspec") {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 /// `true` when a local branch named `branch` exists, probed via
 /// `git rev-parse --verify --quiet refs/heads/<branch>` (the exit code is the
 /// stable signal across git versions, unlike the stderr string). `Err` only

@@ -25,6 +25,17 @@ pub struct PushBlock {
     /// The git push rejection reason (captured stderr).
     pub reason: String,
     pub blocked_at: DateTime<Utc>,
+    /// Code-review report from the original pass. Preserved so the resumed
+    /// open_pull_request call can include the review in the PR body instead
+    /// of silently dropping it.
+    #[serde(default)]
+    pub review_report: Option<crate::code_reviewer::ReviewReport>,
+    /// Rendered `## Spec Verification` PR body section from the original pass.
+    #[serde(default)]
+    pub spec_verification_section: Option<String>,
+    /// Rendered `## Gate verdicts` PR body section from the original pass.
+    #[serde(default)]
+    pub gate_verdicts_section: Option<String>,
 }
 
 fn basename(workspace: &Path) -> String {

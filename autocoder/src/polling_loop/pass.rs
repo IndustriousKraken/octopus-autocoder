@@ -208,6 +208,9 @@ pub async fn execute_one_pass(
                         change_slugs: processed.clone(),
                         reason: format!("{e:#}"),
                         blocked_at: chrono::Utc::now(),
+                        review_report: review_report.clone(),
+                        spec_verification_section: spec_verification_section.clone(),
+                        gate_verdicts_section: gate_verdicts_section.clone(),
                     };
                     match crate::push_block::write(paths, workspace, &marker) {
                         Ok(()) => tracing::warn!(
@@ -340,25 +343,30 @@ async fn resume_push_block(
         .await;
         return Err(e);
     }
-    // Push succeeded. Open the PR from the carried slugs (body derived from the
-    // archived changes' commits — the reviewer/gates already ran in the original
-    // pass), then remove the hold and reset alert throttles.
+    // Push succeeded. Open the PR from the carried slugs, restoring the
+    // review report and gate sections that were computed in the original
+    // pass (stored in the marker) so the PR body includes them.
     let _ = guard.set_stage(busy_marker::Stage::Pr);
+    let revision_concerns: Vec<_> = marker
+        .review_report
+        .as_ref()
+        .map(|r| r.concerns.clone())
+        .unwrap_or_default();
     open_pull_request(
         paths,
         repo,
         github_cfg,
         &marker.change_slugs,
         false,
-        None,
+        marker.review_report.as_ref(),
         reviewer,
         revision_cap,
         false,
-        &[],
+        &revision_concerns,
         chatops_ctx,
         workspace,
-        None,
-        None,
+        marker.spec_verification_section.as_deref(),
+        marker.gate_verdicts_section.as_deref(),
     )
     .await?;
     if let Err(e) = crate::push_block::clear(paths, workspace) {
