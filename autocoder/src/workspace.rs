@@ -248,6 +248,30 @@ pub fn ensure_initialized(
             "could not register per-run CLI artifact + build-output excludes in .git/info/exclude: {e:#}"
         );
     }
+    // Un-track CLI artifact files that were accidentally committed before the
+    // local-exclude guard existed. `.git/info/exclude` only suppresses untracked
+    // files — if opencode.json or .mcp.json was committed in a prior pass it stays
+    // tracked despite the exclude. `git rm --cached` removes it from the index so
+    // it is treated as untracked going forward; the file on disk is untouched.
+    // Best-effort: failures are logged but never abort init.
+    for artifact in crate::agentic_run::WORKSPACE_CLI_ARTIFACT_EXCLUDES {
+        // Only attempt rm --cached for plain files (directories have a trailing /
+        // in the excludes list, skip them — `git rm -r --cached` on .opencode/
+        // would remove all files under it including legitimate tracked content).
+        if artifact.ends_with('/') {
+            continue;
+        }
+        let path = workspace.join(artifact);
+        if path.exists() {
+            if let Err(e) = crate::git::rm_cached(workspace, artifact) {
+                tracing::debug!(
+                    workspace = %workspace.display(),
+                    artifact,
+                    "git rm --cached for tracked CLI artifact: {e:#}"
+                );
+            }
+        }
+    }
     // One-time migration of any legacy iteration-pending markers (a27a1
     // originally placed them at <workspace>/openspec/changes/<change>/.iteration-pending.json,
     // where `git clean -fd` periodically wiped them). The marker now

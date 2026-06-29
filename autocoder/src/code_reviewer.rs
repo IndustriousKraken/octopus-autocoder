@@ -46,7 +46,7 @@ const DEFAULT_TEMPLATE: &str = include_str!("../../prompts/code-review-default.m
 /// and the documented baseline. Operators override via `config.yaml`.
 const DEFAULT_PROMPT_BUDGET: usize = 2_000_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewVerdict {
     Pass,
     Concerns,
@@ -60,7 +60,7 @@ pub enum ReviewVerdict {
     FailedToRun,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewReport {
     pub verdict: ReviewVerdict,
     pub markdown: String,
@@ -90,7 +90,7 @@ pub struct ReviewReport {
 /// `## Code Review: <change_slug>` heading. The `markdown` body includes
 /// the per-change verdict + concerns + revision-requests in the same
 /// format the bundled-mode `## Code Review` block uses.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerChangeSection {
     pub change_slug: String,
     pub markdown: String,
