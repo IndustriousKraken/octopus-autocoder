@@ -101,6 +101,9 @@ mod tests {
             change_slugs: vec!["foo".into(), "bar".into()],
             reason: "remote: error: GH006 Protected branch update failed".into(),
             blocked_at: Utc::now(),
+            review_report: None,
+            spec_verification_section: None,
+            gate_verdicts_section: None,
         };
         write(&paths, &ws, &marker).unwrap();
         assert!(exists(&paths, &ws));

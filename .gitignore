@@ -15,5 +15,12 @@ target/
 # Application Config
 config.yaml
 
+# Per-run CLI agent configs (machine-local, written by the daemon per
+# workspace). MUST NOT be committed — the workspace manager explicitly
+# excludes them via .git/info/exclude for target repos; the same applies
+# to this repo's own root. See agentic_run::WORKSPACE_CLI_ARTIFACT_EXCLUDES.
+opencode.json
+.mcp.json
+
 # Daemon bookkeeping markers (untracked, never committed)
 **/.priority.json

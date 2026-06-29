@@ -692,6 +692,9 @@ async fn stale_push_block_marker_is_cleared_and_pass_proceeds() {
             change_slugs: vec!["already-merged".into()],
             reason: "stale".into(),
             blocked_at: chrono::Utc::now(),
+            review_report: None,
+            spec_verification_section: None,
+            gate_verdicts_section: None,
         },
     )
     .unwrap();
