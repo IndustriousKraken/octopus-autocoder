@@ -471,10 +471,18 @@ async fn prepare_workspace_for_pass(
     // Best-effort — failures log a WARN but never block the iteration.
     opportunistic_upstream_fetch(workspace, repo);
     git::checkout(workspace, &repo.base_branch)?;
-    // reset --hard instead of pull --ff-only so a diverged local base branch
-    // (e.g. an accidental executor commit to base) self-heals; status_porcelain
-    // only catches file-level dirt, not branch-ahead state.
-    git::reset_hard_to_remote(workspace, &repo.base_branch)?;
+    // pull --ff-only first (works for both "already up to date" and normal ff).
+    // If it fails the local base is diverged (e.g. an accidental executor
+    // commit to base that status_porcelain misses). Reset hard to origin to
+    // self-heal; fetch already ran above so origin/<base> is current.
+    if let Err(e) = git::pull_ff_only(workspace, &repo.base_branch) {
+        tracing::warn!(
+            url = repo.url.as_str(),
+            "pull --ff-only failed ({e:#}); local base branch diverged — resetting to origin/{}",
+            repo.base_branch
+        );
+        git::reset_hard_to_remote(workspace, &repo.base_branch)?;
+    }
     git::recreate_branch(workspace, &repo.agent_branch)?;
 
     // Canonical-spec RAG workspace-init hook (a21). Idempotent: only
