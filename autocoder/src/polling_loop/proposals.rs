@@ -42,8 +42,8 @@ pub async fn process_proposal_requests(
     git::fetch(workspace).with_context(|| "chat-triage: git fetch".to_string())?;
     git::checkout(workspace, &repo.base_branch)
         .with_context(|| format!("chat-triage: checkout `{}`", repo.base_branch))?;
-    git::pull_ff_only(workspace, &repo.base_branch)
-        .with_context(|| format!("chat-triage: pull --ff-only `{}`", repo.base_branch))?;
+    git::reset_hard_to_remote(workspace, &repo.base_branch)
+        .with_context(|| format!("chat-triage: reset --hard origin/{}", repo.base_branch))?;
     git::recreate_branch(workspace, &repo.agent_branch)
         .with_context(|| format!("chat-triage: recreate `{}`", repo.agent_branch))?;
 
