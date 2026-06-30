@@ -198,8 +198,10 @@ async fn completed_with_empty_workspace_is_failed() {
 }
 
 /// 13.4.2 / git-workflow-manager baseline: when `git pull --ff-only`
-/// fails (base branch has diverged from origin), the iteration aborts
-/// and the agent branch is NOT created or modified.
+/// fails because the local base branch has diverged from origin (a bug
+/// that can occur when an executor accidentally commits to the base
+/// branch), the pass self-heals by resetting to origin and continues
+/// normally rather than aborting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pull_conflict_aborts_iteration_without_touching_agent_branch() {
     let (_dir, ws) = fixture_workspace_with_remote();
@@ -222,8 +224,8 @@ async fn pull_conflict_aborts_iteration_without_touching_agent_branch() {
         .unwrap();
     assert!(st.success());
 
-    // Now create a divergent local commit on main so pull --ff-only fails
-    // (our local main is not an ancestor of origin/main and vice versa).
+    // Create a divergent local commit on main (local main is not an ancestor
+    // of origin/main and vice versa — this is the bug scenario).
     std::fs::write(ws.join("LOCAL_ONLY.md"), "local-side\n").unwrap();
     let st = std::process::Command::new("git")
         .args(["add", "-A"])
@@ -246,17 +248,24 @@ async fn pull_conflict_aborts_iteration_without_touching_agent_branch() {
 
     let executor = CompletingExecutorNoDiff;
     let result = run_one_pass_no_push(&ws, &executor).await;
-    assert!(result.is_err(), "pass must error when pull --ff-only fails");
-    let msg = format!("{:#}", result.unwrap_err());
+    // The pass self-heals: resets local main to origin/main and continues.
+    assert!(result.is_ok(), "diverged base must self-heal, not abort: {result:?}");
+
+    // After self-heal the local base is at origin/main (remote-side commit
+    // present, local-side commit discarded).
     assert!(
-        msg.contains("git pull --ff-only failed") || msg.contains("non-fast-forward"),
-        "error must surface the git failure verbatim, got: {msg}"
+        ws.join("REMOTE_ONLY.md").exists(),
+        "remote-side commit must be present after reset"
+    );
+    assert!(
+        !ws.join("LOCAL_ONLY.md").exists(),
+        "local-side commit must be discarded after reset"
     );
 
-    // Agent branch must remain absent after the aborted iteration.
+    // agent-q was created at the reset base.
     assert!(
-        crate::git::rev_parse(&ws, "agent-q").is_err(),
-        "agent-q must not be created when the iteration aborts at pull"
+        crate::git::rev_parse(&ws, "agent-q").is_ok(),
+        "agent-q must be created after self-heal"
     );
 }
 
