@@ -471,7 +471,10 @@ async fn prepare_workspace_for_pass(
     // Best-effort — failures log a WARN but never block the iteration.
     opportunistic_upstream_fetch(workspace, repo);
     git::checkout(workspace, &repo.base_branch)?;
-    git::pull_ff_only(workspace, &repo.base_branch)?;
+    // reset --hard instead of pull --ff-only so a diverged local base branch
+    // (e.g. an accidental executor commit to base) self-heals; status_porcelain
+    // only catches file-level dirt, not branch-ahead state.
+    git::reset_hard_to_remote(workspace, &repo.base_branch)?;
     git::recreate_branch(workspace, &repo.agent_branch)?;
 
     // Canonical-spec RAG workspace-init hook (a21). Idempotent: only

@@ -41,8 +41,8 @@ pub async fn process_audit_triages(
     git::fetch(workspace).with_context(|| "audit-triage: git fetch".to_string())?;
     git::checkout(workspace, &repo.base_branch)
         .with_context(|| format!("audit-triage: checkout `{}`", repo.base_branch))?;
-    git::pull_ff_only(workspace, &repo.base_branch)
-        .with_context(|| format!("audit-triage: pull --ff-only `{}`", repo.base_branch))?;
+    git::reset_hard_to_remote(workspace, &repo.base_branch)
+        .with_context(|| format!("audit-triage: reset --hard origin/{}", repo.base_branch))?;
     // Use a temp work branch rather than agent_branch so the real agent_branch
     // ref keeps pointing at the open PR's commit. run_revision_dispatchers runs
     // later in the same iteration and calls diff_three_dot(base, agent_branch) —
