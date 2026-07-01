@@ -1496,6 +1496,24 @@ async fn run_revision_execute(
         );
     }
 
+    // Clear the .needs-spec-revision.json marker now that a revision PR is
+    // open. The open PR parks the queue; the marker's blocking role is
+    // redundant. Safe under close-without-merge: if the operator closes the
+    // PR without merging, the gate re-fires on the next pass and re-writes
+    // the marker. Best-effort — a delete failure is logged but never fails
+    // the revision (mirrors the @bot-revise path in revisions/process_pr.rs).
+    match crate::queue::remove_revision_marker_idempotent(workspace, change_slug) {
+        Ok(true) => tracing::info!(
+            change = %change_slug,
+            "revision-execute: cleared .needs-spec-revision.json marker after spec-revision PR opened"
+        ),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            change = %change_slug,
+            "revision-execute: failed to clear .needs-spec-revision.json marker (continuing): {e:#}"
+        ),
+    }
+
     // Flip the thread state to Acted so a repeat `send it` is handled
     // gracefully (task 4.3). Reconstruct a fresh state when none was stored
     // (degraded alert) so the acted flag still lands.
@@ -2863,13 +2881,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(*pr_calls.lock().unwrap(), 1, "a clean re-gate opens the PR");
-        assert_eq!(
-            crate::spec_revision::read_marker(&ws, "c1")
-                .unwrap()
-                .unwrap()
-                .consecutive_failed_rounds,
-            0,
-            "a clean re-gate (PR opened) resets the consecutive-failure counter"
+        // The marker is deleted when the PR opens (the open PR parks the queue;
+        // clearing also resets the consecutive-failure counter implicitly).
+        assert!(
+            crate::spec_revision::read_marker(&ws, "c1").unwrap().is_none(),
+            "a clean re-gate (PR opened) deletes the .needs-spec-revision.json marker"
         );
     }
 
