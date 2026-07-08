@@ -7,9 +7,156 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.3.0] - 2026-07-01
+
+This release completes the migration of every LLM step onto a provider-swappable,
+CLI-wrapped "agentic" session, adds the verifier-gate framework
+(`[in]`/`[canon]`/`[rules]`/`[out]`) that fails closed, brings first-class GitLab
+and GitHub Enterprise support, an OS-level agent sandbox, and the issues lane for
+behavior-preserving corrections.
+
+### Highlights
+
+- **Provider-swappable agentic fleet** — every LLM step (reviewer, audits, contradiction checks, and optionally the implementer) now runs through a CLI-wrapped session behind a shared model registry, with `claude`, `opencode` (OpenAI-compatible / Ollama / OpenRouter), and `antigravity` (Google) strategies. The reviewer is agentic by default and reads the diff and files on demand.
+- **Verifier gates that fail closed** — four gates — `[in]` (change self-consistency), `[canon]` (change vs. canon), `[rules]` (global engineering rules), and `[out]` (code implements spec) — run around each change and treat "couldn't run" as a hold, never a pass. Run them locally with `autocoder verify <slug>`.
+- **First-class GitLab and GitHub Enterprise** — a `Forge` abstraction adds autonomous merge-request creation, review, and triggers for GitLab, and GitHub Enterprise via a self-hosted `api_base`.
+- **OS-level agent sandbox** — agentic subprocesses run under a kernel-enforced sandbox (masked home, isolated workspaces, masked credentials) so a model can't read the host's secrets or leak a key into a commit.
+- **Issues lane** — a second work path for behavior-preserving corrections that carry no spec delta, with curated entries, maintainer-promoted public GitHub-issue ingestion, and a per-issue perma-stuck gate. On by default.
+
+### Added
+
+**Agentic fleet**
+
+- Extract a single agentic-run primitive and migrate the advisory audits, the code reviewer, and the contradiction check off stdout/HTTP-JSON scraping onto in-session structured submission.
+- Add `opencode` and `antigravity` (`agy`) CLI strategies so non-Anthropic providers (OpenAI-compatible, Ollama, OpenRouter, Google) are first-class, and make the implementer strategy-agnostic too.
+- Add a shared model registry that drives strategy/model selection for the executor, reviewer, gates, and audits; make an agentic role's API key always optional, falling back to the CLI's own session.
+- Make the agentic reviewer the default; it reads the diff and touched files on demand instead of dumping every file into one budget-bounded prompt.
+
+**Verifier-gate framework**
+
+- Add the `[in]`, `[canon]`, `[rules]`, and `[out]` gates and the shared framework that names and positions them around each change.
+- Add `autocoder verify <slug>` to run the pre-executor gates locally against the working tree.
+- Add a tool-capability probe and a path-less-`api_base` warning so a model that can't emit tool calls, or a misconfigured endpoint, surfaces at config time instead of holding every change with an opaque error.
+- Have the `[out]` gate flag stub implementations, and persist each gate's full session log for diagnosis.
+
+**Multi-forge**
+
+- Add a `Forge` provider abstraction with GitHub and GitLab implementations (GitHub Enterprise for free via `api_base`), and route open-issue reads through the forge PAT instead of the `gh` CLI's own credentials.
+
+**Issues lane**
+
+- Add the issues lane: curated `issues/<slug>` corrections and maintainer-promoted ingestion of public GitHub issues, where reporting is not triggering — promotion is the authorization gate.
+- Let the bug/gap audits file issues rather than only spec changes, review issue PRs like change PRs, support single-file issues, and add a per-issue perma-stuck gate.
+
+**Security and sandbox**
+
+- Run agentic subprocesses under an OS-level (bubblewrap) sandbox with an exposed-home denylist for the executor and the correct policy for read-only roles.
+- Stop plaintext credentials from ever reaching a model or a committed file, bind the control socket into the sandbox, and exclude per-run CLI config artifacts from commits.
+- Activate the host's language toolchains (pyenv, nvm, rbenv, …) inside the agent environment so builds resolve the right interpreter.
+
+**Operator recovery**
+
+- Add code rollback/recovery to re-implement merged-but-ungated work under the controls, unconditional rollback as an emergency override that preempts in-flight work, and defer/resume for a unit you want to set aside intact.
+- Unify the destructive-confirm interface to one `confirm` verb, add bulk marker clearing across the fleet, and let operators reorder the change queue without renaming directories.
+- Add on-demand code review (point the reviewer at a PR, commit, file, or described area) and review-survival provenance (which of a past change's edits still live in current code).
+
 ### Changed
 
-- **Issues lane is now on by default.** The `features.issues.enabled` flag defaults to `true` — the issues lane is one of the two fundamental work paths. On upgrade, an existing install whose config omits `features.issues` gains the active issues lane (per-iteration unit selection becomes `issues > changes > audits`). This does **not** enable autonomous GitHub-issue triage, which stays separately gated by `features.scout.include_issues`. Operators who track corrections in an external tracker (Jira, Linear, and similar) can opt out by setting `features.issues.enabled: false`.
+- Make "gatekeepers fail closed" a project-wide standard — an inability to run a control is a non-passing state, never a pass — and bring the verifier gates and audits into conformance.
+- Drain operator chat requests between changes so a long queue walk can't starve them, and never stay silent when addressed: reply even when the bot can't act on the request.
+- Ground the spec-revision `send it` loop in the current contradiction, persist its incremental progress across rounds, hold the busy marker while it runs, clear the revision marker on success, and nudge decomposition when a large change won't converge.
+- Make the human `@<bot> revise` cap opt-in (unlimited by default), and stop burning a revision slot when the subprocess never started.
+- Add a unified, configurable agentic-session timeout, workspace-cache eviction so build trees don't fill the disk, and one unified rotated daemon log.
+- Commit `OCTOPUS.md` to a managed repo (issues, OpenSpec, canon/archive, and gate rules in one place) and document local `verify`.
+
+### Fixed
+
+- Fail the `[out]` gate closed when the change's delta was already archived — it had been silently passing everything — and make the reviewer's failure visible in the PR instead of rendering no review section.
+- Rate a credential-leak reviewer finding as `Block`, not `Concerns`, and aggregate reviewer revisions so duplicate findings don't each spend an executor run and a cap slot.
+- Degrade gracefully when one repo's fork setup fails instead of crash-looping the whole daemon, and preserve completed work when a branch push is rejected.
+- Fix a UTF-8-boundary panic in the issue-triage parser, expand `~` in the global-rules corpus path, and resolve in-change `RENAMED` headers in the archivability pre-flight.
+- Serialize workspace git ops so a rollback can't corrupt the index of a concurrent pass, and make the check-only install write a config the binary can discover.
+- Surface an open-PR park in `status` (it had shown idle), name the offending paths in a write-policy audit alert, and persist the on-demand audit queue across restarts.
+
+### Also included
+
+- Decompose the 17,943-line `polling_loop.rs` (the project's worst structural-bloat offender) and add a file-size-discipline escalation to the architecture audit.
+- Redesign the architecture advisory audit, add canon self-contradiction and canon-consolidation audits, carry full audit-finding bodies through triage, and make audits fail closed and report.
+- Deprecate the redundant `executor.command` knob; fall back to a bundled review when a per-change split yields no sub-contexts; improve executor-failure legibility with retry backoff.
+
+## [v1.2.1] - 2026-06-04
+
+This release makes autocoder operable from chat — a full inbound ChatOps command
+surface — and closes the PR-comment revision loop end to end. It also hardens the
+spec-archive and executor-outcome paths against silent failure and moves daemon
+state off `/tmp`.
+
+### Highlights
+
+- **Operate autocoder from chat** — a full inbound command surface (`@<bot> status`, `revise`, `send it`, `audit`, `code-review`, `wipe-workspace`, `clear-perma-stuck`, …) with a status menu, enriched healthy-repo status, threaded audit findings, and at-least-once event dedup.
+- **PR-comment revision loop** — `@<bot> revise <text>` on any autocoder-opened PR runs a revision iteration, reviewer-initiated revisions flow through the same path, and the agent now pushes back on requests that would damage the code.
+- **On-demand audits and triage** — trigger any audit from chat, and `send it` in an audit thread turns findings into a fixes PR plus a spec PR.
+- **Durable state off `/tmp`** — daemon state, markers, and bookkeeping move to a persistent state directory so a reboot no longer wipes them.
+- **Structured executor outcomes** — the implementer signals success / needs-revision / another-iteration through MCP tools instead of fragile stdout sentinels.
+
+### Added
+
+**ChatOps command surface**
+
+- Add an inbound Slack command listener with a parser, dispatcher, and control-socket handlers for operator verbs (`status`, `clear-perma-stuck`, `wipe-workspace`, …), documented in the README.
+- Add `@<bot> status` with no repo argument to list configured repositories instead of returning `?`, and enrich `@<bot> status <repo>` so a healthy repo reports what the daemon is doing instead of collapsing to one line.
+- Deduplicate Slack's at-least-once redeliveries and resolve both user-style (`U…`) and bot-style (`B…`) mentions so mobile and desktop commands both parse.
+- Post audit findings in per-audit threads with clear separators, trigger any audit on demand, and run `send it` in an audit thread to open a fixes PR and a spec PR.
+- Re-run the reviewer on a PR with `@<bot> code-review`, and notify the chat channel across the whole revise lifecycle, not just on the PR.
+
+**Revision loop**
+
+- Add the `@<bot> revise <text>` PR-comment revision dispatcher and route reviewer-initiated revisions through the same plumbing.
+- Add separate caps for operator-initiated and automatic reviewer-marked revisions, and surface the revision's summary in the PR comment it posts.
+
+**Onboarding existing codebases**
+
+- Add the `brownfield` verb to generate canonical specs for an existing capability, plus a survey-and-batch mode that proposes which capabilities to spec and in what order.
+- Add a `scout` verb that answers "what's worth looking at?" on an unfamiliar codebase.
+- Add OSS fork-contribution support (`spec_storage` for out-of-tree specs, fork-mode PR routing) so autocoder can land targeted PRs on repos the operator doesn't own.
+
+**Install, config, and diagnostics**
+
+- Detect pre-wizard installs so re-running the installer no longer clobbers a hand-written systemd unit or config, and re-run just one wizard section instead of the whole thing.
+- Add a config-validation subcommand to check a config against the binary without starting the daemon, and an `inspect` diagnostic subcommand for agent activity and RAG context.
+- Add `update.sh` with a startup version notification derived from `git describe`, plus the `autocoder changelog` subcommand and a chat-driven changelog stylist that rewrites it as release notes.
+- Add a shared model registry and unify the per-role LLM provider config so a model tuple is declared once, and attribute LLM-produced output to the model that generated it.
+
+**Executor and spec integrity**
+
+- Feed the implementer the canonical specs via an MCP RAG surface so changes are built against the existing contract.
+- Replace stdout outcome sentinels with MCP outcome tools, add an "I need another iteration" outcome for honest scope overflow, and recover when an agent exits without signaling any outcome.
+- Stream executor output incrementally so a timeout-kill captures partial work instead of a 0-byte log, and split the per-change log into separate prompt/actions/answer/stderr files.
+- Add a semantic change-internal contradiction pre-flight and a spec-delta archivability pre-flight before a change reaches the executor.
+
+### Changed
+
+- Run pending changes before audits and bound how many audits run per iteration, so an audit storm can't monopolize the daemon.
+- Move daemon state, markers, and workspace bookkeeping off `/tmp` into a persistent state directory, with consistent path resolution across every code path.
+- Write `secrets.env` at `0600` atomically instead of chmod-after-write, and gate external GitHub-comment triggers so only authorized users can fire billed work.
+- Classify a SIGTERM-killed executor (exit 143 on `systemctl restart`) as a restart, not a failure, and make chatops recovery verbs tolerant of backtick-wrapped change slugs copied from alerts.
+- Ship language-neutral default prompts so agents on non-Rust projects don't run `cargo`.
+
+### Fixed
+
+- Harden the spec-rebuild and archive paths against openspec's "exits 0 but archived nothing" silent skip, and order the rebuild by dependency rather than alphabetically.
+- Fix the busy marker bricking a repo whose daemon was killed mid-iteration, and stop permanently skipping a repo for the daemon's lifetime on a transient clone/fetch failure.
+- Self-heal a workspace that exists but has no `.git/` by re-cloning instead of failing forever.
+- Process `@<bot> revise` on fork-PR repos (the head qualifier now respects the fork owner), stop double-processing a single revise comment, and build the revision prompt from the open PR rather than the archived change state.
+- Push and open a PR from audit-only iterations so audit-authored proposals stop vanishing.
+- Fix the reviewer's auto-revise never firing, a git-fetch pipe deadlock on large fetches, and a scope check rejecting the changelog stylist's own `changelog: skip` edit.
+- Skip audits and their writes against a workspace with no `.git/`, coordinate `wipe-workspace` with the in-flight iteration instead of killing it mid-file-op, and fall back to the active path for a change's `proposal.md` when assembling a PR body.
+
+### Also included
+
+- Reviewer: configurable prompt budget with a per-change review mode (honored on re-review too), single-pass prompt substitution, and tests that assert behavior instead of verbatim prompt wording.
+- Uniform prompt-override surface across the embedded templates, audit logs that carry the repo URL, and audit-generated changes marked as such in the start-of-work notification and self-validated at authoring time.
+- Tests use per-test tempdirs instead of live daemon paths, daemon paths are threaded through APIs instead of a process global, and prompts link to upstream OpenSpec docs.
 
 ## [v1.1.1] - 2026-05-24
 
