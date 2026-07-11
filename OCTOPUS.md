@@ -47,48 +47,6 @@ part being changed.
 Every change MUST pass `openspec validate --strict` before it is considered
 ready.
 
-## Roadmap items (lightweight future-feature records)
-
-A **roadmap item** is a future-feature record: an idea that is early,
-speculative, or deliberately deferred, and does not yet warrant an issue (which
-requires a code defect) or an OpenSpec change (which requires full spec
-authorship). Roadmap items live one-per-file at `roadmap/<slug>.md`, where
-`<slug>` matches `^[a-zA-Z0-9_-]{1,64}$`.
-
-Each item carries YAML frontmatter followed by a free-text markdown body with no
-required sections:
-
-```markdown
----
-title: <one-line description>
-status: proposed | considering | planned | deferred
-added: YYYY-MM-DD
----
-
-Free-text body.
-```
-
-Status values:
-
-- `proposed` — raised, not yet evaluated.
-- `considering` — may become a change.
-- `planned` — accepted; timing uncommitted.
-- `deferred` — set aside, kept for reference.
-
-Operators and agents move an item through its lifecycle (for example `proposed`
-→ `considering` → `planned`, or `planned` → `deferred`) by editing the `status`
-field.
-
-Unlike canon under `openspec/specs/`, roadmap items are **NOT autocoder-owned**:
-they are human- and agent-editable and carry **no gate enforcement**. They are
-also **NOT queue input** — the queue engine enumerates only
-`openspec/changes/`, so files under `roadmap/` sit outside its scope by position,
-and they are **never automatically implemented**. Turning a roadmap item into
-work is a deliberate act: someone writes an issue or an OpenSpec change.
-
-An agent running a discuss or audit session SHOULD check `roadmap/` for relevant
-prior thinking before proposing new work.
-
 ## Canon and archive are autocoder-owned
 
 The canonical specifications under `openspec/specs/` and the archive under
