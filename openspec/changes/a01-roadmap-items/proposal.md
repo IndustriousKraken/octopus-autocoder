@@ -1,27 +1,33 @@
-# Roadmap items: lightweight per-file future-feature records
+# Roadmap items: a lightweight future-feature record convention
 
 ## Why
 
-Capturing future-feature ideas currently has no lightweight home in the repo.
-Issues require a code defect; changes require full spec authorship. A future
-feature idea that is too early, too speculative, or deliberately deferred has
-nowhere to land without either forcing a premature spec or cluttering an ad-hoc
-file.
+Future-feature ideas have no lightweight home in the repo today. An issue
+requires a code defect; an OpenSpec change requires full spec authorship. An
+idea that is early, speculative, or deliberately deferred is forced into one of
+those heavier forms or ends up in an ad-hoc file.
 
-A `roadmap/` directory of individual markdown files gives these ideas a home
-that:
+A `roadmap/` directory of one-file-per-idea records gives these ideas a home
+that is searchable, linkable, and human- and agent-editable, and — unlike canon
+— carries no gate enforcement. It is created naturally by the discuss → send it
+flow (see `discuss-verb-conversational-propose`, which lists a roadmap item as
+one of its output artifact types) and stays out of the implementation queue.
 
-- Is searchable and linkable (one file per idea, named by slug).
-- Is easy to create via the `discuss` → `send it` flow without requiring full
-  spec authorship.
-- Stays OUT of the queue engine (autocoder does not automatically implement
-  roadmap items — they are ideas, not work orders).
-- Is editable by humans and agents alike (unlike `openspec/specs/` which is
-  autocoder-owned and immutable between changes).
+## What Changes
+
+- A `roadmap/` directory is added at the repo root (tracked via `.gitkeep`).
+- The roadmap convention — file format, frontmatter, status values, lifecycle —
+  is documented in `OCTOPUS.md`.
+- One canonical requirement defines the roadmap item format so agents produce
+  and read them consistently.
+
+Roadmap items are NOT queue input, and that needs no new code: the queue engine
+enumerates only `openspec/changes/`, so files under `roadmap/` are already out
+of its scope by position. No exclusion logic and no gitignore entry is required.
 
 ## Format
 
-Each roadmap item lives at `roadmap/<slug>.md`:
+`roadmap/<slug>.md`:
 
 ```markdown
 ---
@@ -30,43 +36,16 @@ status: proposed | considering | planned | deferred
 added: YYYY-MM-DD
 ---
 
-Free-text body describing the feature, motivation, and any known constraints or
-open questions. No required sections. Keep it as short or long as the idea warrants.
+Free-text body. No required sections.
 ```
 
-`status` values:
-- `proposed` — idea has been raised; not yet evaluated.
-- `considering` — under active consideration; may become a spec.
-- `planned` — accepted for a future spec; timing not yet committed.
-- `deferred` — explicitly set aside; kept for reference.
-
-The `added` date is the creation date (set by the creator; not auto-updated).
-No other frontmatter fields are required.
-
-## What Changes
-
-- `roadmap/` directory is created at the repo root (tracked by git).
-- `OCTOPUS.md` gains a `## Roadmap items` section explaining the format to
-  agents and human contributors.
-- The `discuss` verb's artifact-creation prompt (`prompts/discuss-mode.md`)
-  is updated to instruct the agent that when the operator's request is a
-  future-feature idea (not yet specced, not urgent, explicitly aspirational),
-  the appropriate artifact is a new `roadmap/<slug>.md` rather than a full
-  `openspec/changes/<slug>/` directory.
-- Roadmap items are NOT automatically processed by the queue engine and MUST
-  NOT appear under `openspec/changes/` or `issues/`.
-- Agents implementing OpenSpec changes SHALL treat `roadmap/` as a searchable
-  reference (the `discuss` prompt proactively reads it; implementing agents MAY
-  read it for context). Agents MUST NOT delete roadmap items without operator
-  instruction; items transition to `planned` or `deferred` via operator edits.
+Status: `proposed` (raised, not evaluated) → `considering` (may become a change)
+→ `planned` (accepted, timing uncommitted); `deferred` (set aside, kept for
+reference). Operators and agents move an item by editing its `status` field.
 
 ## Impact
 
-- Affected specs: `orchestrator-cli` — two ADDED requirements (roadmap item
-  format, discuss-mode prompt roadmap guidance). `project-documentation` spec
-  update is NOT needed; this change owns OCTOPUS.md and `roadmap/`.
-- Affected files: `OCTOPUS.md` (new section), `roadmap/` (new directory, empty
-  initially), `prompts/discuss-mode.md` (new file, or add section when that
-  file is created by `discuss-verb-conversational-propose`).
-- No queue-engine changes: the `list_pending` enumeration already excludes
-  `roadmap/` (it only walks `openspec/changes/`). No exclusion logic needed.
+- Affected specs: `orchestrator-cli` — one ADDED requirement (roadmap item
+  format + documentation).
+- Affected files: `OCTOPUS.md` (new section), `roadmap/.gitkeep` (new).
+- No code behavior changes; no queue-engine changes.
