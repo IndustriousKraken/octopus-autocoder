@@ -28,7 +28,7 @@
 
 ## 4. Discuss-mode prompt
 
-- [ ] 4.1 Write `prompts/discuss-mode.md`: proactive context reads (relevant `openspec/specs/*`, `CHANGELOG.md`, `OCTOPUS.md`, `docs/*`, active/archived changes, implementer source files), conversational read-only response style during discussion, the existing-spec-modification deferral signal, roadmap-vs-change artifact routing (per `a01-roadmap-items`), and the write-mode transition on `send it`.
+- [ ] 4.1 Write the new prompt file `prompts/discuss-mode.md` (this task creates a prompt only — it does not touch any specification files). The prompt text instructs the discuss agent to: proactively READ project context for background (the repo's existing specification documents, `CHANGELOG.md`, `OCTOPUS.md`, `docs/*`, active and archived change folders, relevant implementer source files); respond conversationally and read-only during discussion; emit the existing-spec-modification deferral signal; route the output artifact between a roadmap item and a change (per `a01-roadmap-items`); and switch to write mode on `send it`.
 - [ ] 4.2 Retire `prompts/chat-request-triage.md` (superseded by the discuss-mode prompt).
 
 ## 5. Tests
