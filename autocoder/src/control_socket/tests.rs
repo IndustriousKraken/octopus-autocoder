@@ -124,6 +124,7 @@
             outcome_store: crate::outcome_store::OutcomeStore::new(),
             submission_store: crate::submission_store::SubmissionStore::new(),
             paths: Arc::new(paths),
+            discuss_tx: None,
         }
     }
 

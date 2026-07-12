@@ -255,11 +255,6 @@ pub fn truncate_chat_reply_with_pointer(body: &str, request_id: &str, cap: usize
     )
 }
 
-/// Cap on a chat-reply body posted into the request's lifecycle thread.
-/// Mirrors `audit-threads`' `FINDINGS_EXCERPT_CAP` (35,000 chars) so the
-/// Slack threaded-reply length budget is consistent across flows.
-pub const CHAT_REPLY_BODY_CAP: usize = 35_000;
-
 #[cfg(test)]
 mod tests {
     use super::*;

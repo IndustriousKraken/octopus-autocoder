@@ -20,6 +20,7 @@ mod config;
 mod control_socket;
 mod daemon;
 mod dependency_preflight;
+mod discussion_state;
 mod executor;
 mod failure_state;
 mod forge;

@@ -82,6 +82,55 @@ pub struct ProposalRequest {
     pub submitted_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// An event delivered to the dedicated discuss handler
+/// (discuss-verb-conversational-propose). Unlike the poll-drained chat queues,
+/// discuss events flow over an `mpsc` channel so the always-on handler reacts
+/// immediately (no polling-loop delay). The chatops dispatcher submits one of
+/// the three `queue_discuss_*` control-socket actions; the matching handler
+/// builds a variant of this enum and sends it on `ControlState::discuss_tx`.
+#[derive(Debug, Clone)]
+pub enum DiscussEvent {
+    /// `@<bot> discuss <repo> <text>` — start a new conversational session.
+    Start(DiscussStart),
+    /// `@<bot> <text>` reply in an active discuss thread — continue the session.
+    Continue(DiscussContinue),
+    /// `@<bot> send it [trailing]` in an active discuss thread — create the
+    /// artifact and open a PR.
+    SendIt(DiscussSendIt),
+}
+
+/// Payload for `DiscussEvent::Start`.
+#[derive(Debug, Clone)]
+pub struct DiscussStart {
+    pub request_id: String,
+    pub repo_url: String,
+    pub channel: String,
+    pub thread_ts: String,
+    pub operator_user: String,
+    pub initial_text: String,
+}
+
+/// Payload for `DiscussEvent::Continue`.
+#[derive(Debug, Clone)]
+pub struct DiscussContinue {
+    pub request_id: String,
+    pub repo_url: String,
+    pub channel: String,
+    pub thread_ts: String,
+    pub text: String,
+}
+
+/// Payload for `DiscussEvent::SendIt`. `final_context` is any text following
+/// `send it`, appended to the session before the artifact step.
+#[derive(Debug, Clone)]
+pub struct DiscussSendIt {
+    pub request_id: String,
+    pub repo_url: String,
+    pub channel: String,
+    pub thread_ts: String,
+    pub final_context: Option<String>,
+}
+
 /// One in-flight chat-driven changelog-request awaiting stylist run. The
 /// chatops dispatcher's `changelog` verb appends to
 /// `RepoTaskHandle::pending_changelog_requests`; the polling loop drains
@@ -469,6 +518,13 @@ pub struct ControlState {
     /// state/cache/logs/runtime path uses this reference instead of a
     /// process-global.
     pub paths: Arc<crate::paths::DaemonPaths>,
+    /// Sender to the dedicated discuss handler task
+    /// (discuss-verb-conversational-propose). The three `queue_discuss_*`
+    /// actions push a [`DiscussEvent`] here so the always-on handler processes
+    /// it without a polling-loop delay. `None` when the daemon has no chatops
+    /// backend (the discuss verb is chatops-only) OR on the submission-only
+    /// in-process listener — in that case the actions reply with an error.
+    pub discuss_tx: Option<tokio::sync::mpsc::UnboundedSender<DiscussEvent>>,
 }
 
 /// Canonical control-socket path: `<runtime_dir>/control.sock`. The
@@ -565,6 +621,7 @@ fn submission_only_state(
         outcome_store: crate::outcome_store::OutcomeStore::new(),
         submission_store,
         paths,
+        discuss_tx: None,
     }
 }
 
@@ -809,6 +866,15 @@ const DISPATCH: &[(&str, Handler)] = &[
     }),
     ("queue_proposal_request", |p, s| {
         Box::pin(async move { handle_queue_proposal_request(p, s) })
+    }),
+    ("queue_discuss_action", |p, s| {
+        Box::pin(async move { handle_queue_discuss_action(p, s) })
+    }),
+    ("queue_discuss_continue", |p, s| {
+        Box::pin(async move { handle_queue_discuss_continue(p, s) })
+    }),
+    ("queue_discuss_send_it", |p, s| {
+        Box::pin(async move { handle_queue_discuss_send_it(p, s) })
     }),
     ("queue_changelog_request", |p, s| {
         Box::pin(async move { handle_queue_changelog_request(p, s) })

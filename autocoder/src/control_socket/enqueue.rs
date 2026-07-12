@@ -210,6 +210,121 @@ pub(crate) fn handle_queue_proposal_request(parsed: &Value, state: &ControlState
     )
 }
 
+/// Shared body for the three `queue_discuss_*` actions
+/// (discuss-verb-conversational-propose). Unlike the poll-drained enqueue
+/// handlers, these deliver a [`DiscussEvent`] over `state.discuss_tx` so the
+/// always-on discuss handler reacts immediately. The handler resolves the repo
+/// (validating the URL), builds the event via `build`, and sends it. Returns
+/// `{ok:true, url, request_id}` on success; `{ok:false, error}` when the repo
+/// is unknown, a required field is missing, or the discuss handler is not
+/// running (no `discuss_tx`).
+fn submit_discuss_event(
+    parsed: &Value,
+    state: &ControlState,
+    build: impl FnOnce(&str, String, String, String) -> super::DiscussEvent,
+) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let request_id = match require_str(parsed, "request_id") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let channel = match require_str(parsed, "channel") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let thread_ts = match require_str(parsed, "thread_ts") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    if let Err(e) = find_repo(state, &url) {
+        return json!({"ok": false, "error": e});
+    }
+    let tx = match state.discuss_tx.as_ref() {
+        Some(tx) => tx,
+        None => {
+            return json!({
+                "ok": false,
+                "error": "discuss handler is not running (no chatops backend configured)",
+            });
+        }
+    };
+    let event = build(&request_id, url.clone(), channel, thread_ts);
+    if let Err(e) = tx.send(event) {
+        return json!({
+            "ok": false,
+            "error": format!("discuss handler channel closed: {e}"),
+        });
+    }
+    json!({"ok": true, "url": url, "request_id": request_id})
+}
+
+/// `queue_discuss_action` — start a new conversational discuss session. The
+/// chatops dispatcher already wrote the `DiscussionState` file AND captured the
+/// ack thread; this delivers the `Start` event to the always-on handler.
+pub(crate) fn handle_queue_discuss_action(parsed: &Value, state: &ControlState) -> Value {
+    let initial_text = parsed
+        .get("initial_text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let operator_user = parsed
+        .get("operator_user")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    submit_discuss_event(parsed, state, |request_id, repo_url, channel, thread_ts| {
+        super::DiscussEvent::Start(super::DiscussStart {
+            request_id: request_id.to_string(),
+            repo_url,
+            channel,
+            thread_ts,
+            operator_user,
+            initial_text,
+        })
+    })
+}
+
+/// `queue_discuss_continue` — continue an active discuss session with a new
+/// in-thread `@<bot>` reply.
+pub(crate) fn handle_queue_discuss_continue(parsed: &Value, state: &ControlState) -> Value {
+    let text = parsed
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    submit_discuss_event(parsed, state, |request_id, repo_url, channel, thread_ts| {
+        super::DiscussEvent::Continue(super::DiscussContinue {
+            request_id: request_id.to_string(),
+            repo_url,
+            channel,
+            thread_ts,
+            text,
+        })
+    })
+}
+
+/// `queue_discuss_send_it` — the operator approved; create the artifact and
+/// open a PR. `final_context` is any text following `send it`.
+pub(crate) fn handle_queue_discuss_send_it(parsed: &Value, state: &ControlState) -> Value {
+    let final_context = parsed
+        .get("final_context")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+    submit_discuss_event(parsed, state, |request_id, repo_url, channel, thread_ts| {
+        super::DiscussEvent::SendIt(super::DiscussSendIt {
+            request_id: request_id.to_string(),
+            repo_url,
+            channel,
+            thread_ts,
+            final_context,
+        })
+    })
+}
+
 /// Queue a chat-driven changelog request for the repo's next polling
 /// iteration. The request was already persisted to disk as a
 /// `ChangelogRequestState` file by the chatops dispatcher; this

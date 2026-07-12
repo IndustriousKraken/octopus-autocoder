@@ -31,6 +31,25 @@ The install script's "production releases" filter skips pre-releases by default,
 
 The workflow exposes a `workflow_dispatch` trigger with a `dry_run` boolean input (default `true`). Triggering it manually from *Actions → release → Run workflow* exercises `lint`, `test`, and `build` against any branch without creating a tag or publishing a release. Set `dry_run` to `false` only if you genuinely want a workflow_dispatch run to publish (the normal path is to push a tag).
 
+## Migration notes
+
+### `discuss` verb replaces one-shot `propose` (discuss-verb-conversational-propose)
+
+The chatops `propose` verb is now a permanent alias for the new conversational
+`discuss` verb, handled by a dedicated always-on discuss handler rather than the
+polling loop. The old `.chat-reply.md` marker path is removed.
+
+Before deploying this release, **drain any in-flight `ProposalRequestState`
+files** so no request is stranded mid-lifecycle across the cutover: let the
+running daemon finish one full polling cycle per repo (so `pending_proposal_requests`
+queues empty and any `Pending`/`TriagePending` request reaches a terminal
+status), or clear `<state_dir>/proposal-requests/` after confirming no request
+is `Pending`/`TriagePending`. New `discuss` sessions persist to
+`<state_dir>/discussions/` instead; those are safe to leave in place across the
+upgrade. (The `proposal-requests` state type is retained for the internal
+scout→`spec-it` flow, which still submits directive-shaped requests through the
+retained spec-PR path.)
+
 ## After publish
 
 The Release body is GitHub's auto-generated changelog. Edit it on the Release page to add highlights, breaking-change notes, or upgrade guidance if the auto-summary needs annotation.

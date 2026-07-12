@@ -222,6 +222,22 @@ pub trait Executor: Send + Sync {
             reason: "issue-triage mode not supported by this executor backend".to_string(),
         })
     }
+
+    /// One turn of the conversational `discuss` flow
+    /// (discuss-verb-conversational-propose). The discuss handler renders the
+    /// `prompts/discuss-mode.md` template into `ctx.rendered_prompt`; this
+    /// method runs the agentic session (read-only during discussion, write on
+    /// `send it`, per `ctx.write_mode`), resuming the prior session when
+    /// `ctx.resume_session_id` is set so context stays token-cache-friendly
+    /// across turns. Returns the agent's reply text AND the resumable session
+    /// handle to persist for the next turn.
+    ///
+    /// Default impl returns an error so a backend that hasn't been taught about
+    /// the discuss flow degrades to a handled failure rather than a panic.
+    async fn run_discuss(&self, workspace: &Path, ctx: &DiscussContext) -> Result<DiscussTurn> {
+        let _ = (workspace, ctx);
+        anyhow::bail!("discuss mode not supported by this executor backend")
+    }
 }
 
 /// Context handed to `Executor::run_triage`. Plumbed in from the
@@ -334,6 +350,32 @@ pub struct ChatTriageContext {
     /// `openspec/specs/`. The triage prompt instructs the LLM to read
     /// the relevant subset before deciding how to act on the directive.
     pub canonical_specs_index: String,
+}
+
+/// Context handed to `Executor::run_discuss`
+/// (discuss-verb-conversational-propose). The discuss handler renders the
+/// discuss-mode prompt AND carries the resumable session handle across turns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscussContext {
+    /// Fully rendered prompt: `prompts/discuss-mode.md` + this turn's message.
+    pub rendered_prompt: String,
+    /// Session handle to resume, or `None` on the first turn.
+    pub resume_session_id: Option<String>,
+    /// `false` = read-only conversational turn; `true` = the `send it` write
+    /// turn where the agent may create/modify files and commit.
+    pub write_mode: bool,
+}
+
+/// Result of one `Executor::run_discuss` turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscussTurn {
+    /// The agent's reply text, posted verbatim into the discuss thread.
+    pub reply: String,
+    /// The resumable session handle to persist for the next turn. `None` when
+    /// the backend could not attribute a session.
+    pub session_id: Option<String>,
+    /// True when the session hit its wall-clock cap before finishing.
+    pub timed_out: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

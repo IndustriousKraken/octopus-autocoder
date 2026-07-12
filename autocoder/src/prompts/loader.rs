@@ -58,6 +58,9 @@ pub enum PromptId {
     AuditTriage,
     /// `prompts/chat-request-triage.md` — `propose` triage.
     ChatRequestTriage,
+    /// `prompts/discuss-mode.md` — the conversational `discuss` agent
+    /// (discuss-verb-conversational-propose).
+    DiscussMode,
     /// `prompts/issue-report-triage.md` — read-only triage of a reported
     /// GitHub issue for the a010 hybrid issues-lane ingestion.
     IssueReportTriage,
@@ -139,6 +142,7 @@ const PROMPT_CODE_REVIEW: &str = include_str!("../../../prompts/code-review-defa
 const PROMPT_AUDIT_TRIAGE: &str = include_str!("../../../prompts/audit-triage.md");
 const PROMPT_CHAT_REQUEST_TRIAGE: &str =
     include_str!("../../../prompts/chat-request-triage.md");
+const PROMPT_DISCUSS_MODE: &str = include_str!("../../../prompts/discuss-mode.md");
 const PROMPT_ISSUE_REPORT_TRIAGE: &str =
     include_str!("../../../prompts/issue-report-triage.md");
 const PROMPT_ARCHITECTURE_ADVISOR: &str =
@@ -179,6 +183,7 @@ impl PromptId {
             Self::CodeReview => PROMPT_CODE_REVIEW,
             Self::AuditTriage => PROMPT_AUDIT_TRIAGE,
             Self::ChatRequestTriage => PROMPT_CHAT_REQUEST_TRIAGE,
+            Self::DiscussMode => PROMPT_DISCUSS_MODE,
             Self::IssueReportTriage => PROMPT_ISSUE_REPORT_TRIAGE,
             Self::AuditArchitectureAdvisor => PROMPT_ARCHITECTURE_ADVISOR,
             Self::AuditDrift => PROMPT_DRIFT_AUDIT,
@@ -210,6 +215,7 @@ impl PromptId {
             Self::CodeReview => "code-review-default.md",
             Self::AuditTriage => "audit-triage.md",
             Self::ChatRequestTriage => "chat-request-triage.md",
+            Self::DiscussMode => "discuss-mode.md",
             Self::IssueReportTriage => "issue-report-triage.md",
             Self::AuditArchitectureAdvisor => "architecture-advisor.md",
             Self::AuditDrift => "drift-audit.md",
@@ -239,6 +245,7 @@ impl PromptId {
             Self::CodeReview => "CodeReview",
             Self::AuditTriage => "AuditTriage",
             Self::ChatRequestTriage => "ChatRequestTriage",
+            Self::DiscussMode => "DiscussMode",
             Self::IssueReportTriage => "IssueReportTriage",
             Self::AuditArchitectureAdvisor => "AuditArchitectureAdvisor",
             Self::AuditDrift => "AuditDrift",
@@ -269,6 +276,7 @@ impl PromptId {
             Self::CodeReview,
             Self::AuditTriage,
             Self::ChatRequestTriage,
+            Self::DiscussMode,
             Self::IssueReportTriage,
             Self::AuditArchitectureAdvisor,
             Self::AuditDrift,

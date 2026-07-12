@@ -45,6 +45,7 @@ impl OperatorCommandDispatcher {
     pub(super) async fn dispatch_send_it_on_audit(
         &self,
         thread_ts: &str,
+        trailing: Option<&str>,
         repositories: &[RepoIdentity],
         submitter: &dyn ActionSubmitter,
     ) -> String {
@@ -56,9 +57,10 @@ impl OperatorCommandDispatcher {
             Ok(Some(s)) => s,
             Ok(None) => {
                 // No audit thread matched — try the survey-thread, then the
-                // issue-candidate, then the revision-thread fallback before
-                // refusing (canon's context order: audit → survey →
-                // issue-candidate → spec-revision).
+                // issue-candidate, then the revision-thread, then the
+                // discuss-thread fallback before refusing (canon's context
+                // order: audit → survey → issue-candidate → spec-revision →
+                // discuss).
                 if let Some(reply) = self
                     .try_send_it_on_survey(thread_ts, repositories, submitter)
                     .await
@@ -72,6 +74,11 @@ impl OperatorCommandDispatcher {
                     return reply;
                 }
                 if let Some(reply) = self.try_send_it_on_revision(thread_ts, submitter).await {
+                    return reply;
+                }
+                if let Some(reply) =
+                    self.try_send_it_on_discuss(thread_ts, trailing, submitter).await
+                {
                     return reply;
                 }
                 return SEND_IT_REFUSE_UNTRACKED.to_string();
@@ -94,6 +101,11 @@ impl OperatorCommandDispatcher {
                     return reply;
                 }
                 if let Some(reply) = self.try_send_it_on_revision(thread_ts, submitter).await {
+                    return reply;
+                }
+                if let Some(reply) =
+                    self.try_send_it_on_discuss(thread_ts, trailing, submitter).await
+                {
                     return reply;
                 }
                 return SEND_IT_REFUSE_UNTRACKED.to_string();
@@ -379,5 +391,63 @@ impl OperatorCommandDispatcher {
             "✓ Revising `{change}` along the discussed direction. autocoder will re-run the [in] and [canon] gates AND reply in this thread with the PR link (or the remaining contradiction).",
             change = state.change_slug,
         ))
+    }
+
+    /// discuss-verb-conversational-propose: the FIFTH `send it` context. Look
+    /// up the operator-replied `thread_ts` against the active `DiscussionState`
+    /// set. On a match, submit the `queue_discuss_send_it` control-socket
+    /// action carrying any `trailing` text as `final_context`, AND return
+    /// `Some(reply)`. A discussion already `Executing`/`Completed` returns a
+    /// graceful no-op reply. Returns `None` when no discussion matches — the
+    /// caller falls through to the canonical untracked-thread refusal.
+    ///
+    /// State files are keyed by `thread_ts` (mirroring the audit/revision
+    /// stores), so the lookup is a direct read — `thread_ts` resolves to at
+    /// most one record across the five contexts.
+    async fn try_send_it_on_discuss(
+        &self,
+        thread_ts: &str,
+        trailing: Option<&str>,
+        submitter: &dyn ActionSubmitter,
+    ) -> Option<String> {
+        use crate::discussion_state::{DiscussionStatus, read_state};
+        let state = match read_state(&self.discussion_state_dir, thread_ts) {
+            Ok(Some(s)) => s,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(
+                    thread_ts = %thread_ts,
+                    "discussion state read failed; treating as untracked: {e:#}"
+                );
+                return None;
+            }
+        };
+        if state.status != DiscussionStatus::Active {
+            return Some(format!(
+                "✓ send it: this discussion is already {status}. No new action taken.",
+                status = state.status.label(),
+            ));
+        }
+        let final_context = trailing.map(str::trim).filter(|s| !s.is_empty());
+        let payload = serde_json::json!({
+            "action": "queue_discuss_send_it",
+            "url": state.repo_url,
+            "request_id": state.request_id,
+            "channel": state.channel,
+            "thread_ts": state.thread_ts,
+            "final_context": final_context.unwrap_or(""),
+        });
+        let resp = submitter.submit(payload).await;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no error message)");
+            return Some(format!("✗ send it: could not start artifact creation: {err}"));
+        }
+        Some(
+            "✓ On it — creating the artifact we discussed. I'll open a PR AND post the link here when it's ready."
+                .to_string(),
+        )
     }
 }

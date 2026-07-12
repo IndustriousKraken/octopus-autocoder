@@ -103,6 +103,7 @@ const BROWNFIELD_DRAFT_LOG_CHANGE_NAME: &str = "brownfield-draft";
 /// Synthetic "change" name used for the scout-mode run-log path (a25).
 const SCOUT_LOG_CHANGE_NAME: &str = "scout";
 const ISSUE_TRIAGE_LOG_CHANGE_NAME: &str = "issue-report-triage";
+const DISCUSS_LOG_CHANGE_NAME: &str = "discuss";
 
 pub struct ClaudeCliExecutor {
     command: String,
@@ -1795,6 +1796,73 @@ impl Executor for ClaudeCliExecutor {
         persist_run_log(&self.paths, workspace, SCOUT_LOG_CHANGE_NAME, &prompt, &outcome);
         self.classify_outcome(workspace, SCOUT_LOG_CHANGE_NAME, outcome)
             .await
+    }
+
+    async fn run_discuss(
+        &self,
+        workspace: &Path,
+        ctx: &crate::executor::DiscussContext,
+    ) -> Result<crate::executor::DiscussTurn> {
+        // Read-only during discussion, write on `send it`. The two flags flip
+        // together: `deny_writes` (CLI settings) AND `current_run_sandbox`'s
+        // `workspace_writable` (OS mount). Session is NOT pruned so the handle
+        // can be resumed token-cache-friendly on the next turn.
+        let strategy = self.implementer_strategy();
+        let mut allowed_tools = vec![
+            "Read".to_string(),
+            "Glob".to_string(),
+            "Grep".to_string(),
+            "Bash".to_string(),
+        ];
+        if ctx.write_mode {
+            allowed_tools.push("Edit".to_string());
+            allowed_tools.push("Write".to_string());
+        }
+        let outcome = crate::agentic_run::agentic_run_with_session(
+            crate::agentic_run::AgenticRunOpts {
+                workspace,
+                change: DISCUSS_LOG_CHANGE_NAME,
+                strategy: strategy.as_ref(),
+                prompt: &ctx.rendered_prompt,
+                sandbox: crate::agentic_run::SandboxConfig {
+                    allowed_tools,
+                    disallowed_bash_patterns: Vec::new(),
+                    disallowed_read_paths: Vec::new(),
+                    deny_writes: !ctx.write_mode,
+                },
+                model: None,
+                output_mode: crate::agentic_run::OutputMode::Capture,
+                timeout: self.timeout,
+                paths: Some(&self.paths),
+                settings_dir: self.settings_dir.as_deref(),
+                include_autocoder_tools: false,
+                emit_stream_json_in_capture: false,
+                resume_session_id: ctx.resume_session_id.as_deref(),
+                track_subprocess_marker: false,
+                etxtbsy_retry_spawn: true,
+                os_sandbox: crate::sandbox::current_run_sandbox(self.cli, ctx.write_mode),
+            },
+            // Keep the session alive across turns; the handler prunes via the
+            // 14-day DiscussionState sweep, not per-turn.
+            false,
+            self.session_home.as_deref(),
+        )
+        .await?;
+        if outcome.timed_out {
+            return Ok(crate::executor::DiscussTurn {
+                reply: format!(
+                    "⏱️ The discuss session timed out after {}s before finishing.",
+                    self.timeout.as_secs()
+                ),
+                session_id: outcome.session_handle.or(outcome.session_id),
+                timed_out: true,
+            });
+        }
+        Ok(crate::executor::DiscussTurn {
+            reply: outcome.stdout.trim().to_string(),
+            session_id: outcome.session_handle.or(outcome.session_id),
+            timed_out: false,
+        })
     }
 
     async fn run_issue_triage(
