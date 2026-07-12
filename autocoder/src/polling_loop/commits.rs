@@ -123,11 +123,13 @@ pub async fn run_pass_through_commits(
         paths,
         workspace,
         repo,
+        github_cfg,
         audit_registry,
         audits_cfg,
         audit_settings,
         chatops_ctx,
         queued_audit_types,
+        &pending_filtered,
         processed.len(),
     )
     .await?
@@ -526,16 +528,25 @@ async fn prepare_workspace_for_pass(
 /// and not downgraded, run due audits and signal the caller to stop the
 /// pending walk. Returns true when the queue is blocked. Extracted from
 /// `run_pass_through_commits` (a68 split).
+///
+/// `spec-revision-pr-parks-change`: after the marker check, a change with an
+/// open PR on its spec-revision branch (`<agent_branch>-spec-revision-<change>`)
+/// is ALSO parked — the revision is already in flight, so re-running the gate
+/// would just re-write the `.needs-spec-revision.json` marker the revision
+/// executor cleared. The marker check short-circuits FIRST, so a marked change
+/// never triggers a forge call. The per-change PR query fails open.
 #[allow(clippy::too_many_arguments)]
-async fn handle_blocking_markers_gate(
+pub(crate) async fn handle_blocking_markers_gate(
     paths: &DaemonPaths,
     workspace: &Path,
     repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
     audit_registry: &AuditRegistry,
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,
     chatops_ctx: Option<&ChatOpsContext>,
     queued_audit_types: &std::sync::Mutex<Vec<QueuedAudit>>,
+    pending: &[String],
     committed_count: usize,
 ) -> Result<bool> {
     let blocking_markers = queue::find_queue_blocking_markers(workspace)?;
@@ -573,6 +584,38 @@ async fn handle_blocking_markers_gate(
             "polling pass complete (queue blocked by operator-action markers)"
         );
         return Ok(true);
+    }
+
+    // Spec-revision-PR park: for each pending (unmarked) change, park it when an
+    // open PR exists on its spec-revision branch. `list_pending` already
+    // excludes marker-carrying changes, so this only queries changes with no
+    // marker — one `find_pr_by_head` call per pending change, short-circuiting
+    // on the first park. The helper fails open (WARN, `None`) on a forge error.
+    for change in pending {
+        if let Some((pr_number, pr_url)) =
+            open_spec_revision_pr(repo, github_cfg, change).await
+        {
+            run_due_audits_after_queue(
+                paths,
+                workspace,
+                repo,
+                audit_registry,
+                audits_cfg,
+                audit_settings,
+                chatops_ctx,
+                queued_audit_types,
+            )
+            .await;
+            tracing::info!(
+                url = %repo.url,
+                committed = committed_count,
+                change = %change,
+                pr_number,
+                pr_url = %pr_url,
+                "polling pass complete (queue parked by open spec-revision PR)"
+            );
+            return Ok(true);
+        }
     }
     Ok(false)
 }

@@ -470,6 +470,102 @@ pub(crate) async fn open_pr_exists_for_agent_branch(
     open_pr_exists_for_agent_branch_at(paths, github::DEFAULT_API_BASE, repo, github_cfg).await
 }
 
+/// Return `Some((pr_number, pr_url))` when an OPEN PR exists on the change's
+/// spec-revision branch `<agent_branch>-spec-revision-<change_slug>`, in which
+/// case the caller PARKS the change: a revision is already in flight, so the
+/// spec gate must NOT be re-run for it this iteration (else it would re-add the
+/// `.needs-spec-revision.json` marker the revision executor just cleared).
+///
+/// Fails OPEN: on any failure to perform the check (parse, token, transport,
+/// non-2xx) this logs a WARN and returns `None` so a transient GitHub problem
+/// does not permanently park a change — the same policy as
+/// `open_pr_exists_for_agent_branch_at`. Reuses the `find_pr_by_head` forge call
+/// (which queries `state=open`), so a merged/closed revision PR returns `None`.
+pub(crate) async fn open_spec_revision_pr_at(
+    api_base: &str,
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    change_slug: &str,
+) -> Option<(u64, String)> {
+    let (upstream_owner, upstream_repo) = match github::parse_repo_url(&repo.url) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                change = change_slug,
+                "spec-revision open-PR check skipped: cannot parse repo URL: {e:#}"
+            );
+            return None;
+        }
+    };
+    // Same head-owner resolution as the agent-branch check: the fork owner in
+    // fork-PR mode, the upstream owner in direct mode. The spec-revision branch
+    // lives on the same fork/origin as `agent-q`, so this is identical.
+    let head_owner = github_cfg.fork_owner.as_deref().unwrap_or(&upstream_owner);
+    let branch = crate::polling::revision_session::revision_branch_name(&repo.agent_branch, change_slug);
+
+    let token = match crate::github_credentials::resolve_token(github_cfg, &upstream_owner) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                change = change_slug,
+                "spec-revision open-PR check skipped: token resolution failed: {e:#}"
+            );
+            return None;
+        }
+    };
+
+    use crate::forge::Forge;
+    let result = crate::forge::GithubForge::with_api_base(api_base)
+        .find_pr_by_head(&token, &upstream_owner, &upstream_repo, head_owner, &branch)
+        .await;
+
+    match result {
+        Ok(prs) => match prs.into_iter().next() {
+            Some(pr) => {
+                tracing::info!(
+                    url = %repo.url,
+                    change = change_slug,
+                    branch = branch.as_str(),
+                    pr_number = pr.number,
+                    pr_url = pr.url.as_str(),
+                    "change parked: open spec-revision PR #{} ({}) is in flight; skipping gate for this change",
+                    pr.number,
+                    pr.url
+                );
+                Some((pr.number, pr.url))
+            }
+            None => None,
+        },
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                change = change_slug,
+                branch = branch.as_str(),
+                "spec-revision open-PR check failed: {e:#}; proceeding (not parking this change)"
+            );
+            None
+        }
+    }
+}
+
+/// Production entry point for [`open_spec_revision_pr_at`]: routes to the
+/// test-injected mockito base under `cfg(test)`, else the live GitHub API.
+pub(crate) async fn open_spec_revision_pr(
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    change_slug: &str,
+) -> Option<(u64, String)> {
+    #[cfg(test)]
+    {
+        if let Some(api_base) = test_hooks::github_api_base() {
+            return open_spec_revision_pr_at(&api_base, repo, github_cfg, change_slug).await;
+        }
+    }
+    open_spec_revision_pr_at(github::DEFAULT_API_BASE, repo, github_cfg, change_slug).await
+}
+
 /// Open the audit-triage / chat-triage spec PR. Mirrors the shape of
 /// `polling_loop::open_pull_request` but is purpose-built for the
 /// spec-only triage flow (no reviewer step, no change-list body). Routes
