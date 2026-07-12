@@ -260,9 +260,13 @@ async fn process_continue(deps: &DiscussHandlerDeps, cont: DiscussContinue) -> a
 
 async fn process_send_it(deps: &DiscussHandlerDeps, si: DiscussSendIt) -> anyhow::Result<()> {
     let state_root = discussion_state::default_state_root(&deps.paths);
+    // Defense-in-depth: only an Active discussion can be sent. The dispatcher
+    // already refuses non-Active `send it`, but a second SendIt event (retry,
+    // manual control-socket call, future dispatcher bug) must NOT re-run the
+    // agent and open a duplicate PR. Mirrors the guard in `process_continue`.
     let mut state = match discussion_state::read_state(&state_root, &si.thread_ts).ok().flatten() {
-        Some(s) => s,
-        None => {
+        Some(s) if s.status == DiscussionStatus::Active => s,
+        _ => {
             post_reply(
                 deps,
                 &si.channel,
