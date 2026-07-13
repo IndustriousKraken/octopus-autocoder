@@ -668,7 +668,16 @@ fn build_requirement_index(workspace: &Path) -> HashMap<(String, String), String
             continue;
         }
         let spec = path.join("spec.md");
-        if !spec.is_file() {
+        // Do not follow a symlinked spec (a symlinked `spec.md` OR a symlinked
+        // capability dir): a committed symlink to a host file would otherwise be
+        // read here and its bytes indexed, leaking it. Require the canonical spec
+        // path to be a regular file contained under the specs root. Mirrors the
+        // RAG indexer's `spec_within_root` guard on its identical walk.
+        let within = match (spec.canonicalize(), specs_dir.canonicalize()) {
+            (Ok(real), Ok(root)) => real.is_file() && real.starts_with(&root),
+            _ => false,
+        };
+        if !within {
             continue;
         }
         match crate::rag::chunk_canonical_spec(&spec, ChunkStrategy::PerRequirement) {
@@ -1195,6 +1204,43 @@ mod tests {
         );
         let text = &idx[&("storage".into(), "relational store".into())];
         assert!(text.contains("relational database"));
+    }
+
+    /// Security regression: a `spec.md` committed as a symlink to a file OUTSIDE
+    /// `openspec/specs/` (an in-repo path or an absolute host path) must never be
+    /// followed and read — otherwise the daemon leaks host bytes into the canon
+    /// index. The real spec alongside it is still indexed.
+    #[test]
+    fn build_requirement_index_does_not_follow_symlinked_spec() {
+        use std::os::unix::fs::symlink;
+        let ws = workspace_with_specs(&[(
+            "storage",
+            "# storage\n\n### Requirement: Relational store\nAll data SHALL live in a relational database.\n\n#### Scenario: x\n- **WHEN** y\n- **THEN** z\n",
+        )]);
+        // A file OUTSIDE openspec/specs/ that an attacker points a spec.md at.
+        let secret = ws.path().join("host_secret.txt");
+        std::fs::write(
+            &secret,
+            "### Requirement: LEAKED\nsuper-secret-token-xyz\n\n#### Scenario: s\n- **WHEN** a\n- **THEN** b\n",
+        )
+        .unwrap();
+        let evil_dir = ws.path().join("openspec/specs/evil");
+        std::fs::create_dir_all(&evil_dir).unwrap();
+        symlink(&secret, evil_dir.join("spec.md")).unwrap();
+
+        let idx = build_requirement_index(ws.path());
+        // The real spec is still indexed.
+        assert!(idx.contains_key(&("storage".into(), "relational store".into())));
+        // The symlinked spec's bytes are NOT read/indexed — no host-file leak.
+        assert!(
+            !idx.keys().any(|(cap, _)| cap == "evil"),
+            "symlinked spec.md must not be indexed: {:?}",
+            idx.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !idx.values().any(|v| v.contains("super-secret-token-xyz")),
+            "symlinked host-file bytes must never enter the canon index"
+        );
     }
 
     // ---- report state round-trip ---------------------------------------
