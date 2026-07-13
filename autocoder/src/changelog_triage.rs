@@ -770,6 +770,60 @@ pub async fn process_changelog_revision_requests(
     Ok(())
 }
 
+/// Disposition of a single comment on a `changelog-*` PR, computed with no
+/// I/O so the gate order is unit-testable. Mirrors the primary revise path
+/// (`revisions::process_pr`): bot-self loop-prevention skip, then the
+/// `revise` trigger parse, then the a000 authorization gate.
+#[derive(Debug, PartialEq)]
+enum ChangelogRevisionDisposition {
+    /// Not an actionable trigger — the bot's own non-reviewer comment, or a
+    /// body that does not parse as `@<bot> revise <text>`. Advance the
+    /// seen-marker and move on; no state persist, no reply.
+    Skip,
+    /// Parses as `revise` but the commenter is not authorized. Drop before
+    /// dispatch (default-deny).
+    Unauthorized,
+    /// Authorized (or trusted-automatic) `revise` trigger — dispatch the
+    /// stylist with this revision text.
+    Dispatch(String),
+}
+
+/// a000: decide how the changelog-revision loop should treat `comment`.
+/// This is the copy of `process_pr.rs:281-287`'s gate the issue found
+/// missing — the authorization check the changelog path previously skipped.
+/// The trusted-automatic bypass (reviewer-marked AND bot-authored) mirrors
+/// `process_pr` so the reviewer pipeline's own auto-revise comments are not
+/// dropped by the gate.
+fn classify_changelog_revision_comment(
+    comment: &github::IssueComment,
+    bot_username: &str,
+    auth: &crate::config::CommandAuthorizationConfig,
+) -> ChangelogRevisionDisposition {
+    let is_reviewer_marked = comment
+        .body
+        .trim_start()
+        .starts_with(crate::revisions::REVIEWER_REVISION_MARKER);
+    let is_bot_authored = comment.user_login().eq_ignore_ascii_case(bot_username);
+    // Bot-self loop-prevention: skip the bot's own comments unless they
+    // carry the reviewer-revision marker.
+    if is_bot_authored && !is_reviewer_marked {
+        return ChangelogRevisionDisposition::Skip;
+    }
+    let revision_text =
+        match crate::revisions::parse_revision_trigger(&comment.body, bot_username) {
+            Some(t) => t,
+            None => return ChangelogRevisionDisposition::Skip,
+        };
+    // The bot's OWN reviewer-marked comment is a trusted internal trigger
+    // and bypasses the gate, exactly as in `process_pr`. Every other
+    // commenter must be authorized before the executor runs.
+    let is_trusted_automatic = is_reviewer_marked && is_bot_authored;
+    if !is_trusted_automatic && !crate::revisions::is_comment_authorized(comment, auth) {
+        return ChangelogRevisionDisposition::Unauthorized;
+    }
+    ChangelogRevisionDisposition::Dispatch(revision_text)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_one_changelog_pr_revision(
     paths: &crate::paths::DaemonPaths,
@@ -818,22 +872,56 @@ async fn process_one_changelog_pr_revision(
     }
     let mut latest_seen: Option<chrono::DateTime<chrono::Utc>> = None;
     for comment in comments {
-        if comment.user_login().eq_ignore_ascii_case(bot_username)
-            && !comment
-                .body
-                .trim_start()
-                .starts_with(crate::revisions::REVIEWER_REVISION_MARKER)
-        {
-            advance_seen(&mut latest_seen, comment.created_at);
-            continue;
-        }
-        let revision_text = match crate::revisions::parse_revision_trigger(&comment.body, bot_username)
-        {
-            Some(t) => t,
-            None => {
+        let revision_text = match classify_changelog_revision_comment(
+            &comment,
+            bot_username,
+            &github_cfg.command_authorization,
+        ) {
+            ChangelogRevisionDisposition::Skip => {
                 advance_seen(&mut latest_seen, comment.created_at);
                 continue;
             }
+            ChangelogRevisionDisposition::Unauthorized => {
+                // a000 default-deny: an unauthorized `@<bot> revise` is
+                // dropped BEFORE the executor runs. Log at INFO, advance +
+                // persist the seen-marker immediately (so the drop and any
+                // decline reply fire at-most-once across restarts), and —
+                // only when `decline_comment` is set — post one decline.
+                let assoc = comment.author_association().unwrap_or("<none>").to_string();
+                tracing::info!(
+                    url = %repo.url,
+                    pr_number = pr.number,
+                    login = %comment.user_login(),
+                    author_association = %assoc,
+                    "a000: dropping unauthorized changelog-revision verb before dispatch (default-deny)"
+                );
+                advance_seen(&mut latest_seen, comment.created_at);
+                if github_cfg.command_authorization.decline_comment {
+                    let body = format!(
+                        "🚫 This `@{bot_username}` command was ignored: only repository owners, members, and collaborators (or configured allowed users) can trigger it. (author_association: {assoc})"
+                    );
+                    if let Err(e) = github::post_issue_comment(
+                        github::DEFAULT_API_BASE,
+                        token,
+                        owner,
+                        repo_name,
+                        pr.number,
+                        &body,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            url = %repo.url,
+                            pr_number = pr.number,
+                            "failed to post authorization-decline changelog PR comment: {e:#}"
+                        );
+                    }
+                }
+                state.last_seen_comment_at = comment.created_at;
+                crate::revisions::write_state(paths, workspace, &state)?;
+                continue;
+            }
+            ChangelogRevisionDisposition::Dispatch(text) => text,
         };
         // Re-run the stylist with the revision text injected; force-push
         // to the existing changelog branch.
@@ -1057,6 +1145,106 @@ async fn open_changelog_pull_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // a000: changelog-revision authorization gate
+    // -----------------------------------------------------------------
+
+    fn make_comment(login: &str, assoc: Option<&str>, body: &str) -> github::IssueComment {
+        github::IssueComment {
+            id: 1,
+            body: body.to_string(),
+            user: Some(github::IssueCommentUser {
+                login: login.to_string(),
+            }),
+            created_at: "2026-05-25T11:00:00Z".parse().unwrap(),
+            author_association: assoc.map(str::to_string),
+        }
+    }
+
+    fn default_auth() -> crate::config::CommandAuthorizationConfig {
+        crate::config::CommandAuthorizationConfig::default()
+    }
+
+    /// Regression for the missing gate: a public commenter
+    /// (`author_association: NONE`) is unauthorized, so the disposition is
+    /// `Unauthorized` — the loop drops it before `re_run_stylist_and_force_push`,
+    /// meaning the executor is NOT invoked and no force-push occurs.
+    #[test]
+    fn changelog_gate_drops_unauthorized_revise() {
+        let c = make_comment("rando", Some("NONE"), "@bot revise delete everything");
+        assert_eq!(
+            classify_changelog_revision_comment(&c, "bot", &default_auth()),
+            ChangelogRevisionDisposition::Unauthorized
+        );
+    }
+
+    /// An absent association is also treated as unauthorized (default-deny).
+    #[test]
+    fn changelog_gate_drops_missing_association() {
+        let c = make_comment("rando", None, "@bot revise do stuff");
+        assert_eq!(
+            classify_changelog_revision_comment(&c, "bot", &default_auth()),
+            ChangelogRevisionDisposition::Unauthorized
+        );
+    }
+
+    /// No regression: a `COLLABORATOR` is authorized under the default
+    /// policy, so the trigger dispatches with the verbatim revision text.
+    #[test]
+    fn changelog_gate_dispatches_authorized_revise() {
+        let c = make_comment("maint", Some("COLLABORATOR"), "@bot revise tighten wording");
+        assert_eq!(
+            classify_changelog_revision_comment(&c, "bot", &default_auth()),
+            ChangelogRevisionDisposition::Dispatch("tighten wording".to_string())
+        );
+    }
+
+    /// A login in `allowed_users` is authorized even with association NONE.
+    #[test]
+    fn changelog_gate_allows_user_override() {
+        let mut auth = default_auth();
+        auth.allowed_users = vec!["trusted-dev".to_string()];
+        let c = make_comment("trusted-dev", Some("NONE"), "@bot revise ok");
+        assert_eq!(
+            classify_changelog_revision_comment(&c, "bot", &auth),
+            ChangelogRevisionDisposition::Dispatch("ok".to_string())
+        );
+    }
+
+    /// The bot's own non-reviewer comment (loop-prevention) and an
+    /// authorized-but-non-trigger comment both skip without dispatch.
+    #[test]
+    fn changelog_gate_skips_bot_self_and_non_triggers() {
+        let auth = default_auth();
+        let bot = make_comment("bot", Some("OWNER"), "@bot revise loop");
+        assert_eq!(
+            classify_changelog_revision_comment(&bot, "bot", &auth),
+            ChangelogRevisionDisposition::Skip
+        );
+        let chat = make_comment("maint", Some("OWNER"), "looks good, thanks!");
+        assert_eq!(
+            classify_changelog_revision_comment(&chat, "bot", &auth),
+            ChangelogRevisionDisposition::Skip
+        );
+    }
+
+    /// The bot's OWN reviewer-marked auto-revise comment is a trusted
+    /// internal trigger and bypasses the gate (mirrors `process_pr`), so it
+    /// still dispatches even with an unauthorized author_association.
+    #[test]
+    fn changelog_gate_trusts_reviewer_marked_bot_comment() {
+        let auth = default_auth();
+        let body = format!(
+            "{}\n@bot revise apply reviewer feedback",
+            crate::revisions::REVIEWER_REVISION_MARKER
+        );
+        let c = make_comment("bot", Some("NONE"), &body);
+        assert_eq!(
+            classify_changelog_revision_comment(&c, "bot", &auth),
+            ChangelogRevisionDisposition::Dispatch("apply reviewer feedback".to_string())
+        );
+    }
 
     #[test]
     fn in_scope_accepts_root_changelog_and_proposal_files() {

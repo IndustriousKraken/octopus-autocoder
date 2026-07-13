@@ -471,7 +471,7 @@ pub(crate) fn compose_affordance_reply(bot_username: &str) -> String {
 /// the forge — `GithubForge::authorize` owns the gate. This thin wrapper
 /// keeps the dispatcher's call sites unchanged while routing the decision
 /// through the `Forge` trait (the selected forge decides authorization).
-fn is_comment_authorized(
+pub(crate) fn is_comment_authorized(
     comment: &github::IssueComment,
     auth: &CommandAuthorizationConfig,
 ) -> bool {

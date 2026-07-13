@@ -45,18 +45,18 @@ unauthenticated entry point.
 
 ## Tasks
 
-- [ ] In `process_one_changelog_pr_revision`, after `parse_revision_trigger`
+- [x] In `process_one_changelog_pr_revision`, after `parse_revision_trigger`
   returns a trigger and before `re_run_stylist_and_force_push`, drop the comment
   when `!is_comment_authorized(&comment, &github_cfg.command_authorization)` —
   mirroring `process_pr.rs:281-287`. Respect `decline_comment` (silent by
   default) and advance `last_seen_comment_at` so the drop is at-most-once.
-- [ ] Audit for any other copy of the revise/verb-dispatch shape that may have
+- [x] Audit for any other copy of the revise/verb-dispatch shape that may have
   dropped the same gate (grep for `parse_revision_trigger` call sites and confirm
   each is preceded by an authorization check or is a trusted-internal path).
 
 ## Tests
 
-- [ ] An unauthorized commenter's `@<bot> revise ...` on a `changelog-*` PR is
+- [x] An unauthorized commenter's `@<bot> revise ...` on a `changelog-*` PR is
   dropped: the executor is NOT invoked and no force-push occurs.
-- [ ] An authorized commenter's `@<bot> revise ...` on the same PR still runs the
+- [x] An authorized commenter's `@<bot> revise ...` on the same PR still runs the
   stylist and force-pushes (no regression).

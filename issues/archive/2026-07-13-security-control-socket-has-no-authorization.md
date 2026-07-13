@@ -75,10 +75,27 @@ both holes.
   guard is held for the run and drops (tearing the socket down) on return.
   Documented dev-only gap: sandbox-exec (macOS) cannot remap a path, so there the
   agent reaches the shared socket — the production deployment is Linux.
-- [ ] Register a real schema for every gate role so `record_submission` cannot
+- [x] Register a real schema for every gate role so `record_submission` cannot
   accept an arbitrary "approve" blob (defense-in-depth on top of identity stamping).
-- [ ] Consider an `SO_PEERCRED`/token check as defense-in-depth on the operator
-  socket even though same-uid limits its value.
+  Every daemon-consumed submission role has a registered validator, wired at
+  daemon startup in `cli/run.rs`: `[in]`/`[canon]`/`[rules]` + advisory audits via
+  `control_socket::register_gate_and_audit_submission_schemas`, the reviewer via
+  `code_reviewer::register_reviewer_submission_schema`, and `[out]` via
+  `code_implements_spec::register_code_implements_spec_submission_schema`. Each
+  validator is the role's real payload mapper (e.g. `payload_to_review_result`),
+  so a schema-invalid blob is rejected in `submission_store::record` before any
+  storage. No code change needed here — the gate changes already register these;
+  `record_submission` now conforms to orchestrator-cli "Schema-invalid submission
+  is rejected".
+- [x] Consider an `SO_PEERCRED`/token check as defense-in-depth on the operator
+  socket even though same-uid limits its value. CONSIDERED, deliberately NOT
+  added: the per-session relay socket already makes the operator surface
+  unreachable from the sandbox (the actual threat), so the residual is a same-uid
+  peer on the daemon's own full socket — a canon-accepted non-boundary (the socket
+  is `0600` in a `0750` dir; a same-uid process is already in the daemon's trust
+  domain). `SO_PEERCRED` cannot distinguish same-uid peers and a static token
+  bridged into the sandbox is itself forgeable, so neither adds real protection
+  over the relay isolation. Left out as speculative.
 
 ## Tests
 
@@ -90,7 +107,20 @@ both holes.
   socket is stamped to the executor's own `(workspace, change)` — the reviewer
   slot the daemon consumes stays empty
   (`control_socket::tests::relay_socket_stamps_identity_blocking_verdict_forgery`).
-- [ ] End-to-end (after activation): a spawned agent's MCP child reaches only its
-  per-session relay socket; an operator action over it is refused.
-- [ ] A gate role with a registered schema rejects a payload that doesn't match
-  the schema (forged "approve" blob is refused).
+- [x] End-to-end (after activation): a spawned agent's MCP child reaches only its
+  per-session relay socket; an operator action over it is refused. Covered in
+  substance by the composition of two unit tests (a live spawn-a-real-agent test
+  needs a running daemon + real sandbox + MCP subprocess, which is infeasible /
+  flaky in the CI sandbox): `sandbox::tests::control_socket_remap_binds_relay_over_shared_path`
+  proves the relay socket is bound OVER the unchanged shared control-socket path
+  for both Linux mechanisms (bwrap `--ro-bind-try src dest`, systemd
+  `BindReadOnlyPaths=src:dest`), so the MCP child — connecting to the unchanged
+  `ENV_CONTROL_SOCKET` path — reaches ONLY its own relay socket; and
+  `control_socket::tests::relay_socket_refuses_non_relay_actions` proves an
+  operator action over that relay socket is refused.
+- [x] A gate role with a registered schema rejects a payload that doesn't match
+  the schema (forged "approve" blob is refused)
+  (`control_socket::tests::relay_socket_rejects_schema_invalid_submission`): with
+  the real reviewer schema registered, a reviewer-bound relay's `record_submission`
+  of `{"approved": true}` is rejected (`ok:false`, reason names `submit_review`)
+  and stores nothing, while a valid `{"verdict":"Approve",...}` round-trips.
