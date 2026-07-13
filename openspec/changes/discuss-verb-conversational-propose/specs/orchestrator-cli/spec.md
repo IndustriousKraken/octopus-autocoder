@@ -5,6 +5,11 @@
 ### Requirement: Directive triage uses the existing two-PR mechanic; PRs participate in the revision-loop
 ### Requirement: Proposal-request state files are pruned after 7 days
 
+## RENAMED Requirements
+
+- FROM: `### Requirement: `propose` chatops verb queues a chat-driven triage request`
+- TO: `### Requirement: `propose` chatops verb is a permanent alias for `discuss``
+
 ## MODIFIED Requirements
 
 ### Requirement: `propose` chatops verb is a permanent alias for `discuss`
@@ -50,9 +55,9 @@ The daemon's dedicated discuss handler processes `DiscussAction` items as they a
 - **AND** no state file is written
 
 ### Requirement: Discuss handler processes requests without waiting for the polling loop
-The daemon SHALL maintain a dedicated discuss handler as a persistent async task, separate from the per-repo polling loop. The handler listens for `DiscussAction` and `DiscussContinueAction` control-socket submissions and processes them immediately upon receipt. The handler MUST NOT wait for a polling iteration's sleep timer.
+The daemon SHALL maintain a dedicated discuss handler as a persistent async task, separate from the per-repo polling loop. The handler listens for `DiscussAction`, `DiscussContinueAction`, and `DiscussSendItAction` control-socket submissions and processes them immediately upon receipt. The handler MUST NOT wait for a polling iteration's sleep timer. (`DiscussAction` and `DiscussContinueAction` are handled entirely within the read-only conversational phase described below; `DiscussSendItAction` is handled per the `send it` in a discuss thread creates an artifact sequentially requirement, which is the only path that leaves read-only mode.)
 
-The discuss agent runs in a read-only sandbox (no file writes, no git commits) during the conversational phase. Session state — including a session ID usable for context resumption — is persisted to `DiscussionState` after each agent turn so continuation messages and the eventual `send it` can resume the conversation.
+During the conversational phase the discuss AGENT runs in a read-only sandbox: the sandboxed agentic session performs no file writes and no git commits. This read-only constraint scopes the AGENT's sandbox only — it does NOT constrain the daemon handler, which (outside the agent sandbox, as it does for every lifecycle) still writes daemon-owned state and lifecycle-marker files and commits them where its own requirements direct. Specifically, the handler persists session state — including a session ID usable for context resumption — to `DiscussionState` after each agent turn (so continuation messages and the eventual `send it` can resume the conversation), AND may write and commit the defer marker per `Auto-defer protects an existing spec under active discuss`. The AGENT itself gains file-write and commit capability only on `send it`, per `send it in a discuss thread creates an artifact sequentially`.
 
 The discuss-mode agent prompt SHALL instruct the agent to proactively read:
 - Canonical specs in `openspec/specs/*/spec.md` relevant to the topic.
@@ -107,7 +112,7 @@ The discuss handler queues the artifact-creation job so that it runs AFTER the c
 - **AND** `DiscussionState.status` transitions to `Completed`
 
 ### Requirement: Auto-defer protects an existing spec under active discuss
-When the discuss agent determines during the conversational phase that the operator is discussing a modification to an existing canonical spec or an active change's spec delta, the handler SHALL write the defer marker for the relevant change or spec entry, commit it to the workspace, and post a thread reply naming the deferred unit AND stating the exact command to clear it: `"I've deferred <slug> while we discuss. If you decide not to follow through, clear it with @<bot> undefer <repo> <slug>. I'll clear it automatically when a PR lands."`
+When the discuss agent determines during the conversational phase that the operator is discussing a modification to an existing canonical spec or an active change's spec delta, the handler SHALL write the defer marker for the relevant change or spec entry, commit it to the workspace, and post a thread reply naming the deferred unit AND stating the exact command to clear it. This marker write and commit is a DAEMON-handler action performed outside the agent's read-only sandbox (consistent with the daemon's ownership of lifecycle-marker files); it does NOT grant the sandboxed conversational agent any write capability, which the agent gains only on `send it`. The reply text is: `"I've deferred <slug> while we discuss. If you decide not to follow through, clear it with @<bot> undefer <repo> <slug>. I'll clear it automatically when I open its PR."`
 
 On `send it` completion (PR opened), the handler SHALL clear the defer marker and commit/push the removal. If no `send it` arrives within 7 days of the last thread activity, the handler SHALL post a single idle reminder in the thread naming the deferred unit and restating the undefer command. The reminder fires once per stale discussion.
 

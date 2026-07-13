@@ -55,4 +55,21 @@ On a unique repo match AND `features.brownfield_survey.enabled: true` for that r
 #### Scenario: Help verb lists the new verbs
 - **WHEN** an operator posts `@<bot> help`
 - **THEN** the help output lists `brownfield-survey` (chat-driven workflow) AND `clear-survey` (operator recovery)
-- **AND** `send it`'s help text names all five valid thread contexts (audit, brownfield-survey, issue-candidate, spec-revision, AND discuss)
+- **AND** `send it`'s help text names every valid `send it` thread context, per the single canonical set defined by `Inbound listener dispatches send it by thread context AND refuses untracked threads` (NOT a restated count, so adding a context updates one requirement)
+
+### Requirement: Inbound listener recognizes the `clear-survey` verb
+The inbound listener SHALL recognize `@<bot> clear-survey <repo-substring>` as an operator-recovery verb (alongside `clear-perma-stuck`, `clear-revision`, `clear-scout`, `wipe-workspace`, etc.). The listener SHALL parse the repo-substring per the existing match rule AND submit `ClearSurveyAction { repo_url, channel, thread_ts }`.
+
+#### Scenario: Clear-survey happy path
+- **WHEN** an operator posts `@<bot> clear-survey myrepo` AND the repo resolves uniquely
+- **THEN** a `ClearSurveyAction` is submitted
+- **AND** the polling iteration deletes ALL `BrownfieldSurveyState` files for that repo AND replies with the count
+
+#### Scenario: Clear-survey with no surveys present
+- **WHEN** an operator posts `@<bot> clear-survey myrepo` AND no `BrownfieldSurveyState` files exist for that repo
+- **THEN** the bot replies `✓ Cleared 0 brownfield-survey(s) for <repo_url>.` (idempotent)
+
+#### Scenario: Help verb lists the new verbs
+- **WHEN** an operator posts `@<bot> help`
+- **THEN** the help output lists `brownfield-survey` (chat-driven workflow) AND `clear-survey` (operator recovery)
+- **AND** `send it`'s help text names every valid `send it` thread context, per the single canonical set defined by `Inbound listener dispatches send it by thread context AND refuses untracked threads` (NOT a restated count, so adding a context updates one requirement)
