@@ -56,29 +56,29 @@ credential-exposure severity.
 
 ## Tasks
 
-- [ ] In `cli/run.rs:262`, add the deployment's secret/state paths to
+- [x] In `cli/run.rs:262`, add the deployment's secret/state paths to
   `own_secret_paths`: at minimum `config_dir/secrets.env` (canonicalized), and
   ideally mask the entire config directory. Confirm the mask applies across
   systemd-run, bwrap, and sandbox-exec (the masking path at `sandbox.rs:1121` is
   mechanism-independent).
-- [ ] Give bwrap and sandbox-exec the same curated env systemd-run already gets:
+- [x] Give bwrap and sandbox-exec the same curated env systemd-run already gets:
   add `--clearenv` to `bwrap_argv` then re-inject only the passthrough allowlist;
   `cmd.env_clear()` in `wrap_command` before setting the allowlist for the
   sandbox-exec path. Run every forwarded var through `CredentialFilter::is_credential`.
-- [ ] Replace the `ANTHROPIC_` passthrough prefix with an explicit non-secret
+- [x] Replace the `ANTHROPIC_` passthrough prefix with an explicit non-secret
   name allowlist (`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`), or filter each
   forwarded name through `CredentialFilter::is_credential` before `--setenv`.
-- [ ] Also mask the daemon's resolved state/cache/runtime/logs dirs (they sit
+- [x] Also mask the daemon's resolved state/cache/runtime/logs dirs (they sit
   under the RW `$HOME` in the XDG/dev deployment; see the companion
   control-socket issue for why writable daemon state matters).
 
 ## Tests
 
-- [ ] A sandbox plan built for an executor role masks `secrets.env` (assert the
+- [x] A sandbox plan built for an executor role masks `secrets.env` (assert the
   resolved mask set contains the secrets path) — the `/dev/null` shadow renders
   it unreadable.
-- [ ] The composed bwrap argv contains `--clearenv`; the composed child env for
+- [x] The composed bwrap argv contains `--clearenv`; the composed child env for
   bwrap/sandbox-exec contains none of a set of seeded fake secrets
   (`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`) present in the parent env.
-- [ ] `should_passthrough("ANTHROPIC_API_KEY")` is `false`;
+- [x] `should_passthrough("ANTHROPIC_API_KEY")` is `false`;
   `should_passthrough("ANTHROPIC_BASE_URL")` is `true`.

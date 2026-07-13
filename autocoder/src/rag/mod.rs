@@ -256,12 +256,10 @@ impl CanonicalRagStore {
             let mut guard = self.entries.write().await;
             guard.retain(|e| !to_remove.contains(e.input.capability.as_str()));
         }
+        let specs_root = workspace.join("openspec/specs");
         for cap in capabilities {
-            let path = workspace
-                .join("openspec/specs")
-                .join(cap)
-                .join("spec.md");
-            if path.is_file() {
+            let path = specs_root.join(cap).join("spec.md");
+            if spec_within_root(&specs_root, &path) {
                 new_paths.push(path);
             }
         }
@@ -429,12 +427,32 @@ fn discover_canonical_specs(workspace: &Path) -> Result<Vec<PathBuf>> {
             continue;
         }
         let spec_path = entry.path().join("spec.md");
-        if spec_path.is_file() {
+        if spec_within_root(&specs_root, &spec_path) {
             out.push(spec_path);
         }
     }
     out.sort();
     Ok(out)
+}
+
+/// Accept `spec_path` for indexing only if it is a regular file that,
+/// after fully resolving symlinks, still lives inside `specs_root`.
+///
+/// The daemon reads these files unsandboxed with owner privileges and
+/// hands their contents back to the sandboxed agent via the
+/// `query_canonical_specs` control action. A committed `spec.md` (or an
+/// intermediate `<cap>/` directory) that is a symlink to an absolute
+/// host path — `/etc/passwd`, `~/.ssh/id_ed25519`, a secrets file — must
+/// therefore never be followed. `canonicalize()` resolves the whole
+/// chain, and the `starts_with` containment check rejects any target
+/// that escapes the managed spec tree. Mirrors the no-follow discipline
+/// in `workspace_cache::dir_size`. Canonicalizing the root too handles a
+/// workspace that is itself reached through a symlink.
+fn spec_within_root(specs_root: &Path, spec_path: &Path) -> bool {
+    let (Ok(real), Ok(root)) = (spec_path.canonicalize(), specs_root.canonicalize()) else {
+        return false;
+    };
+    real.is_file() && real.starts_with(&root)
 }
 
 #[cfg(test)]
@@ -613,6 +631,79 @@ mod tests {
         assert_eq!(got_b.entry_count().await, 1);
         let nope = registry.get("never-registered").await;
         assert!(nope.is_none());
+    }
+
+    /// Security regression (issues lane): a `spec.md` committed as a
+    /// symlink must never be followed, so the daemon cannot read a
+    /// symlink target — an in-repo file OR an absolute out-of-tree host
+    /// path — and leak its bytes to the sandboxed agent via
+    /// `query_canonical_specs`. A regular `spec.md` alongside it is still
+    /// indexed (no regression). The symlink targets carry a real
+    /// `### Requirement:` heading so that, were they followed, they would
+    /// definitely produce indexable chunks — the assertions below prove
+    /// they do not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_spec_md_is_skipped_regular_still_indexed() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+
+        // (a) spec.md -> an in-repo secret file.
+        let secret_in_repo = tmp.path().join("secret-in-repo.md");
+        std::fs::write(
+            &secret_in_repo,
+            "### Requirement: Stolen\nIN_REPO_SECRET_TOKEN\n",
+        )
+        .unwrap();
+        let evil_a = tmp.path().join("openspec/specs/evil-a");
+        std::fs::create_dir_all(&evil_a).unwrap();
+        symlink(&secret_in_repo, evil_a.join("spec.md")).unwrap();
+
+        // (b) spec.md -> an absolute out-of-tree host path.
+        let outside = TempDir::new().unwrap();
+        let secret_host = outside.path().join("host-secret.env");
+        std::fs::write(
+            &secret_host,
+            "### Requirement: Stolen\nHOST_SECRET_PASSWORD\n",
+        )
+        .unwrap();
+        let evil_b = tmp.path().join("openspec/specs/evil-b");
+        std::fs::create_dir_all(&evil_b).unwrap();
+        symlink(&secret_host, evil_b.join("spec.md")).unwrap();
+
+        // A legitimate regular spec.
+        write_spec(
+            tmp.path(),
+            "audits",
+            "### Requirement: Audit cadence\nSHALL run audits.\n",
+        );
+
+        // discover_canonical_specs must return only the regular spec.
+        let discovered = discover_canonical_specs(tmp.path()).unwrap();
+        assert_eq!(discovered.len(), 1, "only the regular spec is discovered");
+        assert!(discovered[0].ends_with("audits/spec.md"));
+
+        // And nothing symlinked reaches the index.
+        let store = build_store(tmp.path()).await;
+        assert_eq!(store.entry_count().await, 1);
+        let entries = store.entries.read().await;
+        for e in entries.iter() {
+            assert_eq!(e.input.capability, "audits");
+            assert!(!e.input.text.contains("IN_REPO_SECRET_TOKEN"));
+            assert!(!e.input.text.contains("HOST_SECRET_PASSWORD"));
+        }
+        drop(entries);
+
+        // rebuild_capabilities must also refuse to follow the symlink.
+        store
+            .rebuild_capabilities(tmp.path(), &["evil-a".to_string(), "evil-b".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(store.entry_count().await, 1);
+        let entries = store.entries.read().await;
+        for e in entries.iter() {
+            assert_eq!(e.input.capability, "audits");
+        }
     }
 
     #[test]
