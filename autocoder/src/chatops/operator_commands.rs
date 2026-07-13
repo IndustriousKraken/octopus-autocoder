@@ -153,7 +153,11 @@ pub const MAX_CHANGELOG_RAW_ARGS_LEN: usize = 512;
 
 fn change_slug_regex() -> &'static regex::Regex {
     static R: OnceLock<regex::Regex> = OnceLock::new();
-    R.get_or_init(|| regex::Regex::new(r"^[a-zA-Z0-9_-]{1,64}$").unwrap())
+    // First char is alnum/underscore, NOT `-`: a change slug reaches `openspec`
+    // as a bare positional, so a leading dash would be parsed as a flag rather
+    // than a change name. (The `openspec` call sites also pass `--` before the
+    // slug as belt-and-suspenders.)
+    R.get_or_init(|| regex::Regex::new(r"^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,63}$").unwrap())
 }
 
 fn repo_substring_regex() -> &'static regex::Regex {
@@ -163,7 +167,9 @@ fn repo_substring_regex() -> &'static regex::Regex {
 
 fn audit_substring_regex() -> &'static regex::Regex {
     static R: OnceLock<regex::Regex> = OnceLock::new();
-    R.get_or_init(|| regex::Regex::new(r"^[a-zA-Z0-9_-]{1,64}$").unwrap())
+    // First char is alnum/underscore, NOT `-` (see `change_slug_regex`): this
+    // value reaches `openspec validate <slug> --strict` as a bare positional.
+    R.get_or_init(|| regex::Regex::new(r"^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,63}$").unwrap())
 }
 
 fn invalid_change_slug_reply() -> Reply {
@@ -5297,6 +5303,24 @@ mod tests {
                     .trim_end_matches(".git"),
             ),
         }
+    }
+
+    #[test]
+    fn slug_regexes_reject_leading_dash() {
+        // Normal slugs (including a leading underscore, still allowed) pass.
+        for s in ["a01-roadmap-items", "discuss-verb", "_scratch", "x", "A1_b-c"] {
+            assert!(change_slug_regex().is_match(s), "{s} should be a valid change slug");
+            assert!(audit_substring_regex().is_match(s), "{s} should be a valid audit substring");
+        }
+        // A leading dash would be parsed as an `openspec` flag — reject it.
+        for s in ["-y", "--strict", "-foo", "--", "-"] {
+            assert!(!change_slug_regex().is_match(s), "{s} must be rejected (leading dash)");
+            assert!(!audit_substring_regex().is_match(s), "{s} must be rejected (leading dash)");
+        }
+        // Length bound preserved (1..=64).
+        assert!(change_slug_regex().is_match(&"a".repeat(64)));
+        assert!(!change_slug_regex().is_match(&"a".repeat(65)));
+        assert!(!change_slug_regex().is_match(""));
     }
 
     // ---------- parse_command ----------

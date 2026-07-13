@@ -1385,6 +1385,33 @@ pub async fn agentic_run(opts: AgenticRunOpts<'_>) -> Result<AgenticRunOutcome> 
     let streaming = matches!(opts.output_mode, OutputMode::Streaming);
     let emit_stream_json = streaming || opts.emit_stream_json_in_capture;
 
+    // Per-session relay socket (sandbox authorization isolation). For a run that
+    // advertises the autocoder MCP child — the only runs that relay — stand up a
+    // relay-only, identity-stamped socket bound to THIS session's identity and
+    // (below) remap it over the shared control-socket path inside the sandbox, so
+    // a prompt-injected agent can neither reach operator actions nor forge
+    // another role's gate verdict. The identity mirrors what the daemon consumes
+    // by (`workspace.file_name()`, and `change`==`role`==`opts.change` — the
+    // reviewer/gate/audit role or the executor's change slug). `None` (verify /
+    // standalone, where no daemon relay deps are registered) keeps the shared
+    // socket. Held for the whole run; dropped on return, which tears the socket
+    // down. Created ONCE here, outside `build`, so ETXTBSY retries reuse it.
+    let relay_guard = if opts.include_autocoder_tools {
+        let workspace_basename = opts
+            .workspace
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("workspace")
+            .to_string();
+        crate::control_socket::spawn_session_relay(crate::control_socket::RelayIdentity {
+            workspace_basename,
+            change: opts.change.to_string(),
+            role: opts.change.to_string(),
+        })
+    } else {
+        None
+    };
+
     // The command is pure argv assembly (no IO), so it can be rebuilt on
     // each ETXTBSY retry attempt. The settings file is written exactly
     // once, above.
@@ -1445,7 +1472,20 @@ pub async fn agentic_run(opts: AgenticRunOpts<'_>) -> Result<AgenticRunOutcome> 
                 // masked home. Without this the relay times out: the run does
                 // the work but is never recorded.
                 if let Some(sock) = sandbox_control_socket_bind() {
-                    plan.extra_ro_paths.push(sock);
+                    match &relay_guard {
+                        // Remap the per-session relay socket OVER the shared
+                        // socket path: the MCP child connects to
+                        // `ENV_CONTROL_SOCKET` (unchanged) but reaches its own
+                        // relay-only, identity-stamped socket instead of the
+                        // daemon's full socket.
+                        Some(g) => {
+                            plan.control_socket_remap =
+                                Some((g.socket_path().to_path_buf(), sock));
+                        }
+                        // No relay (verify/standalone): bridge the shared socket
+                        // at its own path as before.
+                        None => plan.extra_ro_paths.push(sock),
+                    }
                 }
                 crate::sandbox::wrap_command(mechanism, &plan, &inner)
             }

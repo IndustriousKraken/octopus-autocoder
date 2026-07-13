@@ -2384,7 +2384,7 @@ pub(crate) async fn handle_defer_or_undefer(parsed: &Value, state: &ControlState
 /// `workspace_basename` or `query`) return `ok: false` per the canonical
 /// request-protocol scenario.
 pub(crate) async fn handle_query_canonical_specs(parsed: &Value, state: &ControlState) -> Value {
-    let workspace_basename = match require_str(parsed, "workspace_basename") {
+    let workspace_basename = match relay_identity_field(parsed, state, "workspace_basename") {
         Ok(s) => s,
         Err(e) => {
             return json!({"ok": false, "error": format!("missing required field: workspace_basename ({e})")});
@@ -2471,11 +2471,11 @@ pub(crate) async fn handle_query_canonical_specs(parsed: &Value, state: &Control
 /// development, NOT to enforce business rules — schema validation is
 /// the MCP layer's responsibility.
 pub(crate) fn handle_record_outcome(parsed: &Value, state: &ControlState) -> Value {
-    let workspace_basename = match require_str(parsed, "workspace_basename") {
+    let workspace_basename = match relay_identity_field(parsed, state, "workspace_basename") {
         Ok(s) => s,
         Err(e) => return json!({"ok": false, "error": e}),
     };
-    let change = match require_str(parsed, "change") {
+    let change = match relay_identity_field(parsed, state, "change") {
         Ok(s) => s,
         Err(e) => return json!({"ok": false, "error": e}),
     };
@@ -2555,15 +2555,18 @@ pub(crate) fn handle_consume_outcome(parsed: &Value, state: &ControlState) -> Va
 /// the MCP relay surfaces to the agent as a correctable tool error).
 /// Parallels [`handle_record_outcome`].
 pub(crate) fn handle_record_submission(parsed: &Value, state: &ControlState) -> Value {
-    let workspace_basename = match require_str(parsed, "workspace_basename") {
+    // On a per-session relay socket these three come from the daemon-bound
+    // identity, NOT the request — so a session cannot submit for another
+    // (workspace, change) or forge another `role`'s verdict.
+    let workspace_basename = match relay_identity_field(parsed, state, "workspace_basename") {
         Ok(s) => s,
         Err(e) => return json!({"ok": false, "error": e}),
     };
-    let change = match require_str(parsed, "change") {
+    let change = match relay_identity_field(parsed, state, "change") {
         Ok(s) => s,
         Err(e) => return json!({"ok": false, "error": e}),
     };
-    let role = match require_str(parsed, "role") {
+    let role = match relay_identity_field(parsed, state, "role") {
         Ok(s) => s,
         Err(e) => return json!({"ok": false, "error": e}),
     };
@@ -2600,15 +2603,15 @@ pub(crate) fn handle_record_submission(parsed: &Value, state: &ControlState) -> 
 /// request returns `{"ok":false,...}` but never changes a gate outcome
 /// (the MCP child treats the relay as fire-and-forget). Observability only.
 pub(crate) fn handle_record_advertised_tool(parsed: &Value, state: &ControlState) -> Value {
-    let workspace_basename = match require_str(parsed, "workspace_basename") {
+    let workspace_basename = match relay_identity_field(parsed, state, "workspace_basename") {
         Ok(s) => s,
         Err(e) => return json!({"ok": false, "error": e}),
     };
-    let change = match require_str(parsed, "change") {
+    let change = match relay_identity_field(parsed, state, "change") {
         Ok(s) => s,
         Err(e) => return json!({"ok": false, "error": e}),
     };
-    let role = match require_str(parsed, "role") {
+    let role = match relay_identity_field(parsed, state, "role") {
         Ok(s) => s,
         Err(e) => return json!({"ok": false, "error": e}),
     };

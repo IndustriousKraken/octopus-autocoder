@@ -760,8 +760,11 @@ pub fn validate_proposal_with_command(
     let out = loop {
         let res = std::process::Command::new(openspec_command)
             .arg("validate")
-            .arg(slug)
             .arg("--strict")
+            // `--` before the slug so a `-`-leading value is never parsed as a
+            // flag (defense-in-depth alongside `change_slug_regex`).
+            .arg("--")
+            .arg(slug)
             .current_dir(workspace)
             .output();
         match res {
