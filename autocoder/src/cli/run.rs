@@ -259,8 +259,26 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     // cannot read or edit them. Operators place config in varying locations
     // (`~/.config/autocoder/`, `~/autocoder/config.yaml`, `/etc/autocoder/`), so
     // this is resolved at runtime, not hardcoded.
-    let own_secret_paths: Vec<std::path::PathBuf> =
+    let mut own_secret_paths: Vec<std::path::PathBuf> =
         vec![std::fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone())];
+    // The installer writes the deployment's raw credential VALUES to a sibling
+    // `secrets.env` (GitHub PAT, chatops + provider tokens), loaded into the
+    // daemon env via `EnvironmentFile=`. Masking only `config.yaml` — which by
+    // default holds env-var NAMES, not values — left `secrets.env` readable to a
+    // same-uid sandboxed agent, so mask it too. A non-existent path (inline-only
+    // deployments) is a harmless no-op: the mask builder drops absent paths.
+    if let Some(dir) = config_path.parent() {
+        let secrets = dir.join("secrets.env");
+        own_secret_paths.push(std::fs::canonicalize(&secrets).unwrap_or(secrets));
+    }
+    // The daemon's own state + run-log dirs are disjoint from the agent's
+    // workspace (under `<cache>/workspaces`) and the control socket (under
+    // `<runtime>`), so masking them cannot break the agent — it stops a
+    // sandboxed agent reading daemon state or tampering with persistence. Cache
+    // and runtime are deliberately NOT masked wholesale (they host the workspace
+    // and socket); finer-grained masking of those is a separate hardening item.
+    own_secret_paths.push(daemon_paths.state.clone());
+    own_secret_paths.push(daemon_paths.logs.clone());
     crate::sandbox::init_global(
         sandbox_mechanism,
         allow_unsandboxed,
@@ -1010,6 +1028,12 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
             );
         }
     }
+    // Shared stores: cloned into the control state AND registered as the
+    // per-session relay deps below (same Arc-backed instances), so an agent's
+    // relay-socket submissions and this daemon's own-socket consume hit the same
+    // store.
+    let outcome_store = crate::outcome_store::OutcomeStore::new();
+    let submission_store = crate::submission_store::SubmissionStore::new();
     let control_state = ControlState {
         github: github_holder.clone(),
         reviewer: reviewer_holder.clone(),
@@ -1021,9 +1045,10 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         repo_tasks_changed: task_map_changed.clone(),
         spawn_repo: spawn_repo.clone(),
         canonical_rag_registry: canonical_rag_registry.clone(),
-        outcome_store: crate::outcome_store::OutcomeStore::new(),
-        submission_store: crate::submission_store::SubmissionStore::new(),
+        outcome_store: outcome_store.clone(),
+        submission_store: submission_store.clone(),
         paths: daemon_paths.clone(),
+        relay_identity: None,
     };
     // Register the gate (`[in]`/`[canon]`/`[rules]`) AND advisory-audit
     // `submit_*` payload schemas on the shared submission store BEFORE the
@@ -1044,6 +1069,17 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     crate::code_implements_spec::register_code_implements_spec_submission_schema(
         &control_state.submission_store,
     );
+    // Register the shared stores so per-session relay sockets (bridged into each
+    // sandboxed agent by `agentic_run`) write into the SAME stores this daemon
+    // drains over its own full socket. The schemas registered just above live on
+    // the same Arc-backed submission store, so relay submissions are validated
+    // identically.
+    crate::control_socket::init_session_relay(crate::control_socket::SessionRelayDeps {
+        canonical_rag_registry: canonical_rag_registry.clone(),
+        outcome_store,
+        submission_store,
+        paths: daemon_paths.clone(),
+    });
     let listener_cancel = cancel.clone();
     let control_handle: JoinHandle<()> = tokio::spawn(async move {
         if let Err(e) = control_socket::listen(control_state, listener_cancel).await {

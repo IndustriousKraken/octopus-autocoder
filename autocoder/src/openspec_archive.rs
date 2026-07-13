@@ -42,7 +42,10 @@ pub struct RealArchiveRunner;
 impl ArchiveRunner for RealArchiveRunner {
     fn run(&self, openspec_cwd: &Path, slug: &str) -> Result<ArchiveRunOutput, String> {
         match std::process::Command::new("openspec")
-            .args(["archive", slug, "-y"])
+            // `--` before the slug so a `-`-leading value can never be parsed as
+            // a flag (defense-in-depth alongside `change_slug_regex`); `-y` stays
+            // before `--` as a real option.
+            .args(["archive", "-y", "--", slug])
             .current_dir(openspec_cwd)
             .output()
         {

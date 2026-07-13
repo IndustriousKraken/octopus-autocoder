@@ -469,6 +469,43 @@ pub struct ControlState {
     /// state/cache/logs/runtime path uses this reference instead of a
     /// process-global.
     pub paths: Arc<crate::paths::DaemonPaths>,
+    /// When `Some`, this state serves a PER-SESSION RELAY socket bridged into
+    /// one sandboxed agent (see [`spawn_session_relay`]). Two effects:
+    ///   1. Dispatch is restricted to [`RELAY_ACTIONS`] — the operator action
+    ///      surface (wipe / rollback / marker clears / queue / reload …) is
+    ///      unreachable from the sandbox.
+    ///   2. The relay handlers STAMP this identity onto every submission,
+    ///      IGNORING the request's `workspace_basename` / `change` / `role`
+    ///      fields — so a prompt-injected agent cannot forge another role's
+    ///      gate verdict (e.g. an executor session claiming `role: reviewer`)
+    ///      or act for another repo/change. `None` on the daemon's own socket
+    ///      and the standalone `verify` submission listener (unchanged).
+    pub relay_identity: Option<Arc<RelayIdentity>>,
+}
+
+/// The `(workspace_basename, change, role)` a per-session relay socket is bound
+/// to. Set by the daemon at agent-spawn time from the SAME source it uses for
+/// the `ORCH_MCP_*` env vars; the agent cannot influence it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayIdentity {
+    pub workspace_basename: String,
+    pub change: String,
+    pub role: String,
+}
+
+/// The ONLY control-socket actions a sandboxed agent's MCP child issues, and
+/// therefore the only ones a per-session relay socket accepts. Everything else
+/// in `DISPATCH` (the operator surface + the daemon/verify-side `consume_*`
+/// reads) is refused when [`ControlState::relay_identity`] is `Some`.
+const RELAY_ACTIONS: &[&str] = &[
+    "record_submission",
+    "record_outcome",
+    "record_advertised_tool",
+    "query_canonical_specs",
+];
+
+fn is_relay_action(action: &str) -> bool {
+    RELAY_ACTIONS.contains(&action)
 }
 
 /// Canonical control-socket path: `<runtime_dir>/control.sock`. The
@@ -565,6 +602,7 @@ fn submission_only_state(
         outcome_store: crate::outcome_store::OutcomeStore::new(),
         submission_store,
         paths,
+        relay_identity: None,
     }
 }
 
@@ -642,6 +680,139 @@ pub fn spawn_submission_listener(
     });
 
     Ok(SubmissionListenerGuard {
+        cancel,
+        socket: path,
+        _handle: handle,
+    })
+}
+
+// ===================================================================
+// Per-session relay sockets (sandbox authorization isolation)
+// ===================================================================
+
+/// The daemon's shared stores a per-session relay listener writes into, so an
+/// agent's submissions/outcomes land where the DAEMON drains them: the agent
+/// records over its per-session relay socket, the daemon consumes over its own
+/// full socket, and both hit these same stores. Registered once at daemon
+/// startup via [`init_session_relay`]; absent in the `verify`/standalone paths,
+/// where [`spawn_session_relay`] returns `None` and the caller keeps the shared
+/// control socket.
+pub struct SessionRelayDeps {
+    pub canonical_rag_registry: crate::rag::CanonicalRagRegistry,
+    pub outcome_store: crate::outcome_store::OutcomeStore,
+    pub submission_store: crate::submission_store::SubmissionStore,
+    pub paths: Arc<crate::paths::DaemonPaths>,
+}
+
+static SESSION_RELAY_DEPS: std::sync::OnceLock<Arc<SessionRelayDeps>> = std::sync::OnceLock::new();
+static SESSION_RELAY_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Register the daemon's shared stores so [`spawn_session_relay`] can stand up
+/// per-session relay sockets. Called once at daemon startup; a second call is
+/// ignored (the first registration wins).
+pub fn init_session_relay(deps: SessionRelayDeps) {
+    let _ = SESSION_RELAY_DEPS.set(Arc::new(deps));
+}
+
+fn current_session_relay() -> Option<Arc<SessionRelayDeps>> {
+    SESSION_RELAY_DEPS.get().cloned()
+}
+
+/// A `ControlState` bound to ONE sandboxed agent: shares the daemon's stores,
+/// serves ONLY the relay actions (via `relay_identity.is_some()`), and stamps
+/// `identity` onto every submission. The operator holders are inert placeholders
+/// (dispatch refuses those actions), mirroring [`submission_only_state`].
+fn session_relay_state(deps: &SessionRelayDeps, identity: RelayIdentity) -> ControlState {
+    let github: GithubConfig =
+        serde_json::from_value(serde_json::json!({})).expect("GithubConfig is fully serde-defaulted");
+    let placeholder_cfg = Config {
+        repositories: Vec::new(),
+        executor: crate::config::placeholder_executor_config(),
+        github: github.clone(),
+        reviewer: None,
+        chatops: None,
+        audits: None,
+        paths: crate::config::DaemonPathsConfig::default(),
+        cache: crate::config::CacheConfig::default(),
+        features: crate::config::FeaturesConfig::default(),
+        canonical_rag: None,
+        models: None,
+        journal_log: None,
+    };
+    let spawn_repo: SpawnRepoFn =
+        Arc::new(|_repo: RepositoryConfig| SpawnOutcome::StartupCheckFailed);
+    ControlState {
+        github: Arc::new(ArcSwap::from_pointee(github)),
+        reviewer: Arc::new(ArcSwap::from_pointee(None)),
+        chatops: Arc::new(ArcSwap::from_pointee(None)),
+        cache: Arc::new(ArcSwap::from_pointee(crate::config::CacheConfig::default())),
+        last_config: Arc::new(ArcSwap::from_pointee(placeholder_cfg)),
+        config_path: PathBuf::new(),
+        repo_tasks: Arc::new(Mutex::new(HashMap::new())),
+        repo_tasks_changed: Arc::new(Notify::new()),
+        spawn_repo,
+        // Share the daemon's real stores so the daemon's own-socket consume sees
+        // what the agent records here.
+        canonical_rag_registry: deps.canonical_rag_registry.clone(),
+        outcome_store: deps.outcome_store.clone(),
+        submission_store: deps.submission_store.clone(),
+        paths: deps.paths.clone(),
+        relay_identity: Some(Arc::new(identity)),
+    }
+}
+
+/// Guard for a per-session relay listener. `Drop` cancels the listener (which
+/// removes the socket file). Hold it for the agent run's lifetime.
+pub struct SessionRelayGuard {
+    cancel: CancellationToken,
+    socket: PathBuf,
+    _handle: JoinHandle<()>,
+}
+
+impl SessionRelayGuard {
+    /// The bound per-session relay socket path, to bridge into the sandbox.
+    pub fn socket_path(&self) -> &Path {
+        &self.socket
+    }
+}
+
+impl Drop for SessionRelayGuard {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+/// Stand up a per-session relay socket bound to `identity`, sharing the daemon's
+/// stores, serving ONLY [`RELAY_ACTIONS`] and stamping `identity` onto every
+/// submission. Returns `None` when the daemon relay deps were never registered
+/// (the `verify`/standalone paths, or a bind failure) — the caller then keeps
+/// the shared control socket. Bridge the guard's `socket_path()` into the
+/// agent's sandbox and hold the guard for the run's lifetime; dropping it tears
+/// the socket down.
+pub fn spawn_session_relay(identity: RelayIdentity) -> Option<SessionRelayGuard> {
+    let deps = current_session_relay()?;
+    let n = SESSION_RELAY_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = deps.paths.runtime.join("relay").join(format!("relay-{n}.sock"));
+    let listener = match bind_at(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(
+                "could not bind per-session relay socket {}: {e:#}; agent will use the shared socket",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let state = session_relay_state(&deps, identity);
+    let cancel = CancellationToken::new();
+    let serve_cancel = cancel.clone();
+    let serve_path = path.clone();
+    let handle: JoinHandle<()> = tokio::spawn(async move {
+        if let Err(e) = serve(listener, serve_path, state, serve_cancel).await {
+            tracing::error!("per-session relay listener exited: {e:#}");
+        }
+    });
+    Some(SessionRelayGuard {
         cancel,
         socket: path,
         _handle: handle,
@@ -894,6 +1065,17 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
             return json!({"ok": false, "error": "malformed request: missing `action` field"});
         }
     };
+    // A per-session relay socket (bridged into a sandboxed agent) accepts ONLY
+    // the agent's relay actions. The operator surface — wipe / rollback / marker
+    // clears / queue / reload, plus the daemon-side `consume_*` reads — is
+    // refused here, so a prompt-injected agent cannot reach it.
+    if state.relay_identity.is_some() && !is_relay_action(&action) {
+        tracing::warn!(action = %action, "refused non-relay action on a sandbox relay socket");
+        return json!({
+            "ok": false,
+            "error": format!("action `{action}` is not permitted on a sandbox relay socket")
+        });
+    }
     match DISPATCH.iter().find(|(name, _)| *name == action.as_str()) {
         Some((_, handler)) => handler(&parsed, state).await,
         None => json!({"ok": false, "error": format!("unknown action: {action}")}),
@@ -1000,6 +1182,30 @@ fn require_str(parsed: &Value, field: &str) -> std::result::Result<String, Strin
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| format!("missing `{field}` field"))
+}
+
+/// Resolve an identity field (`workspace_basename` / `change` / `role`) for a
+/// relay handler. On a per-session relay socket (`state.relay_identity` is
+/// `Some`) the daemon-bound value is authoritative and the request's field is
+/// IGNORED — this is what stops a sandboxed agent forging another role's gate
+/// verdict or acting for another workspace/change. Off a relay socket (the
+/// daemon's own socket, the standalone `verify` listener) it reads the request
+/// field exactly as before. A non-identity field always falls through to the
+/// request.
+pub(crate) fn relay_identity_field(
+    parsed: &Value,
+    state: &ControlState,
+    field: &str,
+) -> std::result::Result<String, String> {
+    if let Some(id) = &state.relay_identity {
+        match field {
+            "workspace_basename" => return Ok(id.workspace_basename.clone()),
+            "change" => return Ok(id.change.clone()),
+            "role" => return Ok(id.role.clone()),
+            _ => {}
+        }
+    }
+    require_str(parsed, field)
 }
 
 /// Outcome of [`preempt_and_acquire_busy_marker`] on success: the held

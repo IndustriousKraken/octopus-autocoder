@@ -405,6 +405,17 @@ pub struct SandboxPlan {
     /// `connect()` to relay outcomes/submissions even when the socket lives
     /// under `/tmp` or a masked home.
     pub extra_ro_paths: Vec<PathBuf>,
+    /// Bind the per-session relay socket (`.0`, on the host) at the daemon
+    /// control-socket path (`.1`, inside the namespace), so a sandboxed agent's
+    /// MCP child — which connects to the control-socket path from
+    /// `ENV_CONTROL_SOCKET`, unchanged — actually reaches its OWN relay socket
+    /// (relay-only, identity-stamped) instead of the daemon's full socket.
+    /// `None` keeps the prior behavior (the shared socket, bound via
+    /// `extra_ro_paths`). Applied AFTER `extra_ro_paths` so it wins the path.
+    /// bwrap/systemd honor the source≠dest bind; sandbox-exec (macOS dev) cannot
+    /// remap a path, so there the agent still reaches the shared socket — a
+    /// documented dev-only gap (the production deployment is Linux).
+    pub control_socket_remap: Option<(PathBuf, PathBuf)>,
     /// Writable, ephemeral (tmpfs) subtrees overlaid on top of the read-only
     /// workspace, so a CLI can write its project-local scratch
     /// ([`cli_workspace_scratch`]) without the repo files becoming writable.
@@ -453,19 +464,91 @@ impl InnerCommand {
     }
 }
 
-/// Env-var names/prefixes forwarded into the `systemd-run` service unit (which
-/// does NOT inherit the caller's full environment). The wrapped CLI needs
-/// `HOME`/`PATH`/`USER` to locate its store + binaries; the MCP child needs
-/// the `ORCH_*` control-socket vars; the strategy's explicit `ANTHROPIC_*` /
-/// model-selection env is forwarded separately from [`InnerCommand::env`].
-const SYSTEMD_ENV_PASSTHROUGH: &[&str] = &["HOME", "PATH", "USER", "LOGNAME", "LANG", "TERM"];
-const SYSTEMD_ENV_PASSTHROUGH_PREFIXES: &[&str] = &["ORCH_", "XDG_", "ANTHROPIC_"];
+/// The curated agent-env passthrough allowlist: the ONLY daemon-environment
+/// variables forwarded from the daemon's process env into a sandboxed agent.
+/// Applied uniformly by all three mechanisms — `systemd-run` (which does NOT
+/// inherit the caller's env) forwards these via `--setenv`, and bwrap /
+/// sandbox-exec re-inject exactly this set after clearing the inherited env in
+/// [`wrap_command`]. The wrapped CLI needs `HOME`/`PATH`/`USER` to locate its
+/// store + binaries; the MCP child needs the `ORCH_*` control-socket vars; the
+/// non-secret Anthropic routing knobs let a self-hosted gateway work.
+///
+/// This is a POSITIVE allowlist and MUST stay credential-free: no `api_key`,
+/// token, or secret-bearing name belongs here. In particular the prefix set
+/// deliberately does NOT include `ANTHROPIC_` — that would also match
+/// `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` and leak the daemon's own key
+/// to the agent. A provider key the agent legitimately needs is opted in
+/// per-role and rides [`InnerCommand::env`], not this passthrough.
+const SYSTEMD_ENV_PASSTHROUGH: &[&str] = &[
+    "HOME",
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "TERM",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+];
+const SYSTEMD_ENV_PASSTHROUGH_PREFIXES: &[&str] = &["ORCH_", "XDG_"];
 
 fn should_passthrough(name: &str) -> bool {
-    SYSTEMD_ENV_PASSTHROUGH.contains(&name)
-        || SYSTEMD_ENV_PASSTHROUGH_PREFIXES
-            .iter()
-            .any(|p| name.starts_with(p))
+    // Explicit, hand-curated non-secret names pass unconditionally. This admits
+    // `ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL`, which the credential filter below
+    // would otherwise reject on its `ANTHROPIC_` prefix.
+    if SYSTEMD_ENV_PASSTHROUGH.contains(&name) {
+        return true;
+    }
+    // The prefixes (`ORCH_`, `XDG_`) are open-ended, so guard them with the
+    // shared credential filter (defense in depth): a wildcard match that
+    // nonetheless looks credential-bearing (`*_TOKEN` / `*_KEY` / `AWS_*` / …) is
+    // dropped, never forwarded to a prompt-injectable agent. Uses the strict
+    // DEFAULT patterns, NOT the operator's `agent_env` relaxations — the sandbox
+    // boundary must not loosen just because a toolchain var was allowlisted for
+    // the login-shell capture.
+    SYSTEMD_ENV_PASSTHROUGH_PREFIXES
+        .iter()
+        .any(|p| name.starts_with(p))
+        && !crate::agent_env::CredentialFilter::default().is_credential(name)
+}
+
+/// The curated daemon-environment variables re-injected into a bwrap /
+/// sandbox-exec child after [`wrap_command`] clears the inherited env: the
+/// `daemon_env` pairs whose name passes [`should_passthrough`]. Any variable
+/// NOT returned here — every secret the daemon holds (GitHub PAT, provider
+/// keys, `EnvironmentFile` values) — is dropped and never reaches the agent.
+fn reinjected_env(
+    daemon_env: impl Iterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    daemon_env
+        .filter(|(k, _)| k.to_str().is_some_and(should_passthrough))
+        .collect()
+}
+
+/// The full curated child environment an argv-encoding mechanism forwards into
+/// a sandboxed agent: the strategy's explicit `inner_env` FIRST, then every
+/// `daemon_env` var whose name passes [`should_passthrough`] and does not
+/// collide with an explicit name (so `inner.env` wins a collision). Every daemon
+/// secret — GitHub PAT, provider keys, `EnvironmentFile` values — is dropped.
+/// Shared by both Linux mechanisms that build their own env from scratch:
+/// `systemd-run` (which does NOT inherit the caller's env) forwards each via
+/// `--setenv=K=V`, and bwrap (which `--clearenv`s its inherited env) re-adds
+/// each via `--setenv K V`.
+fn forwarded_child_env(
+    inner_env: &[(OsString, OsString)],
+    daemon_env: impl Iterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    let explicit: std::collections::HashSet<&OsStr> =
+        inner_env.iter().map(|(k, _)| k.as_os_str()).collect();
+    let mut out: Vec<(OsString, OsString)> = inner_env.to_vec();
+    for (k, v) in daemon_env {
+        if explicit.contains(k.as_os_str()) {
+            continue;
+        }
+        if k.to_str().is_some_and(should_passthrough) {
+            out.push((k, v));
+        }
+    }
+    out
 }
 
 /// Build the full `systemd-run` argv (program included) for `plan` wrapping
@@ -564,28 +647,25 @@ pub fn systemd_run_argv(plan: &SandboxPlan, inner: &InnerCommand) -> Vec<OsStrin
     for p in &plan.extra_ro_paths {
         prop(&mut argv, "BindReadOnlyPaths", p.as_os_str());
     }
-
-    // Forward the strategy's explicit env + the curated passthrough set.
-    for (k, v) in &inner.env {
-        let mut s = OsString::from("--setenv=");
-        s.push(k);
-        s.push("=");
-        s.push(v);
-        argv.push(s);
+    // Per-session relay socket bound AT the daemon control-socket path
+    // (systemd's `src:dest` BindReadOnlyPaths form), so the MCP child connecting
+    // to `ENV_CONTROL_SOCKET` reaches its own relay socket. Applied last so it
+    // wins the destination path.
+    if let Some((src, dest)) = &plan.control_socket_remap {
+        let mut spec = src.as_os_str().to_os_string();
+        spec.push(":");
+        spec.push(dest.as_os_str());
+        prop(&mut argv, "BindReadOnlyPaths", &spec);
     }
-    let explicit: std::collections::HashSet<&OsStr> =
-        inner.env.iter().map(|(k, _)| k.as_os_str()).collect();
-    for (k, v) in std::env::vars_os() {
-        if explicit.contains(k.as_os_str()) {
-            continue;
-        }
-        if k.to_str().is_some_and(should_passthrough) {
-            let mut s = OsString::from("--setenv=");
-            s.push(&k);
-            s.push("=");
-            s.push(&v);
-            argv.push(s);
-        }
+
+    // Forward the strategy's explicit env + the curated passthrough set; every
+    // daemon secret is dropped (systemd-run does not inherit the caller's env).
+    for (k, v) in forwarded_child_env(&inner.env, std::env::vars_os()) {
+        let mut s = OsString::from("--setenv=");
+        s.push(&k);
+        s.push("=");
+        s.push(&v);
+        argv.push(s);
     }
 
     argv.push(OsString::from("--"));
@@ -595,10 +675,15 @@ pub fn systemd_run_argv(plan: &SandboxPlan, inner: &InnerCommand) -> Vec<OsStrin
 }
 
 /// Build the full `bwrap` argv (program included) for `plan` wrapping `inner`.
-/// `bwrap` inherits the caller's environment, so the strategy's explicit env
-/// is applied onto the wrapper [`tokio::process::Command`] in
-/// [`wrap_command`] rather than encoded here. Network namespaces are NOT
-/// unshared (egress stays open by design).
+/// `bwrap` would otherwise inherit the caller's — i.e. the daemon's — full
+/// environment, which carries the deployment's secrets (GitHub PAT,
+/// `ANTHROPIC_API_KEY`, `EnvironmentFile` values). `--clearenv` wipes that
+/// inherited env, and the curated [`forwarded_child_env`] set is re-injected via
+/// `--setenv` (below) so a sandboxed agent's `printenv` sees no daemon secret —
+/// parity with `systemd-run`, which builds its child env the same way.
+/// ([`wrap_command`] also `env_clear`s the wrapper command, so the bwrap process
+/// itself never even holds the secrets.) Network namespaces are NOT unshared
+/// (egress stays open by design).
 pub fn bwrap_argv(plan: &SandboxPlan, inner: &InnerCommand) -> Vec<OsString> {
     let mut argv: Vec<OsString> = Vec::new();
     let push = |argv: &mut Vec<OsString>, s: &str| argv.push(OsString::from(s));
@@ -606,6 +691,10 @@ pub fn bwrap_argv(plan: &SandboxPlan, inner: &InnerCommand) -> Vec<OsString> {
     push(&mut argv, SandboxMechanism::Bwrap.program());
     push(&mut argv, "--die-with-parent");
     push(&mut argv, "--new-session");
+    // Env hygiene: clear the inherited daemon env FIRST; the `--setenv`
+    // re-injection near the end (bwrap applies env ops in argv order, so
+    // `--setenv` after `--clearenv` survives) restores only the curated set.
+    push(&mut argv, "--clearenv");
     // Isolate namespaces EXCEPT the network (egress stays open by design).
     push(&mut argv, "--unshare-user");
     push(&mut argv, "--unshare-ipc");
@@ -704,6 +793,15 @@ pub fn bwrap_argv(plan: &SandboxPlan, inner: &InnerCommand) -> Vec<OsString> {
         argv.push(p.as_os_str().to_os_string());
         argv.push(p.as_os_str().to_os_string());
     }
+    // Per-session relay socket bound AT the daemon control-socket path (bwrap
+    // takes distinct SRC DEST), so the MCP child connecting to
+    // `ENV_CONTROL_SOCKET` reaches its own relay socket. Applied last (bwrap is
+    // last-mount-wins) so it shadows the shared socket at that path.
+    if let Some((src, dest)) = &plan.control_socket_remap {
+        push(&mut argv, "--ro-bind-try");
+        argv.push(src.as_os_str().to_os_string());
+        argv.push(dest.as_os_str().to_os_string());
+    }
 
     for cap in DROPPED_CAPS {
         push(&mut argv, "--cap-drop");
@@ -712,6 +810,15 @@ pub fn bwrap_argv(plan: &SandboxPlan, inner: &InnerCommand) -> Vec<OsString> {
 
     push(&mut argv, "--chdir");
     argv.push(plan.workspace.as_os_str().to_os_string());
+
+    // Re-inject the curated child env after `--clearenv` (bwrap `--setenv` takes
+    // NAME and VALUE as two args). Same set systemd-run forwards: the strategy's
+    // explicit env + the passthrough allowlist; every daemon secret is dropped.
+    for (k, v) in forwarded_child_env(&inner.env, std::env::vars_os()) {
+        push(&mut argv, "--setenv");
+        argv.push(k);
+        argv.push(v);
+    }
 
     push(&mut argv, "--");
     argv.push(inner.program.clone());
@@ -831,6 +938,13 @@ pub fn seatbelt_profile(plan: &SandboxPlan) -> String {
     for p in &plan.extra_ro_paths {
         out.push_str(&format!("(allow file-read* (literal {}))\n", sb_quote(p)));
     }
+    // sandbox-exec cannot bind-remap a path: allow the child to reach the
+    // control-socket DEST directly. On macOS that path is the daemon's shared
+    // socket, so the agent reaches the full surface rather than a relay socket —
+    // a documented dev-only gap (production is Linux bwrap/systemd, which remap).
+    if let Some((_src, dest)) = &plan.control_socket_remap {
+        out.push_str(&format!("(allow file-read* (literal {}))\n", sb_quote(dest)));
+    }
     // Writable project scratch on top of the read-only workspace (a CLI's
     // `<workspace>/.opencode`-style dir). Last-match-wins, so this re-allows
     // writes to the scratch subtree after the workspace write-deny above; the
@@ -885,9 +999,30 @@ pub fn wrap_command(
     };
     let mut cmd = tokio::process::Command::new(&argv[0]);
     cmd.args(&argv[1..]);
-    // bwrap inherits the env; systemd-run encodes it as --setenv (above) but
-    // setting it on the wrapper too is harmless. Either way the strategy's
-    // explicit env reaches the inner command.
+    // Environment hygiene. bwrap and sandbox-exec (Seatbelt) both inherit the
+    // wrapper's — i.e. the daemon's — full environment, which carries the
+    // deployment's secrets (GITHUB_TOKEN, ANTHROPIC_API_KEY, EnvironmentFile
+    // values). Clear it and re-inject ONLY the curated `should_passthrough`
+    // allowlist, so a sandboxed agent's `printenv` sees no daemon secret. This
+    // brings both mechanisms to parity with systemd-run, which already runs the
+    // unit with exactly this set (via `--setenv`) plus `inner.env` — so the set
+    // is already proven sufficient for the agent + its MCP child to function.
+    // systemd-run itself needs the wrapper's inherited env to find its binary
+    // and start the transient unit, and it does NOT pass that inherited env into
+    // the unit, so it is left untouched.
+    if matches!(
+        mechanism,
+        SandboxMechanism::Bwrap | SandboxMechanism::SandboxExec
+    ) {
+        cmd.env_clear();
+        for (k, v) in reinjected_env(std::env::vars_os()) {
+            cmd.env(k, v);
+        }
+    }
+    // The strategy's explicit env (model selection, an opt-in provider key, the
+    // per-spawn ORCH_MCP_* identity vars) reaches the inner command. Applied
+    // LAST so it wins any collision with the passthrough set. For systemd-run
+    // this is belt-and-suspenders (the argv already carries `--setenv`).
     for (k, v) in &inner.env {
         cmd.env(k, v);
     }
@@ -1214,6 +1349,9 @@ impl RunSandbox {
             // Populated by the caller (agentic_run) with the control socket
             // when the relay is configured; the plan builder itself adds none.
             extra_ro_paths: Vec::new(),
+            // Set by the caller (agentic_run) to a per-session relay socket; the
+            // plan builder itself does not remap.
+            control_socket_remap: None,
             workspace_scratch,
             siblings_ro,
         }
@@ -1459,6 +1597,7 @@ mod tests {
             home: PathBuf::from("/home/u"),
             policy: FsPolicy::Denylist { mask },
             extra_ro_paths: Vec::new(),
+            control_socket_remap: None,
             workspace_scratch: Vec::new(),
             siblings_ro: None,
         }
@@ -1482,6 +1621,7 @@ mod tests {
             },
             home,
             extra_ro_paths: Vec::new(),
+            control_socket_remap: None,
             workspace_scratch: Vec::new(),
             siblings_ro: None,
         }
@@ -1516,6 +1656,200 @@ mod tests {
             argv.iter().any(|a| a == &format!("--property=InaccessiblePaths={}", cfg.display())),
             "systemd argv must mask the daemon config: {argv:?}"
         );
+    }
+
+    /// The agent-env passthrough allowlist admits the operational vars the agent
+    /// and its MCP child need, and rejects every secret the daemon may hold.
+    /// `ANTHROPIC_API_KEY` is the explicit regression guard: the previous
+    /// `ANTHROPIC_` passthrough PREFIX matched — and leaked — it.
+    #[test]
+    fn passthrough_allowlist_admits_operational_vars_and_rejects_secrets() {
+        for name in [
+            "HOME",
+            "PATH",
+            "USER",
+            "LANG",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_MODEL",
+            "ORCH_MCP_ROLE",
+            "ORCH_DAEMON_CONTROL_SOCKET",
+            "XDG_RUNTIME_DIR",
+        ] {
+            assert!(should_passthrough(name), "{name} must pass the agent-env allowlist");
+        }
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "GITHUB_TOKEN",
+            "SLACK_BOT_TOKEN",
+            "OPENAI_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "TOTALLY_MADE_UP_SECRET",
+            // Defense in depth: a credential-looking name that DOES match an
+            // open-ended prefix is still dropped by the credential-filter guard.
+            "ORCH_SESSION_TOKEN",
+            "XDG_SIGNING_KEY",
+        ] {
+            assert!(!should_passthrough(name), "{name} must NOT reach a sandboxed agent");
+        }
+    }
+
+    /// Exploit-style: given a daemon environment holding the deployment's
+    /// secrets alongside operational vars (as it looks on a real box loading
+    /// `secrets.env` via `EnvironmentFile=`), the set re-injected into a
+    /// bwrap/sandbox-exec child after `env_clear` contains NONE of the secrets
+    /// and ALL of the operational vars. This is the negative half of the
+    /// credential-isolation guarantee (`wrap_command` clears the inherited env,
+    /// then re-adds only this set).
+    #[test]
+    fn reinjected_env_drops_daemon_secrets_and_keeps_operational_vars() {
+        let daemon_env = [
+            ("GITHUB_TOKEN", "ghp_secret"),
+            ("ANTHROPIC_API_KEY", "sk-ant-secret"),
+            ("SLACK_BOT_TOKEN", "xoxb-secret"),
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/u"),
+            ("ORCH_DAEMON_CONTROL_SOCKET", "/run/x.sock"),
+            ("ANTHROPIC_BASE_URL", "https://gw.example"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+
+        let kept: Vec<String> = reinjected_env(daemon_env)
+            .into_iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+
+        for secret in ["GITHUB_TOKEN", "ANTHROPIC_API_KEY", "SLACK_BOT_TOKEN"] {
+            assert!(!kept.contains(&secret.to_string()), "{secret} leaked into the sandbox env");
+        }
+        for keep in ["PATH", "HOME", "ORCH_DAEMON_CONTROL_SOCKET", "ANTHROPIC_BASE_URL"] {
+            assert!(kept.contains(&keep.to_string()), "{keep} must reach the agent");
+        }
+    }
+
+    /// `wrap_command` for bwrap wires the two halves together: the strategy's
+    /// explicit `inner.env` reaches the child, and an operational var from the
+    /// process env is re-injected after the clear (so the agent is not starved
+    /// of `PATH`). The DROP of daemon secrets is covered by
+    /// `reinjected_env_drops_daemon_secrets_and_keeps_operational_vars`.
+    #[test]
+    fn wrap_command_bwrap_reinjects_allowlist_and_inner_env() {
+        let cmd = wrap_command(SandboxMechanism::Bwrap, &deny_plan(true, Vec::new()), &inner());
+        let envs: Vec<(String, Option<String>)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v.as_deref() == Some("https://example.invalid")),
+            "inner.env must reach the child: {envs:?}"
+        );
+        assert!(
+            envs.iter().any(|(k, _)| k == "PATH"),
+            "bwrap wrapper must re-inject PATH after env_clear: {envs:?}"
+        );
+    }
+
+    /// `forwarded_child_env` — the set both systemd-run and bwrap re-inject after
+    /// building their child env from scratch — drops every daemon secret (as seen
+    /// on a real box loading `secrets.env` via `EnvironmentFile=`) while keeping
+    /// the passthrough allowlist and the strategy's explicit `inner.env`. Uses a
+    /// synthetic daemon env (edition-2024 `set_var` is unsafe + racy, so the file
+    /// tests the pure builder, not the live process env).
+    #[test]
+    fn forwarded_child_env_drops_secrets_and_keeps_allowlist_plus_inner() {
+        let inner_env = vec![
+            (OsString::from("ANTHROPIC_BASE_URL"), OsString::from("https://gw")),
+            (OsString::from("ORCH_MCP_ROLE"), OsString::from("executor")),
+        ];
+        // GITHUB_TOKEN + ANTHROPIC_API_KEY seeded in the "parent" env; a value for
+        // ANTHROPIC_BASE_URL collides with inner.env (inner.env must win).
+        let daemon_env = [
+            ("GITHUB_TOKEN", "ghp_secret"),
+            ("ANTHROPIC_API_KEY", "sk-ant-secret"),
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/u"),
+            ("ANTHROPIC_BASE_URL", "https://leak"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+
+        let out: Vec<(String, String)> = forwarded_child_env(&inner_env, daemon_env)
+            .into_iter()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+            .collect();
+        let names: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+
+        for secret in ["GITHUB_TOKEN", "ANTHROPIC_API_KEY"] {
+            assert!(!names.contains(&secret), "{secret} leaked into the child env: {out:?}");
+        }
+        for keep in ["PATH", "HOME", "ANTHROPIC_BASE_URL", "ORCH_MCP_ROLE"] {
+            assert!(names.contains(&keep), "{keep} must reach the child: {out:?}");
+        }
+        // inner.env wins the name collision — the daemon's value never overrides.
+        let base = out.iter().find(|(k, _)| k == "ANTHROPIC_BASE_URL").unwrap();
+        assert_eq!(base.1, "https://gw", "inner.env must win the collision, not the daemon env");
+    }
+
+    /// The composed bwrap argv clears the inherited daemon env and re-injects
+    /// only the curated set: `--clearenv` is present and precedes every
+    /// `--setenv` (bwrap applies env ops in argv order, so the re-injected vars
+    /// must come after the clear to survive), and the strategy's `inner.env` is
+    /// forwarded as a `--setenv NAME VALUE` pair.
+    #[test]
+    fn bwrap_argv_clears_env_before_reinjecting_allowlist() {
+        let a = osv(&bwrap_argv(&deny_plan(true, Vec::new()), &inner()));
+        let clear_at = a
+            .iter()
+            .position(|x| x == "--clearenv")
+            .expect("bwrap argv must --clearenv the inherited daemon env");
+        if let Some(se) = a.iter().position(|x| x == "--setenv") {
+            assert!(clear_at < se, "--clearenv must precede --setenv so re-injected vars survive: {a:?}");
+        }
+        // inner.env re-injected: `--setenv ANTHROPIC_BASE_URL https://example.invalid`.
+        let base = a
+            .iter()
+            .position(|x| x == "ANTHROPIC_BASE_URL")
+            .expect("inner.env must be re-injected via --setenv");
+        assert_eq!(a[base - 1], "--setenv");
+        assert_eq!(a[base + 1], "https://example.invalid");
+    }
+
+    /// The daemon's OWN secret paths added at run-start — the sibling
+    /// `secrets.env` FILE and a daemon state/log DIR — are masked. Exercises the
+    /// directory branch of the mask builder (`own_secret_paths` previously only
+    /// ever held the config file, a regular file).
+    #[test]
+    fn own_secret_paths_mask_covers_secrets_file_and_state_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let secrets = root.path().join("secrets.env");
+        std::fs::write(&secrets, "GITHUB_TOKEN=ghp_x\n").unwrap();
+        let state_dir = root.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let run = RunSandbox {
+            workspace_writable: true,
+            own_secret_paths: vec![secrets.clone(), state_dir.clone()],
+            ..Default::default()
+        };
+        let mask = run.resolve_mask_list(root.path());
+        let secrets_entry = mask
+            .iter()
+            .find(|e| e.path == secrets)
+            .expect("secrets.env must be masked");
+        assert!(!secrets_entry.is_dir, "secrets.env is a file → /dev/null shadow");
+        let state_entry = mask
+            .iter()
+            .find(|e| e.path == state_dir)
+            .expect("state dir must be masked");
+        assert!(state_entry.is_dir, "state dir is a directory → tmpfs");
     }
 
     /// B+D: under the denylist the workspaces-parent is bound read-only while the
@@ -1679,6 +2013,37 @@ mod tests {
         let mut p = allow_plan(false, true);
         p.extra_ro_paths.push(PathBuf::from(SOCK));
         p
+    }
+
+    /// The per-session relay socket is bound AT the shared control-socket path
+    /// (source≠dest) so the MCP child — connecting to the unchanged control-socket
+    /// path — reaches its own relay socket. Verified for both Linux mechanisms.
+    #[test]
+    fn control_socket_remap_binds_relay_over_shared_path() {
+        let mut plan = deny_plan(true, sample_mask());
+        plan.control_socket_remap = Some((
+            PathBuf::from("/run/relay/relay-0.sock"),
+            PathBuf::from("/run/control.sock"),
+        ));
+        // bwrap: `--ro-bind-try <src> <dest>` (the only ro-bind-try — deny-mode
+        // extra_ro_paths is empty).
+        let a = osv(&bwrap_argv(&plan, &inner()));
+        let pos = a
+            .iter()
+            .position(|x| x == "/run/relay/relay-0.sock")
+            .expect("relay src must be bound in bwrap argv");
+        assert_eq!(a[pos - 1], "--ro-bind-try");
+        assert_eq!(
+            a[pos + 1], "/run/control.sock",
+            "relay must be bound AT the shared socket path: {a:?}"
+        );
+        // systemd: `BindReadOnlyPaths=<src>:<dest>`.
+        let s = osv(&systemd_run_argv(&plan, &inner()));
+        assert!(
+            s.iter()
+                .any(|x| x == "--property=BindReadOnlyPaths=/run/relay/relay-0.sock:/run/control.sock"),
+            "systemd must bind relay src:dest: {s:?}"
+        );
     }
 
     #[test]
@@ -2264,6 +2629,7 @@ mod tests {
                 cli_binary_binds: vec![],
             },
             extra_ro_paths: Vec::new(),
+            control_socket_remap: None,
             workspace_scratch: Vec::new(),
             siblings_ro: None,
         };
