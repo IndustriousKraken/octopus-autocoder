@@ -368,9 +368,9 @@ implementation.
 - **AND** per-repository fork-owner overrides are NOT supported
 
 ### Requirement: Startup verification of fork existence
-When `github.fork_owner` is set, autocoder SHALL ensure each configured repository has a reachable fork at the derived URL before spawning that repository's polling task. Forks that are missing or unreachable SHALL be created automatically via `POST /repos/{upstream-owner}/{upstream-repo}/forks` using the PAT resolved for the upstream owner; the daemon then polls the fork URL via `git ls-remote` until it becomes reachable or until a 60-second timeout elapses.
+When `github.fork_owner` is set, autocoder SHALL ensure each configured repository has a reachable fork at the derived URL before spawning that repository's polling task. Forks that are missing or unreachable SHALL be created automatically via `POST /repos/{upstream-owner}/{upstream-repo}/forks` using the PAT resolved for the upstream owner. On a 2xx creation response, autocoder SHALL parse the response body and compare the returned fork's identity (`full_name`) against the owner/name expected from the derived fork URL (case-insensitive). When the identities match — or the response body cannot be parsed for an identity — the daemon polls the fork URL via `git ls-remote` until it becomes reachable or until a 60-second timeout elapses. When the identities differ (the idempotent existing-fork case where the fork carries a different name — e.g. the upstream was renamed after forking, or fork creation collided with an existing repository name), autocoder SHALL record the failure immediately with a cause that names the actual fork returned, the expected fork, AND the remedy (rename the existing fork to the expected name), WITHOUT entering the reachability poll — the poll cannot succeed for a fork that exists under a different name.
 
-A fork-setup failure for one repository — creation returns non-2xx, OR the fork is not reachable within the timeout — SHALL NOT abort daemon startup. The daemon SHALL instead: record the failure (the upstream URL, the expected fork URL, AND the cause); **skip that repository for the process lifetime** (no polling task is spawned for it) — the same per-repo skip-for-lifetime behavior already used when a fork URL cannot be derived; emit a chatops alert through the standard outbound notification path that identifies the repository AND carries a brief remedy hint; AND continue setting up AND serving every other repository. A fork-setup failure for one repository SHALL NEVER prevent the daemon from starting, from serving other repositories, OR from serving chatops. The daemon exits non-zero at startup only for non-per-repo fatal conditions (e.g. config-load failure) — NEVER for a per-repo fork-setup failure, even when every configured repository fails fork setup (it stays up so an operator can remediate AND recover the repository by fixing the fork, then restarting or reloading).
+A fork-setup failure for one repository — creation returns non-2xx, the creation response identifies a fork other than the expected one, OR the fork is not reachable within the timeout — SHALL NOT abort daemon startup. The daemon SHALL instead: record the failure (the upstream URL, the expected fork URL, AND the cause); **skip that repository** (no polling task is spawned for it) — the daemon never retries fork setup on its own, so absent operator action the skip lasts the remainder of the process lifetime, and the repository rejoins the polling set only when the operator remediates and either restarts the daemon or runs `autocoder reload` on the daemon host (reload's repository reconciliation spawns a polling task for any configured repository that lacks one) — the same per-repo skip behavior already used when a fork URL cannot be derived; emit a chatops alert through the standard outbound notification path that identifies the repository AND carries a brief remedy hint, where the remedy hint names the concrete recovery commands — restart the daemon or run `autocoder reload` on the daemon host (NOT a bare verb like `reload`); AND continue setting up AND serving every other repository. A fork-setup failure for one repository SHALL NEVER prevent the daemon from starting, from serving other repositories, OR from serving chatops. The daemon exits non-zero at startup only for non-per-repo fatal conditions (e.g. config-load failure) — NEVER for a per-repo fork-setup failure, even when every configured repository fails fork setup (it stays up so an operator can remediate AND recover the repository by fixing the fork, then restarting or reloading).
 
 #### Scenario: All forks already exist
 - **WHEN** autocoder starts with `github.fork_owner` set AND every
@@ -387,8 +387,9 @@ A fork-setup failure for one repository — creation returns non-2xx, OR the for
 - **THEN** autocoder issues `POST /repos/<upstream-owner>/<upstream-repo>/forks`
   with header `Authorization: Bearer <token>` (token resolved by the
   existing per-owner routing) for each missing fork
-- **AND** on 2xx response from the POST, autocoder polls the fork URL
-  via `git ls-remote` every 2 seconds for up to 60 seconds
+- **AND** on a 2xx response whose returned fork identity matches the
+  derived fork URL, autocoder polls the fork URL via `git ls-remote`
+  every 2 seconds for up to 60 seconds
 - **AND** when polling succeeds, the daemon proceeds to spawn polling
   tasks normally
 - **AND** the daemon emits one info-level log line per created fork
@@ -401,36 +402,71 @@ A fork-setup failure for one repository — creation returns non-2xx, OR the for
 - **THEN** that repository's failure is recorded with the upstream
   URL, the expected fork URL, and the HTTP status (plus a body snippet
   truncated to 200 chars)
-- **AND** autocoder skips that repository for the process lifetime (no
-  polling task is spawned for it) AND emits a chatops alert that
+- **AND** autocoder skips that repository (no polling task is spawned
+  for it, and the daemon does not retry on its own — recovery is by
+  operator restart or reload) AND emits a chatops alert that
   identifies the repository AND carries a remedy hint
 - **AND** autocoder continues setting up the remaining repositories AND
   the daemon does NOT exit
 
 #### Scenario: Fork-creation succeeds but the fork is not yet reachable
-- **WHEN** the POST returns 2xx AND `git ls-remote <fork-url> HEAD`
-  fails for 60 seconds of polling at 2-second intervals
+- **WHEN** the POST returns 2xx with a matching fork identity AND
+  `git ls-remote <fork-url> HEAD` fails for 60 seconds of polling at
+  2-second intervals
 - **THEN** that repository's failure is recorded as
   "fork creation succeeded but the fork at `<fork-url>` was not
   reachable within 60s"
-- **AND** that repository is skipped for the process lifetime AND a
-  chatops alert identifying it is emitted
+- **AND** that repository is skipped (no retry until an operator
+  restart or reload) AND a chatops alert identifying it is emitted
 - **AND** the daemon proceeds to serve the other repositories without
   exiting
 
 #### Scenario: A fork already exists when creation is attempted
 - **WHEN** autocoder issues the fork-creation POST AND the upstream
-  has already been forked to the destination user
+  has already been forked to the destination user under the expected
+  name
 - **THEN** the GitHub API returns 2xx with the existing fork's
   metadata (idempotent behavior)
-- **AND** autocoder treats this as success and proceeds with the
-  reachability probe normally
+- **AND** the returned fork identity matches the derived fork URL, so
+  autocoder treats this as success and proceeds with the reachability
+  probe normally
+
+#### Scenario: An existing fork carries a different name than expected
+- **WHEN** autocoder issues the fork-creation POST AND the 2xx
+  response's fork identity (`full_name`) differs from the owner/name
+  expected from the derived fork URL (e.g. the upstream was renamed
+  after the fork was created, so the fork still carries the old name)
+- **THEN** that repository's failure is recorded immediately with a
+  cause that names the actual fork returned, the expected fork, AND
+  the rename remedy (e.g. "GitHub returned existing fork
+  `<actual-full-name>` but `<expected-full-name>` was expected; rename
+  the fork to match, then restart or run `autocoder reload`")
+- **AND** no `git ls-remote` reachability polling is performed for
+  that repository (no 60-second wait)
+- **AND** that repository is skipped (no retry until an operator
+  restart or reload) AND a chatops alert identifying it is emitted,
+  AND the daemon proceeds to serve the other repositories without
+  exiting
+
+#### Scenario: Creation response body cannot be parsed for a fork identity
+- **WHEN** the fork-creation POST returns 2xx AND the response body
+  does not yield a parseable fork identity
+- **THEN** autocoder proceeds with the reachability probe exactly as
+  for a matching identity — the `git ls-remote` poll remains the
+  ground truth AND a malformed or unexpected response shape never
+  fails a fork setup that would otherwise succeed
+
+#### Scenario: Fork-setup alert names the concrete reload command
+- **WHEN** any fork-setup failure alert is emitted
+- **THEN** its remedy hint instructs the operator to restart the
+  daemon or run `autocoder reload` on the daemon host (the alert never
+  refers to a bare `reload` verb)
 
 #### Scenario: One repository's fork failure does not take down the others
 - **WHEN** autocoder starts with multiple repositories AND one
-  repository's fork cannot be set up (creation fails OR the fork is not
-  reachable within the timeout) AND the other repositories' forks are
-  reachable
+  repository's fork cannot be set up (creation fails, the returned
+  fork identity mismatches, OR the fork is not reachable within the
+  timeout) AND the other repositories' forks are reachable
 - **THEN** the daemon spawns polling tasks for the reachable
   repositories AND enters normal polling
 - **AND** chatops is served (the daemon does not exit)
@@ -943,8 +979,12 @@ autocoder SHALL provide a `reload` CLI subcommand that connects to the running d
   does not exist OR the connection is refused
 - **THEN** the CLI prints an error message naming the expected
   socket path and exits non-zero
-- **AND** the message hints at the likely cause: the daemon is
-  not running, or is running under a different user
+- **AND** the message hints at the likely causes: the daemon is
+  not running, it is running under a different user, or a stale
+  `XDG_RUNTIME_DIR` inherited from an env-preserving user switch is
+  pointing the CLI at another user's runtime directory
+- **AND** the message suggests retrying from a clean environment
+  via `sudo -u autocoder autocoder reload`
 
 ### Requirement: Reload handler hot-applies the safe config subset
 The control socket's `reload` handler SHALL re-read the YAML config path the daemon was launched with, validate the new content fully (parse + semantic checks), and hot-apply changes to `github`, `reviewer`, `chatops`, AND `repositories` sections. Changes to the `executor` section SHALL NOT be hot-applied; the handler SHALL report it as `requires-restart` so the operator knows it still needs a full restart. The response SHALL include a `repositories_delta` field naming added / removed / changed repository URLs whenever the repository step modified the task set.
@@ -3638,6 +3678,8 @@ permissions.
 ### Requirement: Daemon resolves four standard data-category paths with a defined precedence
 The daemon SHALL resolve four data-category paths at startup: `state` (persistent state — audit cadence, failure counters, alert throttles, revisions), `cache` (re-creatable but kept — repo workspaces), `logs` (per-change run logs), and `runtime` (control socket, transient locks). Each path is resolved by this precedence: (1) an explicit `paths.<field>` value in `config.yaml`, (2) the per-field environment variable `AUTOCODER_STATE_DIR` / `AUTOCODER_CACHE_DIR` / `AUTOCODER_LOGS_DIR` / `AUTOCODER_RUNTIME_DIR`, (3) the systemd-set environment variable `$STATE_DIRECTORY` / `$CACHE_DIRECTORY` / `$LOGS_DIRECTORY` / `$RUNTIME_DIRECTORY`, (4) XDG-derived defaults (dev mode), (5) a hard fallback to `/var/lib/autocoder` and siblings. All four paths SHALL be absolute. No two paths may resolve to the same directory.
 
+At step (4), the runtime path's XDG-derived default SHALL trust `XDG_RUNTIME_DIR` only when the directory it names is owned by the process's current effective uid. When the variable is set but the directory is owned by a different uid, or cannot be inspected at all, the resolver SHALL ignore the variable — logging that it was ignored and why — and derive the runtime default as if the variable were unset (the `runtime/` subdirectory of the XDG state default). A foreign-owned `XDG_RUNTIME_DIR` is a leaked environment from an env-preserving user switch (`su <user>` without `-`), and per the XDG Base Directory specification the runtime directory MUST be owned by the user; resolving another user's private `/run/user/<uid>` can only produce permission failures or a wrong socket path. This ownership guard applies ONLY to the implicit XDG inference — explicit overrides at steps (1)–(3) are honored verbatim as today.
+
 #### Scenario: Config explicit value wins over all env vars
 - **WHEN** `config.yaml` sets `paths.state_dir: /custom/state` AND `AUTOCODER_STATE_DIR=/env/state` is set AND `$STATE_DIRECTORY=/var/lib/autocoder` is set
 - **THEN** the resolved state path is `/custom/state`
@@ -3653,6 +3695,24 @@ The daemon SHALL resolve four data-category paths at startup: `state` (persisten
 #### Scenario: XDG defaults used in dev mode
 - **WHEN** no config override AND no env var AND no systemd-set var AND `$HOME=/home/dev`
 - **THEN** the resolved state path is `/home/dev/.local/state/autocoder` (or `$XDG_STATE_HOME/autocoder` when set)
+
+#### Scenario: Owned XDG_RUNTIME_DIR is used verbatim for the runtime default
+- **WHEN** no config, env, or systemd override applies to the runtime path AND `XDG_RUNTIME_DIR` names an existing directory owned by the current effective uid
+- **THEN** the resolved runtime path is `$XDG_RUNTIME_DIR/autocoder`
+
+#### Scenario: Foreign-owned XDG_RUNTIME_DIR is ignored
+- **WHEN** no config, env, or systemd override applies to the runtime path AND `XDG_RUNTIME_DIR` names a directory owned by a different uid (e.g. the variable leaked through an env-preserving `su` from another user's session)
+- **THEN** the resolved runtime path is the `runtime/` subdirectory of the XDG state default, exactly as if `XDG_RUNTIME_DIR` were unset
+- **AND** the resolver logs that `XDG_RUNTIME_DIR` was ignored, naming the directory and the ownership mismatch
+
+#### Scenario: Uninspectable XDG_RUNTIME_DIR is ignored
+- **WHEN** no config, env, or systemd override applies to the runtime path AND `XDG_RUNTIME_DIR` names a path whose metadata cannot be read (missing, or traversal denied)
+- **THEN** the resolved runtime path is the `runtime/` subdirectory of the XDG state default
+- **AND** the resolver logs that `XDG_RUNTIME_DIR` was ignored, naming the path and the inspection error
+
+#### Scenario: Explicit runtime overrides are never ownership-checked
+- **WHEN** `AUTOCODER_RUNTIME_DIR` (or a `config.yaml` paths value, or systemd's `$RUNTIME_DIRECTORY`) names a directory regardless of its owner
+- **THEN** the resolved runtime path honors that override verbatim — the ownership guard applies only to the implicit `XDG_RUNTIME_DIR` inference
 
 #### Scenario: Relative-path config is rejected at startup
 - **WHEN** `config.yaml` sets `paths.state_dir: relative/path`

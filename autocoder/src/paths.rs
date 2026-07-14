@@ -477,11 +477,61 @@ fn xdg_logs_default() -> Option<PathBuf> {
 
 fn xdg_runtime_default() -> Option<PathBuf> {
     let xdg_runtime = std::env::var("XDG_RUNTIME_DIR").ok().filter(|v| !v.is_empty());
-    runtime_default_from(xdg_runtime, xdg_state_default())
+    runtime_default_from(xdg_runtime, xdg_state_default(), probe_xdg_runtime_ownership)
+}
+
+/// Ownership verdict for a candidate `XDG_RUNTIME_DIR`, produced by an
+/// injected probe so [`runtime_default_from`] stays filesystem-free and
+/// unit-testable (the env-free pattern the other `*_default` helpers use).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum XdgRuntimeOwnership {
+    /// Directory exists and is owned by the process's effective uid.
+    Owned,
+    /// Directory exists but is owned by a different uid.
+    ForeignOwner { owner_uid: u32 },
+    /// Directory metadata could not be read (missing, traversal denied, …).
+    Uninspectable { error: String },
+}
+
+/// Real ownership probe: `stat` the directory and compare its owner uid to the
+/// process's effective uid. Any inspection failure is `Uninspectable` —
+/// treated (by [`runtime_default_from`]) the same as foreign ownership: ignore
+/// the variable and fall back.
+fn probe_xdg_runtime_ownership(dir: &Path) -> XdgRuntimeOwnership {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(dir) {
+        Ok(md) => {
+            let owner_uid = md.uid();
+            if owner_uid == current_euid() {
+                XdgRuntimeOwnership::Owned
+            } else {
+                XdgRuntimeOwnership::ForeignOwner { owner_uid }
+            }
+        }
+        Err(e) => XdgRuntimeOwnership::Uninspectable { error: e.to_string() },
+    }
+}
+
+/// The process's effective uid. `geteuid` takes no arguments, only reads
+/// process credentials, and never fails per POSIX.
+fn current_euid() -> u32 {
+    unsafe { libc::geteuid() }
 }
 
 /// Pure core of [`xdg_runtime_default`]: `$XDG_RUNTIME_DIR/autocoder` when the
-/// var is set; otherwise a `runtime/` subdir of the XDG state default.
+/// var is set AND the directory it names is owned by the current effective uid;
+/// otherwise a `runtime/` subdir of the XDG state default.
+///
+/// The ownership guard applies ONLY to this implicit XDG inference — steps
+/// (1)–(3) of `resolve_one` (config / `AUTOCODER_RUNTIME_DIR` / systemd's
+/// `$RUNTIME_DIRECTORY`) are deliberate operator statements honored verbatim.
+/// A foreign-owned or uninspectable `XDG_RUNTIME_DIR` is a leaked value from an
+/// env-preserving user switch (`su <user>` without `-`): per the XDG Base
+/// Directory spec the runtime dir MUST be user-owned, and resolving another
+/// user's private `/run/user/<uid>` (mode 0700) can only produce permission
+/// failures or a wrong socket path. Ignoring it and falling back makes the CLI
+/// and daemon converge on the same socket regardless of how the operator
+/// reached the daemon's user.
 ///
 /// NEVER `/tmp`. The control socket and transient locks live here; a `/tmp`
 /// runtime is wrong on two counts — `tmpreaper` / `systemd-tmpfiles` can delete
@@ -493,13 +543,36 @@ fn xdg_runtime_default() -> Option<PathBuf> {
 /// unit's `$RUNTIME_DIRECTORY` (a higher-precedence resolver step); this branch
 /// only governs the no-`$XDG_RUNTIME_DIR`, no-systemd case, where a user-
 /// writable state-dir location is correct (the daemon clears stale locks at
-/// startup). Pure so it is testable without mutating the process environment.
+/// startup). Pure (the ownership verdict is injected via `probe`) so it is
+/// testable without mutating the process environment.
 fn runtime_default_from(
     xdg_runtime_dir: Option<String>,
     state_default: Option<PathBuf>,
+    probe: impl Fn(&Path) -> XdgRuntimeOwnership,
 ) -> Option<PathBuf> {
     if let Some(v) = xdg_runtime_dir {
-        return Some(PathBuf::from(v).join("autocoder"));
+        let dir = PathBuf::from(&v);
+        match probe(&dir) {
+            XdgRuntimeOwnership::Owned => return Some(dir.join("autocoder")),
+            XdgRuntimeOwnership::ForeignOwner { owner_uid } => {
+                tracing::warn!(
+                    xdg_runtime_dir = %v,
+                    owner_uid,
+                    euid = current_euid(),
+                    "paths: ignoring XDG_RUNTIME_DIR — directory is owned by another uid \
+                     (leaked from an env-preserving user switch such as `su` without `-`); \
+                     falling back to the state-dir runtime default"
+                );
+            }
+            XdgRuntimeOwnership::Uninspectable { error } => {
+                tracing::warn!(
+                    xdg_runtime_dir = %v,
+                    error = %error,
+                    "paths: ignoring XDG_RUNTIME_DIR — directory metadata could not be read; \
+                     falling back to the state-dir runtime default"
+                );
+            }
+        }
     }
     state_default.map(|s| s.join("runtime"))
 }
@@ -562,19 +635,83 @@ mod tests {
     /// socket and the OS sandbox's private `/tmp` hides it from the relay).
     #[test]
     fn runtime_default_never_falls_back_to_tmp() {
-        // $XDG_RUNTIME_DIR present → used verbatim (+ /autocoder).
+        let owned = |_: &Path| XdgRuntimeOwnership::Owned;
+        // $XDG_RUNTIME_DIR present AND owned → used verbatim (+ /autocoder).
         assert_eq!(
-            runtime_default_from(Some("/run/user/1000".to_string()), None),
+            runtime_default_from(Some("/run/user/1000".to_string()), None, owned),
             Some(PathBuf::from("/run/user/1000/autocoder"))
         );
         // Absent → under the state dir, NOT /tmp.
-        let got = runtime_default_from(None, Some(PathBuf::from("/home/u/.local/state/autocoder")))
-            .expect("state default present");
+        let got = runtime_default_from(
+            None,
+            Some(PathBuf::from("/home/u/.local/state/autocoder")),
+            owned,
+        )
+        .expect("state default present");
         assert_eq!(got, PathBuf::from("/home/u/.local/state/autocoder/runtime"));
         assert!(
             !got.starts_with("/tmp"),
             "runtime must never fall back under /tmp: {got:?}"
         );
+    }
+
+    /// Owned `XDG_RUNTIME_DIR` → `$XDG_RUNTIME_DIR/autocoder`, exercised
+    /// through the REAL probe: a freshly-created tempdir is owned by the test
+    /// process's effective uid, so the probe returns `Owned`.
+    #[test]
+    fn owned_xdg_runtime_dir_is_used_verbatim() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            probe_xdg_runtime_ownership(dir.path()),
+            XdgRuntimeOwnership::Owned,
+            "a tempdir we just created must be owned by our euid"
+        );
+        let got = runtime_default_from(
+            Some(dir.path().to_string_lossy().into_owned()),
+            Some(PathBuf::from("/home/u/.local/state/autocoder")),
+            probe_xdg_runtime_ownership,
+        )
+        .expect("owned runtime dir resolves");
+        assert_eq!(got, dir.path().join("autocoder"));
+    }
+
+    /// Foreign-owned `XDG_RUNTIME_DIR` → state-default `runtime/` fallback.
+    /// `chown` is unavailable in unprivileged test runs, so the foreign
+    /// verdict is simulated through the injected probe.
+    #[test]
+    fn foreign_owned_xdg_runtime_dir_falls_back() {
+        let foreign = |_: &Path| XdgRuntimeOwnership::ForeignOwner {
+            owner_uid: current_euid().wrapping_add(1),
+        };
+        let got = runtime_default_from(
+            Some("/run/user/424242".to_string()),
+            Some(PathBuf::from("/home/u/.local/state/autocoder")),
+            foreign,
+        )
+        .expect("fallback present");
+        assert_eq!(got, PathBuf::from("/home/u/.local/state/autocoder/runtime"));
+    }
+
+    /// Missing / uninspectable `XDG_RUNTIME_DIR` → same state-default fallback.
+    #[test]
+    fn uninspectable_xdg_runtime_dir_falls_back() {
+        let uninspectable = |_: &Path| XdgRuntimeOwnership::Uninspectable {
+            error: "No such file or directory (os error 2)".to_string(),
+        };
+        let got = runtime_default_from(
+            Some("/run/user/424242".to_string()),
+            Some(PathBuf::from("/home/u/.local/state/autocoder")),
+            uninspectable,
+        )
+        .expect("fallback present");
+        assert_eq!(got, PathBuf::from("/home/u/.local/state/autocoder/runtime"));
+
+        // The real probe on a definitely-absent path yields Uninspectable.
+        let missing = std::path::Path::new("/nonexistent/autocoder-xdg-probe-test");
+        assert!(matches!(
+            probe_xdg_runtime_ownership(missing),
+            XdgRuntimeOwnership::Uninspectable { .. }
+        ));
     }
 
     /// Env-var mutation is global; serialize the env-var-touching tests

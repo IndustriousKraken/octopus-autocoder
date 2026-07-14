@@ -1851,13 +1851,14 @@ pub struct ForkSetupFailure {
 trait ForkOps: Send + Sync {
     /// True when `git ls-remote <fork_url> HEAD` succeeds right now.
     fn fork_reachable(&self, fork_url: &str) -> bool;
-    /// Issue the fork-creation POST; `Ok(())` on 2xx.
+    /// Issue the fork-creation POST; on 2xx returns the created/existing
+    /// fork's `full_name` identity (`None` when the body yields none).
     async fn create_fork(
         &self,
         upstream_owner: &str,
         upstream_repo: &str,
         token: &str,
-    ) -> Result<()>;
+    ) -> Result<Option<String>>;
 }
 
 /// Production [`ForkOps`]: real `git ls-remote` probe + real GitHub
@@ -1874,7 +1875,7 @@ impl ForkOps for GitForkOps {
         upstream_owner: &str,
         upstream_repo: &str,
         token: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         crate::github::create_fork(upstream_owner, upstream_repo, token).await
     }
 }
@@ -1970,13 +1971,43 @@ async fn ensure_forks_exist_with(
             "creating fork for {} → {fork_url}",
             repo.url
         );
-        if let Err(e) = ops.create_fork(&upstream_owner, &upstream_repo, &token).await {
-            failures.push(ForkSetupFailure {
-                upstream_url: repo.url.clone(),
-                fork_url: Some(fork_url),
-                cause: format!("fork creation POST failed: {e:#}"),
-            });
-            continue;
+        let returned_identity =
+            match ops.create_fork(&upstream_owner, &upstream_repo, &token).await {
+                Ok(identity) => identity,
+                Err(e) => {
+                    failures.push(ForkSetupFailure {
+                        upstream_url: repo.url.clone(),
+                        fork_url: Some(fork_url),
+                        cause: format!("fork creation POST failed: {e:#}"),
+                    });
+                    continue;
+                }
+            };
+        // GitHub's fork endpoint is idempotent: a 2xx can name an *existing*
+        // fork under a different name (e.g. the upstream was renamed after
+        // forking, so the fork still carries the old name). If the returned
+        // `full_name` names a fork other than the one derived from `fork_url`,
+        // polling that URL can never succeed — fail fast with a rename remedy
+        // instead of waiting out the 60s timeout. A `None` identity
+        // (unparseable body) falls back to the poll, which stays the ground
+        // truth. GitHub treats repo names case-insensitively, so a case-only
+        // difference is a match, not a mismatch.
+        if let Some(actual_full_name) = returned_identity.as_deref() {
+            if let Ok((expected_owner, expected_repo)) = parse_repo_url(&fork_url) {
+                let expected_full_name = format!("{expected_owner}/{expected_repo}");
+                if !actual_full_name.eq_ignore_ascii_case(&expected_full_name) {
+                    failures.push(ForkSetupFailure {
+                        upstream_url: repo.url.clone(),
+                        fork_url: Some(fork_url),
+                        cause: format!(
+                            "github returned existing fork `{actual_full_name}` but \
+                             `{expected_full_name}` was expected; rename the fork to match, \
+                             then restart autocoder or run `autocoder reload` on the daemon host"
+                        ),
+                    });
+                    continue;
+                }
+            }
         }
         // Poll until reachable, up to the configured timeout.
         let deadline = std::time::Instant::now() + reachability_timeout;
@@ -2027,7 +2058,7 @@ pub fn fork_setup_failure_alert_message(failure: &ForkSetupFailure) -> String {
         "⚠️ autocoder: fork setup failed for `{}`{} — {}. This repository is \
          skipped for the process lifetime; the daemon, other repositories, and \
          chatops keep running. Remedy: ensure the fork exists and is reachable, \
-         then restart autocoder (or run `reload`).",
+         then restart autocoder or run `autocoder reload` on the daemon host.",
         failure.upstream_url, fork_part, failure.cause
     )
 }
@@ -2481,6 +2512,14 @@ mod tests {
         /// Upstream `owner/repo` → fork URL inserted into `reachable` on a
         /// successful create (models a fork that becomes reachable after POST).
         make_reachable_on_create: std::collections::HashMap<String, String>,
+        /// Upstream `owner/repo` → the `full_name` identity the create POST
+        /// returns as `Some`. Absent keys return `None` (the unparseable-body
+        /// case), preserving the pre-identity poll behavior.
+        identity_on_create: std::collections::HashMap<String, String>,
+        /// Record of every fork URL a reachability probe was issued for (one
+        /// entry per `fork_reachable` call), so tests can prove the poll loop
+        /// was skipped on the identity-mismatch fast path.
+        probes: Mutex<Vec<String>>,
         /// Record of every `owner/repo` a create POST was attempted for.
         created: Mutex<Vec<String>>,
     }
@@ -2488,6 +2527,7 @@ mod tests {
     #[async_trait::async_trait]
     impl ForkOps for FakeForkOps {
         fn fork_reachable(&self, fork_url: &str) -> bool {
+            self.probes.lock().unwrap().push(fork_url.to_string());
             self.reachable.lock().unwrap().contains(fork_url)
         }
         async fn create_fork(
@@ -2495,7 +2535,7 @@ mod tests {
             upstream_owner: &str,
             upstream_repo: &str,
             _token: &str,
-        ) -> Result<()> {
+        ) -> Result<Option<String>> {
             let key = format!("{upstream_owner}/{upstream_repo}");
             self.created.lock().unwrap().push(key.clone());
             if self.create_fails_for.contains(&key) {
@@ -2504,7 +2544,7 @@ mod tests {
             if let Some(fork) = self.make_reachable_on_create.get(&key) {
                 self.reachable.lock().unwrap().insert(fork.clone());
             }
-            Ok(())
+            Ok(self.identity_on_create.get(&key).cloned())
         }
     }
 
@@ -2593,6 +2633,8 @@ mod tests {
             ),
             create_fails_for: std::collections::HashSet::new(),
             make_reachable_on_create: std::collections::HashMap::new(),
+            identity_on_create: std::collections::HashMap::new(),
+            probes: Mutex::new(Vec::new()),
             created: Mutex::new(Vec::new()),
         };
         let failures = ensure_forks_exist_with(
@@ -2622,6 +2664,8 @@ mod tests {
             reachable: Mutex::new(std::collections::HashSet::new()),
             create_fails_for: std::collections::HashSet::new(),
             make_reachable_on_create: make,
+            identity_on_create: std::collections::HashMap::new(),
+            probes: Mutex::new(Vec::new()),
             created: Mutex::new(Vec::new()),
         };
         let failures = ensure_forks_exist_with(
@@ -2659,6 +2703,8 @@ mod tests {
             ),
             create_fails_for: ["orgB/b".to_string()].into_iter().collect(),
             make_reachable_on_create: std::collections::HashMap::new(),
+            identity_on_create: std::collections::HashMap::new(),
+            probes: Mutex::new(Vec::new()),
             created: Mutex::new(Vec::new()),
         };
         let failures = ensure_forks_exist_with(
@@ -2719,6 +2765,8 @@ mod tests {
                 .into_iter()
                 .collect(),
             make_reachable_on_create: std::collections::HashMap::new(),
+            identity_on_create: std::collections::HashMap::new(),
+            probes: Mutex::new(Vec::new()),
             created: Mutex::new(Vec::new()),
         };
         // Returns normally even when every repository fails fork setup.
@@ -2753,6 +2801,8 @@ mod tests {
             create_fails_for: std::collections::HashSet::new(),
             // never becomes reachable after create
             make_reachable_on_create: std::collections::HashMap::new(),
+            identity_on_create: std::collections::HashMap::new(),
+            probes: Mutex::new(Vec::new()),
             created: Mutex::new(Vec::new()),
         };
         let failures = ensure_forks_exist_with(
@@ -2775,6 +2825,134 @@ mod tests {
         );
     }
 
+    /// 4.1: an identity mismatch (upstream renamed → GitHub idempotently
+    /// returns the existing fork under its OLD name) fails that repository
+    /// immediately with a cause naming both fork identities and the rename
+    /// remedy, skips the reachability poll entirely, and leaves other
+    /// repositories' setup untouched.
+    #[tokio::test]
+    async fn fork_setup_identity_mismatch_fails_fast_and_skips_poll() {
+        let github = fork_github("mu");
+        let repos = vec![
+            repo("git@github.com:orgA/a.git"), // upstream renamed → mismatch
+            repo("git@github.com:orgB/b.git"), // already reachable → untouched
+        ];
+        let mut ids = std::collections::HashMap::new();
+        // GitHub returns the pre-rename fork name instead of the expected `mu/a`.
+        ids.insert("orgA/a".to_string(), "mu/old-a".to_string());
+        let ops = FakeForkOps {
+            reachable: Mutex::new(
+                ["git@github.com:mu/b.git".to_string()].into_iter().collect(),
+            ),
+            create_fails_for: std::collections::HashSet::new(),
+            make_reachable_on_create: std::collections::HashMap::new(),
+            identity_on_create: ids,
+            probes: Mutex::new(Vec::new()),
+            created: Mutex::new(Vec::new()),
+        };
+        let failures = ensure_forks_exist_with(
+            &github,
+            &repos,
+            &ops,
+            // If the poll were NOT skipped, the fork never becomes reachable, so
+            // this would record a timeout failure instead of the mismatch cause.
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(failures.len(), 1, "only the mismatched repo fails: {failures:?}");
+        assert_eq!(failures[0].upstream_url, "git@github.com:orgA/a.git");
+        let cause = &failures[0].cause;
+        assert!(cause.contains("mu/old-a"), "names the actual fork returned: {cause}");
+        assert!(cause.contains("mu/a"), "names the expected fork: {cause}");
+        assert!(cause.contains("rename"), "names the rename remedy: {cause}");
+        assert!(
+            cause.contains("autocoder reload"),
+            "names the concrete reload command: {cause}"
+        );
+
+        // Zero reachability polling for the mismatched fork: only the single
+        // pre-creation existence probe was issued for it — the poll never ran.
+        let mismatch_probes = ops
+            .probes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|u| u.as_str() == "git@github.com:mu/a.git")
+            .count();
+        assert_eq!(
+            mismatch_probes, 1,
+            "the identity-mismatch fast path must skip the reachability poll"
+        );
+
+        // The other repository is untouched: no create POST was issued for it
+        // (already reachable), and it is not among the failures.
+        assert_eq!(
+            ops.created.lock().unwrap().as_slice(),
+            &["orgA/a".to_string()],
+            "only the mismatched repo triggered a create POST"
+        );
+        assert!(
+            !failures
+                .iter()
+                .any(|f| f.upstream_url == "git@github.com:orgB/b.git"),
+            "the reachable repo must not be failed"
+        );
+    }
+
+    /// 4.2: an identity that is NOT a genuine mismatch — exact match,
+    /// unparseable body (`None`), or a case-only difference — proceeds to the
+    /// reachability poll exactly as before the identity check existed.
+    #[tokio::test]
+    async fn fork_setup_matching_none_and_case_only_identity_all_proceed_to_poll() {
+        let cases: Vec<(&str, Option<&str>)> = vec![
+            ("exact match", Some("mu/a")),
+            ("unparseable body → None", None),
+            ("case-only difference", Some("MU/A")),
+        ];
+        for (label, identity) in cases {
+            let github = fork_github("mu");
+            let repos = vec![repo("git@github.com:orgA/a.git")];
+            let mut make = std::collections::HashMap::new();
+            make.insert("orgA/a".to_string(), "git@github.com:mu/a.git".to_string());
+            let mut ids = std::collections::HashMap::new();
+            if let Some(id) = identity {
+                ids.insert("orgA/a".to_string(), id.to_string());
+            }
+            let ops = FakeForkOps {
+                reachable: Mutex::new(std::collections::HashSet::new()),
+                create_fails_for: std::collections::HashSet::new(),
+                make_reachable_on_create: make,
+                identity_on_create: ids,
+                probes: Mutex::new(Vec::new()),
+                created: Mutex::new(Vec::new()),
+            };
+            let failures = ensure_forks_exist_with(
+                &github,
+                &repos,
+                &ops,
+                std::time::Duration::from_millis(500),
+                std::time::Duration::from_millis(1),
+            )
+            .await;
+            assert!(
+                failures.is_empty(),
+                "case `{label}`: non-mismatch identity must proceed and succeed: {failures:?}"
+            );
+            assert_eq!(
+                ops.created.lock().unwrap().as_slice(),
+                &["orgA/a".to_string()],
+                "case `{label}`: the create POST was issued"
+            );
+            // The poll ran: a probe was issued AFTER the initial existence check.
+            assert!(
+                ops.probes.lock().unwrap().len() >= 2,
+                "case `{label}`: the reachability poll must run after creation"
+            );
+        }
+    }
+
     #[test]
     fn fork_setup_failure_alert_message_names_repo_and_remedy() {
         let f = ForkSetupFailure {
@@ -2787,9 +2965,11 @@ mod tests {
         assert!(msg.contains("git@github.com:mu/repo.git"), "names fork: {msg}");
         assert!(msg.contains("403"), "carries the cause: {msg}");
         assert!(msg.contains("skipped"), "states the repo is skipped: {msg}");
+        // The remedy names the concrete command, not a bare `reload` verb.
+        assert!(msg.contains("restart autocoder"), "remedy names restart: {msg}");
         assert!(
-            msg.contains("reload") || msg.contains("restart"),
-            "carries a remedy hint: {msg}"
+            msg.contains("`autocoder reload`"),
+            "remedy names the concrete reload command, not a bare `reload`: {msg}"
         );
     }
 
