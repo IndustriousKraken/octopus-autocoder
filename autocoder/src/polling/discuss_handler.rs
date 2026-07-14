@@ -707,7 +707,16 @@ fn extract_defer(reply: &str) -> (String, Option<String>) {
         if let Some(rest) = line.trim().strip_prefix(DISCUSS_DEFER_PREFIX) {
             let s = rest.trim();
             if !s.is_empty() && slug.is_none() {
-                slug = Some(s.to_string());
+                // The slug is agent-supplied AND used in filesystem paths
+                // (maybe_auto_defer / clear_auto_defer join it under the
+                // workspace). Reject path-traversal components so an
+                // adversarially-prompted agent cannot move directories outside
+                // the intended lanes. Line is still stripped from the reply.
+                if s.contains("..") || s.contains('/') || s.contains('\\') {
+                    tracing::warn!(slug = %s, "discuss auto-defer: rejecting slug with path-traversal components");
+                } else {
+                    slug = Some(s.to_string());
+                }
             }
             continue; // strip the signal line
         }
@@ -735,6 +744,22 @@ mod tests {
         let (visible, slug) = extract_defer("just a normal reply");
         assert_eq!(slug, None);
         assert_eq!(visible, "just a normal reply");
+    }
+
+    #[test]
+    fn extract_defer_rejects_path_traversal_slugs() {
+        // Slug flows into workspace-relative path joins; traversal components
+        // must be dropped (line still stripped from the visible reply).
+        for bad in [
+            "DISCUSS-DEFER: ../../other-change",
+            "DISCUSS-DEFER: foo/bar",
+            "DISCUSS-DEFER: ..\\evil",
+        ] {
+            let reply = format!("Understood.\n{bad}\nTrailing.");
+            let (visible, slug) = extract_defer(&reply);
+            assert_eq!(slug, None, "traversal slug must be rejected: {bad}");
+            assert!(!visible.contains("DISCUSS-DEFER"), "signal line still stripped");
+        }
     }
 
     #[test]
