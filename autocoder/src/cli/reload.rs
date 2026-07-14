@@ -20,8 +20,11 @@ pub async fn execute_at(socket: &Path) -> Result<()> {
         Err(e) => {
             return Err(anyhow!(
                 "could not connect to control socket {}: {e}\n\
-                 hint: the daemon may not be running, or may be running under a \
-                 different user. Try `sudo -u autocoder autocoder reload`.",
+                 hint: the daemon may not be running, it may be running under a \
+                 different user, or a stale XDG_RUNTIME_DIR inherited from an \
+                 env-preserving user switch (`su` without `-`) may be pointing \
+                 this CLI at another user's runtime directory. Retry from a clean \
+                 environment: `sudo -u autocoder autocoder reload`.",
                 socket.display(),
             ));
         }
@@ -116,6 +119,20 @@ mod tests {
                 || msg.to_lowercase().contains("not running")
                 || msg.to_lowercase().contains("connect"),
             "error must hint at cause: {msg}"
+        );
+        // The hint names the different-user cause AND the stale-XDG cause,
+        // and keeps the clean-environment suggestion.
+        assert!(
+            msg.contains("different user"),
+            "hint must keep the different-user cause: {msg}"
+        );
+        assert!(
+            msg.contains("XDG_RUNTIME_DIR"),
+            "hint must name the stale XDG_RUNTIME_DIR cause: {msg}"
+        );
+        assert!(
+            msg.contains("sudo -u autocoder autocoder reload"),
+            "hint must keep the clean-environment suggestion: {msg}"
         );
     }
 }
