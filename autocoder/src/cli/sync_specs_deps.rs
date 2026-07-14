@@ -241,7 +241,20 @@ fn parse_rename_marker(line: &str, marker: &str) -> Option<String> {
     // Strip optional leading "- " bullet (and any extra whitespace).
     let body = line.trim_start_matches('-').trim_start();
     let rest = body.strip_prefix(marker)?;
-    let header = rest.trim().trim_matches('`').trim();
+    // Unwrap ONLY a balanced outer code-span (one leading + one trailing
+    // backtick), NOT a greedy run: a title that itself begins or ends with an
+    // inline-code segment (e.g. `... the `discuss` verb`) must keep its own
+    // backticks so the parsed FROM/TO round-trips against the MODIFIED /
+    // canonical header, which are parsed WITHOUT backtick-trimming. The old
+    // `trim_matches('`')` ate those edge backticks and desynced the two, so a
+    // rename whose title ended in inline code was never reconciled.
+    let inner = rest.trim();
+    let inner = if inner.len() >= 2 && inner.starts_with('`') && inner.ends_with('`') {
+        &inner[1..inner.len() - 1]
+    } else {
+        inner
+    };
+    let header = inner.trim();
     // OpenSpec's rename schema writes FROM/TO as a full `### Requirement: <title>`
     // line (its parser *requires* the prefix), but canonical titles are compared
     // bare — strip the prefix so they match. A bare title (no prefix) passes
@@ -852,6 +865,29 @@ mod tests {
             vec![DeltaEntry::Renamed {
                 from: "Old Name".into(),
                 to: "New Name".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_renamed_preserves_inline_code_at_title_edges() {
+        // Regression: FROM/TO carry the `### Requirement:` prefix AND the titles
+        // contain inline-code segments — including one at the very END of the TO
+        // title (`... for `discuss``). The old greedy `trim_matches('`')` ate
+        // that trailing backtick, so the parsed TO ("... for `discuss") no longer
+        // matched the MODIFIED/canonical header ("... for `discuss`"), and the
+        // rename never reconciled → spurious "header not found" pre-flight alert.
+        // Only the OUTER wrapping pair must be stripped; the title's own
+        // backticks survive.
+        let md = "## RENAMED Requirements\n\n\
+                  - FROM: `### Requirement: `propose` chatops verb queues a chat-driven triage request`\n\
+                  - TO: `### Requirement: `propose` chatops verb is a permanent alias for `discuss``\n";
+        let out = parse_capability_deltas(md);
+        assert_eq!(
+            out,
+            vec![DeltaEntry::Renamed {
+                from: "`propose` chatops verb queues a chat-driven triage request".into(),
+                to: "`propose` chatops verb is a permanent alias for `discuss`".into(),
             }]
         );
     }

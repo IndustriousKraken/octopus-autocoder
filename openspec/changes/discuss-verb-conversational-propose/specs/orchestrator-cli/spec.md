@@ -8,11 +8,11 @@
 ## RENAMED Requirements
 
 - FROM: `### Requirement: `propose` chatops verb queues a chat-driven triage request`
-- TO: `### Requirement: `propose` chatops verb is a permanent alias for `discuss``
+- TO: `### Requirement: `propose` chatops verb is a permanent alias for the `discuss` verb`
 
 ## MODIFIED Requirements
 
-### Requirement: `propose` chatops verb is a permanent alias for `discuss`
+### Requirement: `propose` chatops verb is a permanent alias for the `discuss` verb
 The verb `propose` is a permanent alias for `discuss`. The inbound chatops listener SHALL accept `@<bot> propose <repo-substring> <free-form text>` and process it identically to `@<bot> discuss <repo-substring> <free-form text>` per the `discuss chatops verb starts an immediate conversational session` requirement. No deprecation warning, distinguishing log entry, or behavioral difference applies to the alias. `propose` remains a listed known verb in all help text and verb-recognition requirements.
 
 #### Scenario: `propose` alias triggers discuss behavior
