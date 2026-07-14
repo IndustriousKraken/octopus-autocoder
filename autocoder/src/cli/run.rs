@@ -1998,7 +1998,7 @@ async fn ensure_forks_exist_with(
                 if !actual_full_name.eq_ignore_ascii_case(&expected_full_name) {
                     failures.push(ForkSetupFailure {
                         upstream_url: repo.url.clone(),
-                        fork_url: Some(fork_url.clone()),
+                        fork_url: Some(fork_url),
                         cause: format!(
                             "github returned existing fork `{actual_full_name}` but \
                              `{expected_full_name}` was expected; rename the fork to match, \
