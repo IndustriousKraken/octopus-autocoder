@@ -14,9 +14,9 @@
 //!      first matching sentence.
 
 use super::{
-    BrownfieldDraftContext, ChangelogContext, ChatTriageContext, Executor, ExecutorOutcome,
-    IssueContext, IssueReportTriageContext, ResumeHandle, ScoutContext, TriageContext,
-    UnimplementableTask,
+    BrownfieldDraftContext, ChangelogContext, ChatTriageContext, DiscussContext, DiscussTurn,
+    Executor, ExecutorOutcome, IssueContext, IssueReportTriageContext, ResumeHandle, ScoutContext,
+    TriageContext, UnimplementableTask,
 };
 use crate::agentic_run::AgenticRunOutcome;
 use anyhow::{Context, Result, anyhow};
@@ -99,6 +99,9 @@ const CHANGELOG_STYLIST_LOG_CHANGE_NAME: &str = "changelog-stylist";
 /// (a23). Like the triage modes, brownfield-draft does not target a
 /// pre-existing change directory at invocation time.
 const BROWNFIELD_DRAFT_LOG_CHANGE_NAME: &str = "brownfield-draft";
+
+/// Synthetic "change" name used for the discuss-session run-log path.
+const DISCUSS_LOG_CHANGE_NAME: &str = "discuss";
 
 /// Synthetic "change" name used for the scout-mode run-log path (a25).
 const SCOUT_LOG_CHANGE_NAME: &str = "scout";
@@ -1736,6 +1739,70 @@ impl Executor for ClaudeCliExecutor {
         persist_run_log(&self.paths, workspace, TRIAGE_LOG_CHANGE_NAME, &prompt, &outcome);
         self.classify_outcome(workspace, TRIAGE_LOG_CHANGE_NAME, outcome)
             .await
+    }
+
+    async fn run_discuss(&self, workspace: &Path, ctx: &DiscussContext) -> Result<DiscussTurn> {
+        // One conversational turn. Read-only during discussion
+        // (`deny_writes: true` + read-only OS mount); write-capable on
+        // `send it`. Runs through the session-managing wrapper (prune=false)
+        // so the session id is captured AND the next turn can resume the
+        // cached prefix natively via `--resume`.
+        let strategy = self.implementer_strategy();
+        let mut allowed_tools = vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()];
+        if ctx.write_mode {
+            // ponytail: agent edits the artifact, daemon commits + opens the
+            // PR (revision-execute pattern). Bash allowed so it can run
+            // `openspec validate` on the artifact it drafts.
+            allowed_tools.push("Edit".to_string());
+            allowed_tools.push("Write".to_string());
+            allowed_tools.push("Bash".to_string());
+        }
+        let outcome = crate::agentic_run::agentic_run_with_session(
+            crate::agentic_run::AgenticRunOpts {
+                workspace,
+                change: DISCUSS_LOG_CHANGE_NAME,
+                strategy: strategy.as_ref(),
+                prompt: &ctx.prompt,
+                sandbox: crate::agentic_run::SandboxConfig {
+                    allowed_tools,
+                    disallowed_bash_patterns: self.sandbox.disallowed_bash_patterns.clone(),
+                    disallowed_read_paths: self.sandbox.disallowed_read_paths.clone(),
+                    deny_writes: !ctx.write_mode,
+                },
+                model: None,
+                output_mode: crate::agentic_run::OutputMode::Capture,
+                timeout: self.timeout,
+                paths: Some(&self.paths),
+                settings_dir: self.settings_dir.as_deref(),
+                include_autocoder_tools: false,
+                emit_stream_json_in_capture: false,
+                resume_session_id: ctx.resume_session_id.as_deref(),
+                track_subprocess_marker: true,
+                etxtbsy_retry_spawn: true,
+                os_sandbox: crate::sandbox::current_run_sandbox(self.cli, ctx.write_mode),
+            },
+            false,
+            self.session_home.as_deref(),
+        )
+        .await?;
+        persist_run_log(
+            &self.paths,
+            workspace,
+            DISCUSS_LOG_CHANGE_NAME,
+            &ctx.prompt,
+            &outcome,
+        );
+        if outcome.timed_out {
+            return Err(anyhow!("discuss session timed out"));
+        }
+        let reply = match outcome.final_answer.as_deref().map(str::trim) {
+            Some(a) if !a.is_empty() => a.to_string(),
+            _ => outcome.stdout.trim().to_string(),
+        };
+        Ok(DiscussTurn {
+            reply,
+            session_id: outcome.session_handle.clone(),
+        })
     }
 
     async fn run_chat_triage(

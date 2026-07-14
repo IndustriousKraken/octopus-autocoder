@@ -123,6 +123,8 @@ pub async fn run_pass_through_commits(
         paths,
         workspace,
         repo,
+        github_cfg,
+        &pending_filtered,
         audit_registry,
         audits_cfg,
         audit_settings,
@@ -526,11 +528,22 @@ async fn prepare_workspace_for_pass(
 /// and not downgraded, run due audits and signal the caller to stop the
 /// pending walk. Returns true when the queue is blocked. Extracted from
 /// `run_pass_through_commits` (a68 split).
+///
+/// A `.needs-spec-revision.json` marker short-circuits FIRST (an early exit that
+/// never queries the forge). When no blocking marker is present, the gate ALSO
+/// parks a change whose spec revision is already in flight — an open PR on
+/// `<agent_branch>-spec-revision-<change>` (spec-revision-pr-parks-change). The
+/// spec-revision executor deletes the marker when it opens that PR (per
+/// `revision-clears-needs-spec-revision-marker`); without this check the gate
+/// would find the change unblocked next iteration, re-run the spec gate, and
+/// re-write the marker the executor just cleared.
 #[allow(clippy::too_many_arguments)]
-async fn handle_blocking_markers_gate(
+pub(crate) async fn handle_blocking_markers_gate(
     paths: &DaemonPaths,
     workspace: &Path,
     repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    pending: &[String],
     audit_registry: &AuditRegistry,
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,
@@ -574,7 +587,137 @@ async fn handle_blocking_markers_gate(
         );
         return Ok(true);
     }
+
+    // No blocking marker. An open PR on `<agent_branch>-spec-revision-<change>`
+    // means that change's spec revision is already in flight — park it with the
+    // same halt-queue-walk result as a marker (spec-revision-pr-parks-change).
+    // Fails open: a forge error is logged inside the helper and treated as "not
+    // parked" so a transient GitHub failure cannot park a change indefinitely.
+    if let Some(park) = spec_revision_pr_park(repo, github_cfg, pending).await {
+        tracing::info!(
+            url = repo.url.as_str(),
+            change = %park.change,
+            pr_number = park.pr_number,
+            pr_url = %park.pr_url,
+            "queue parked: change `{}` has an open spec-revision PR #{} ({}); not re-running the spec gate",
+            park.change,
+            park.pr_number,
+            park.pr_url
+        );
+        run_due_audits_after_queue(
+            paths,
+            workspace,
+            repo,
+            audit_registry,
+            audits_cfg,
+            audit_settings,
+            chatops_ctx,
+            queued_audit_types,
+        )
+        .await;
+        tracing::info!(
+            url = %repo.url,
+            committed = committed_count,
+            "polling pass complete (queue parked by an open spec-revision PR)"
+        );
+        return Ok(true);
+    }
     Ok(false)
+}
+
+/// A pending change parked by an open spec-revision PR.
+struct SpecRevisionPark {
+    change: String,
+    pr_number: u64,
+    pr_url: String,
+}
+
+/// Detect the first pending change parked by an open spec-revision PR — a PR
+/// whose head is `<agent_branch>-spec-revision-<change>`. Reuses the existing
+/// `find_pr_by_head` forge call; the head-owner resolution matches the
+/// agent-branch open-PR check (fork owner in fork-PR mode, upstream owner in
+/// direct mode). Test-instrumentable base via the process-wide hook, mirroring
+/// [`open_pr_exists_for_agent_branch`].
+async fn spec_revision_pr_park(
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    pending: &[String],
+) -> Option<SpecRevisionPark> {
+    #[cfg(test)]
+    {
+        if let Some(api_base) = test_hooks::github_api_base() {
+            return spec_revision_pr_park_at(&api_base, repo, github_cfg, pending).await;
+        }
+    }
+    spec_revision_pr_park_at(github::DEFAULT_API_BASE, repo, github_cfg, pending).await
+}
+
+/// Base-parameterized worker for [`spec_revision_pr_park`]. Fails open per
+/// change: a parse / token / forge-query error logs a WARN and is treated as
+/// "not parked" for that change (a transient GitHub failure must not park a
+/// change indefinitely) — the same error policy as
+/// `open_pr_exists_for_agent_branch_at`.
+async fn spec_revision_pr_park_at(
+    api_base: &str,
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    pending: &[String],
+) -> Option<SpecRevisionPark> {
+    if pending.is_empty() {
+        return None;
+    }
+    let (upstream_owner, upstream_repo) = match github::parse_repo_url(&repo.url) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                "spec-revision-PR park check skipped: cannot parse repo URL: {e:#}"
+            );
+            return None;
+        }
+    };
+    let token = match crate::github_credentials::resolve_token(github_cfg, &upstream_owner) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                "spec-revision-PR park check skipped: token resolution failed: {e:#}"
+            );
+            return None;
+        }
+    };
+    let head_owner = github_cfg.fork_owner.as_deref().unwrap_or(&upstream_owner);
+
+    use crate::forge::Forge;
+    let forge = crate::forge::GithubForge::with_api_base(api_base);
+    for change in pending {
+        let head_branch = format!("{}-spec-revision-{}", repo.agent_branch, change);
+        match forge
+            .find_pr_by_head(&token, &upstream_owner, &upstream_repo, head_owner, &head_branch)
+            .await
+        {
+            Ok(prs) => {
+                if let Some(pr) = prs.into_iter().next() {
+                    return Some(SpecRevisionPark {
+                        change: change.clone(),
+                        pr_number: pr.number,
+                        pr_url: pr.url,
+                    });
+                }
+            }
+            Err(e) => {
+                // Fail open: proceed as if no spec-revision PR exists for this
+                // change so a transient GitHub failure cannot park it forever.
+                tracing::warn!(
+                    url = %repo.url,
+                    change = %change,
+                    branch = %head_branch,
+                    "spec-revision-PR park check failed: {e:#}; proceeding as if no spec-revision PR exists for this change"
+                );
+            }
+        }
+    }
+    None
 }
 
 /// Log a mid-iteration recovery failure with its classification (transient

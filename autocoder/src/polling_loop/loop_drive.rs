@@ -132,6 +132,19 @@ pub(crate) fn run_state_housekeeping(paths: &DaemonPaths) {
         Err(e) => tracing::warn!("proposal-requests prune failed (iteration continues): {e:#}"),
     }
 
+    // Same housekeeping for discuss-thread state files (the `discuss`/
+    // `propose` flow). Stale entries (>14 days by `last_activity_at`) are
+    // removed regardless of status so the directory stays bounded.
+    let discussion_state_root = crate::discussion_state::default_state_root(paths);
+    match crate::discussion_state::prune_stale_entries(
+        &discussion_state_root,
+        chrono::Duration::days(14),
+    ) {
+        Ok(0) => {}
+        Ok(n) => tracing::debug!(count = n, "discussions prune removed {n} stale entry(ies)"),
+        Err(e) => tracing::warn!("discussions prune failed (iteration continues): {e:#}"),
+    }
+
     // Same housekeeping for changelog-request state files (per
     // `a06-chat-driven-changelog`). Stale entries (>7 days) are
     // removed regardless of status so the directory stays bounded.

@@ -31,6 +31,29 @@ The install script's "production releases" filter skips pre-releases by default,
 
 The workflow exposes a `workflow_dispatch` trigger with a `dry_run` boolean input (default `true`). Triggering it manually from *Actions → release → Run workflow* exercises `lint`, `test`, and `build` against any branch without creating a tag or publishing a release. Set `dry_run` to `false` only if you genuinely want a workflow_dispatch run to publish (the normal path is to push a tag).
 
+## Migration notes
+
+### `discuss` verb replaces the one-shot `propose` flow
+
+The `propose` chatops verb is now a permanent alias for the new conversational
+`discuss` verb, handled by an always-on discuss handler rather than the polling
+loop. **Before deploying this release, drain any in-flight `propose` requests:**
+let the running daemon finish (or clear) every pending `ProposalRequestState`
+under `<state_dir>/proposal-requests/` that was created by the *old* `propose`
+verb. After deploy, the discuss/propose verb no longer writes
+`ProposalRequestState` — it writes `DiscussionState` under
+`<state_dir>/discussions/` — so any propose-request state left in flight will
+never be processed by the new flow. Stale files age out on the existing 7-day
+prune regardless.
+
+The `ProposalRequestState` type, the `proposal-requests/` state tree, the
+`process_proposal_requests` polling handler, and the `prompts/chat-request-triage.md`
+prompt are **retained** because the out-of-scope scout→spec-it flow
+(`@<bot> spec-it`) still drives one-shot chat-triage through them. Only the
+`propose` verb's coupling to that machinery was removed; the `.chat-reply.md`
+QUESTION path (and the `Discussed` status it set) was removed with it, since the
+scout→spec-it consumer only ever produces DIRECTIVE triage.
+
 ## After publish
 
 The Release body is GitHub's auto-generated changelog. Edit it on the Release page to add highlights, breaking-change notes, or upgrade guidance if the auto-summary needs annotation.

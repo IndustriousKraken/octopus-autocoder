@@ -108,6 +108,23 @@ pub trait Executor: Send + Sync {
         })
     }
 
+    /// One turn of a conversational `discuss` session (the `discuss`/`propose`
+    /// verb). The daemon's discuss handler renders the turn prompt (the
+    /// discuss-mode template + the operator's message for a fresh session, or
+    /// just the new message when resuming) AND supplies the resumable session
+    /// id. During the discussion phase the session is read-only
+    /// (`write_mode: false`); on `send it` the handler re-runs it with
+    /// `write_mode: true` so the agent can create + modify the artifact files.
+    /// Returns the agent's reply text AND the session id to persist for the
+    /// next turn.
+    ///
+    /// Default impl returns an error (no conversational session support).
+    async fn run_discuss(&self, workspace: &Path, ctx: &DiscussContext) -> Result<DiscussTurn> {
+        let _ = workspace;
+        let _ = ctx;
+        anyhow::bail!("discuss mode not supported by this executor backend")
+    }
+
     /// Brownfield-draft mode for the `brownfield` chatops verb (a23).
     /// The polling iteration's brownfield handler resolves the prompt
     /// template (embedded default OR a workspace-relative override
@@ -316,6 +333,30 @@ pub struct IssueContext {
 pub struct IssueReportTriageContext {
     /// Fully rendered triage prompt: template + interpolated context.
     pub rendered_prompt: String,
+}
+
+/// Context handed to `Executor::run_discuss` for one conversational turn.
+/// The discuss handler renders `prompt` (discuss-mode template + operator
+/// message for a fresh session, or just the new message when resuming).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscussContext {
+    /// The fully-rendered turn prompt to hand the agent.
+    pub prompt: String,
+    /// Native session id to resume (cached prefix); `None` starts fresh.
+    pub resume_session_id: Option<String>,
+    /// `false` = read-only conversation turn; `true` = `send it` write turn
+    /// (the agent may create + modify the artifact files).
+    pub write_mode: bool,
+}
+
+/// Result of one `run_discuss` turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscussTurn {
+    /// The agent's reply (posted to the thread on a read-only turn; used as
+    /// the artifact summary on a write turn).
+    pub reply: String,
+    /// The resumable session id to persist for the next turn, when captured.
+    pub session_id: Option<String>,
 }
 
 /// Context handed to `Executor::run_chat_triage`. Plumbed in from the

@@ -710,3 +710,134 @@ pub(crate) fn handle_queue_clear_survey(parsed: &Value, state: &ControlState) ->
         crate::state::brownfield_survey::clear_all,
     )
 }
+
+/// Forward a [`DiscussEvent`] to the always-on discuss handler over its mpsc
+/// channel. Unlike the per-repo `enqueue_request` handlers, the discuss flow is
+/// process-level: the handler resolves the repo config itself. Returns an error
+/// reply when no discuss handler is wired (the minimal control states).
+fn forward_discuss(state: &ControlState, event: DiscussEvent) -> Value {
+    match state.discuss_tx.as_ref() {
+        Some(tx) => match tx.send(event) {
+            Ok(()) => json!({"ok": true}),
+            Err(_) => json!({
+                "ok": false,
+                "error": "discuss handler channel is closed (daemon shutting down?)"
+            }),
+        },
+        None => json!({
+            "ok": false,
+            "error": "discuss handler not available on this control socket"
+        }),
+    }
+}
+
+/// `queue_discuss_action` — a new conversational `discuss`/`propose` request.
+pub(crate) fn handle_queue_discuss_action(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let request_id = match require_str(parsed, "request_id") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let channel = match require_str(parsed, "channel") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let thread_ts = match require_str(parsed, "thread_ts") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let initial_text = parsed
+        .get("initial_text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let operator_user = parsed
+        .get("operator_user")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    forward_discuss(
+        state,
+        DiscussEvent::Start(DiscussAction {
+            repo_url: url,
+            initial_text,
+            channel,
+            thread_ts,
+            request_id,
+            operator_user,
+        }),
+    )
+}
+
+/// `queue_discuss_continue` — a follow-up `@<bot>` reply in a discuss thread.
+pub(crate) fn handle_queue_discuss_continue(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let request_id = match require_str(parsed, "request_id") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let channel = match require_str(parsed, "channel") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let thread_ts = match require_str(parsed, "thread_ts") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let text = parsed
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    forward_discuss(
+        state,
+        DiscussEvent::Continue(DiscussContinueAction {
+            repo_url: url,
+            text,
+            channel,
+            thread_ts,
+            request_id,
+        }),
+    )
+}
+
+/// `queue_discuss_send_it` — `send it [trailing]` in a discuss thread.
+pub(crate) fn handle_queue_discuss_send_it(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let request_id = match require_str(parsed, "request_id") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let channel = match require_str(parsed, "channel") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let thread_ts = match require_str(parsed, "thread_ts") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let final_context = parsed
+        .get("final_context")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.trim().is_empty());
+    forward_discuss(
+        state,
+        DiscussEvent::SendIt(DiscussSendItAction {
+            repo_url: url,
+            final_context,
+            channel,
+            thread_ts,
+            request_id,
+        }),
+    )
+}

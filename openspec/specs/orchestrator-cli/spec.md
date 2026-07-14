@@ -3821,128 +3821,6 @@ When the rebuild's `RebuildReport.prefix_renames` is non-empty, the generated PR
 - **AND** the section appears before the `**Canonical spec files**` section
 - **AND** the section lists every rename grouped by day with dependency summaries
 
-### Requirement: `propose` chatops verb queues a chat-driven triage request
-The chatops listener SHALL recognize `@<bot> propose <repo-substring> <free-form text>` as the `ProposeRequest` command. The repo-substring follows the established case-insensitive substring-matching rules. The free-form text is everything after the substring (trimmed of leading/trailing whitespace, line breaks preserved internally, capped at 10,000 characters). On a unique repo match, the dispatcher SHALL: generate a `request_id`, post a one-line ack that includes the trailing phrase "Follow along in this thread.", capture the ack message's `ts` as the request's lifecycle `thread_ts`, write a `ProposalRequestState` file with `status: Pending`, AND submit a `queue_proposal_request` control-socket action so the next polling iteration picks up the request.
-
-#### Scenario: Happy-path queueing with thread creation
-- **WHEN** an operator posts `@<bot> propose myrepo add a /healthz endpoint` AND `myrepo` uniquely resolves to a configured repo
-- **THEN** the bot posts a top-level ack message containing `✓ Queued proposal request for <repo_url>. The next polling iteration will run it (~Nm). Follow along in this thread.`
-- **AND** the ack's `ts` becomes the request's `thread_ts`
-- **AND** a `ProposalRequestState` file is written with `status: Pending`
-- **AND** the per-repo `pending_proposal_requests` queue gains an entry
-
-#### Scenario: Missing request text is rejected
-- **WHEN** an operator posts `@<bot> propose myrepo` (no free-form text after the substring)
-- **THEN** the bot replies `✗ propose: missing request text. Usage: @<bot> propose <repo> <free-form description>`
-- **AND** no state file is written
-
-#### Scenario: Repo substring ambiguity surfaces the candidate list
-- **WHEN** the repo-substring matches multiple configured repos
-- **THEN** the bot replies with the existing `match_repo`-style "be more specific" list
-- **AND** no state file is written
-
-### Requirement: Triage prompt classifies the request as DIRECTIVE, QUESTION, or AMBIGUOUS before acting
-The triage-mode prompt for chat-driven requests (`prompts/chat-request-triage.md`) SHALL begin with a classification step. The LLM decides:
-
-- **DIRECTIVE**: the input asks for a specific action a reasonable engineer could build. The LLM proceeds to explore the codebase, classify what needs to be done as fix-vs-spec, apply fixes, create spec proposals.
-- **QUESTION**: the input asks for analysis, opinion, or exploration of options. The LLM writes its response to `<workspace>/.chat-reply.md` and STOPS. No source-file modifications.
-- **AMBIGUOUS**: the request might be a directive but the LLM cannot pin down what to build. The LLM SHALL use the `ask_user` MCP tool to ask the operator for clarification. The existing chatops escalation posts the question in the request's thread and resumes the executor with the operator's answer.
-
-#### Scenario: Directive proceeds to explore + classify + fix/spec
-- **WHEN** the operator's request is `add a /healthz endpoint that returns 200 OK with the daemon's version and uptime`
-- **THEN** the LLM classifies as DIRECTIVE
-- **AND** proceeds with the explore + classify + fix-or-spec flow
-- **AND** the diff after execution contains code changes (and optionally a new `openspec/changes/<derived-slug>/` directory)
-
-#### Scenario: Question writes to .chat-reply.md and stops
-- **WHEN** the operator's request is `what would it take to refactor the auth module to use the new error type?`
-- **THEN** the LLM classifies as QUESTION
-- **AND** writes its analysis to `<workspace>/.chat-reply.md`
-- **AND** does NOT modify any other files
-- **AND** `git status --porcelain` (after the executor returns) shows only `.chat-reply.md` as new/modified
-
-#### Scenario: Ambiguous request escalates via ask_user
-- **WHEN** the operator's request is `something something handler logic` (genuinely unclear)
-- **THEN** the LLM classifies as AMBIGUOUS
-- **AND** uses the `ask_user` MCP tool to post a clarifying question
-- **AND** the existing chatops escalation posts the question in the request's `thread_ts`
-- **AND** the operator's reply resumes the executor
-
-### Requirement: `.chat-reply.md` marker drives the discussion-reply path
-After the triage executor returns `Completed`, the polling iteration SHALL check for `<workspace>/.chat-reply.md` BEFORE running the diff-split + two-PR creation. The presence of this file means "the LLM classified as QUESTION and wrote its response here." The iteration SHALL: read the file contents, truncate at 35,000 characters with a daemon-log pointer when over, post the contents as a threaded reply in the request's `thread_ts`, delete `<workspace>/.chat-reply.md`, and set the state's `status` to `Discussed`. If `git status --porcelain` reports any OTHER modifications, the iteration SHALL log WARN naming them AND revert via `git reset --hard HEAD; git clean -fd`. No PRs are created.
-
-#### Scenario: Clean discussion reply
-- **WHEN** the executor returns Completed AND `.chat-reply.md` is the only modified file
-- **THEN** the file contents post as a threaded reply in the request's thread
-- **AND** the file is deleted
-- **AND** the state's `status` is `Discussed`
-- **AND** no PR is created
-- **AND** no WARN log fires
-
-#### Scenario: Discussion reply with leaked source modifications is cleaned up
-- **WHEN** the executor returns Completed AND `.chat-reply.md` is present AND `git status --porcelain` ALSO shows modifications to other files
-- **THEN** the file contents post as a threaded reply normally
-- **AND** the state's `status` is `Discussed`
-- **AND** a WARN log fires naming the unexpected other modifications
-- **AND** the workspace is reverted via `git reset --hard HEAD; git clean -fd` so the next iteration sees a clean tree
-
-#### Scenario: Long reply is truncated with daemon-log pointer
-- **WHEN** the `.chat-reply.md` contents exceed 35,000 characters
-- **THEN** the posted thread reply is truncated to 35,000 chars
-- **AND** ends with `… [truncated; full reply at journalctl -u autocoder | grep request_id=<request_id>]`
-
-### Requirement: Directive triage uses the existing two-PR mechanic; PRs participate in the revision-loop
-When the executor returns `Completed` without a `.chat-reply.md` marker, the polling iteration SHALL discard non-spec writes from the working tree (via the same helper used by the audit-triage path) AND open AT MOST ONE PR — the spec PR — when spec content exists. Code-path writes are dropped before commit; a WARN log AND a chatops reply name the dropped paths when applicable. The two-PR shape from prior canonical text is removed; implementation flows through the standard implementer pipeline on a subsequent polling iteration after the operator merges the spec PR. Operators commenting `@<bot> revise <text>` on the spec PR continue to get revisions through `a01-pr-comment-revision-loop` per the unchanged revision-loop semantics.
-
-#### Scenario: Mixed-diff directive produces one spec PR; code paths discarded with chatops warning
-- **GIVEN** the directive's executor returns `Completed` with BOTH code changes in `src/foo.rs` AND new files in `openspec/changes/<chat-derived-slug>/`
-- **WHEN** the chat-triage completion handler runs
-- **THEN** the discard step restores `src/foo.rs`
-- **AND** the daemon creates a spec branch + PR with ONLY the openspec paths
-- **AND** the PR body does NOT mention a companion fixes PR
-- **AND** the daemon posts a chatops reply in the proposal-thread naming `src/foo.rs` as dropped
-- **AND** the proposal-request state's `status` flips to `Acted`
-
-#### Scenario: Spec-only directive produces one spec PR
-- **GIVEN** the directive's diff has only new `openspec/changes/<chat-derived-slug>/` paths
-- **WHEN** the chat-triage completion handler runs
-- **THEN** the spec PR is created
-- **AND** no chatops warning is posted
-- **AND** the proposal-request state's `status` flips to `Acted`
-
-#### Scenario: Code-only directive produces NO PR
-- **GIVEN** the directive's diff has only code paths (no new `openspec/changes/<chat-derived-slug>/`)
-- **WHEN** the chat-triage completion handler runs
-- **THEN** the discard step restores the code paths
-- **AND** no PR is opened
-- **AND** the daemon posts a chatops reply in the proposal-thread naming `no spec content produced; retry with a clearer directive`
-- **AND** the proposal-request state's `status` flips to `TriageFailed`
-
-#### Scenario: Empty-diff directive posts a no-action reply
-- **GIVEN** the directive's executor returns `Completed` with an empty diff AND no `.chat-reply.md`
-- **WHEN** the chat-triage completion handler runs
-- **THEN** no PRs are created
-- **AND** the bot posts a reply in the request's thread explaining no action was taken
-- **AND** the proposal-request state's `status` flips to `Acted`
-
-#### Scenario: Revision comments on a triage PR are processed normally
-- **GIVEN** a chat-request-spawned PR has an operator comment `@<bot> revise <text>`
-- **WHEN** the revision-loop dispatcher polls for new PR comments
-- **THEN** the existing dispatcher (per `a01-pr-comment-revision-loop`) picks up the comment AND processes the revision against the PR's branch
-- **AND** the proposal-request state file is not consulted (the revision is its own scope)
-- **AND** the revision agent's writes remain scoped to the PR's diff (which by construction now contains only spec files)
-
-### Requirement: Proposal-request state files are pruned after 7 days
-The daemon SHALL prune `ProposalRequestState` files whose `submitted_at` is older than 7 days. The prune runs periodically (at iteration start or once per day per the existing housekeeping pattern). Stale entries are removed regardless of `status`.
-
-#### Scenario: Stale entry is removed
-- **WHEN** the prune runs AND a `ProposalRequestState` has `submitted_at` more than 7 days in the past
-- **THEN** the state file is removed
-
-#### Scenario: Fresh entry is preserved
-- **WHEN** the prune runs AND a `ProposalRequestState` has `submitted_at` within the last 7 days
-- **THEN** the state file is NOT removed regardless of status
-
 ### Requirement: Install wizard probes systemd for an existing installation before falling through to default-path checks
 `autocoder install` SHALL probe `systemctl show autocoder.service` before its default-path idempotency check to detect existing installations whose config is at a non-default location. The probe SHALL extract three properties: `LoadState`, `FragmentPath`, and the `--config <path>` argument from `ExecStart`. The result SHALL drive a three-way branch:
 
@@ -9016,4 +8894,164 @@ Roadmap items are operator- and agent-editable idea records. Unlike the canonica
 #### Scenario: The roadmap convention is documented in OCTOPUS.md
 - **WHEN** a contributor or agent needs to create or interpret a roadmap item
 - **THEN** `OCTOPUS.md` documents the `roadmap/` location, the frontmatter format, the status values, the human- and agent-editable lifecycle, AND that roadmap items are never automatically implemented
+
+### Requirement: `propose` chatops verb is a permanent alias for the `discuss` verb
+The verb `propose` is a permanent alias for `discuss`. The inbound chatops listener SHALL accept `@<bot> propose <repo-substring> <free-form text>` and process it identically to `@<bot> discuss <repo-substring> <free-form text>` per the `discuss chatops verb starts an immediate conversational session` requirement. No deprecation warning, distinguishing log entry, or behavioral difference applies to the alias. `propose` remains a listed known verb in all help text and verb-recognition requirements.
+
+#### Scenario: `propose` alias triggers discuss behavior
+- **WHEN** an operator posts `@<bot> propose myrepo add a /healthz endpoint`
+- **THEN** the behavior is identical to `@<bot> discuss myrepo add a /healthz endpoint`
+- **AND** the ack message, DiscussionState file, and handler path are the same as for `discuss`
+- **AND** no deprecation note appears in the ack
+
+#### Scenario: Missing request text is rejected (alias path)
+- **WHEN** an operator posts `@<bot> propose myrepo` (no free-form text)
+- **THEN** the bot replies `✗ discuss: missing request text. Usage: @<bot> discuss <repo> <question or request>`
+- **AND** no state file is written
+
+### Requirement: `discuss` chatops verb starts an immediate conversational session
+The chatops listener SHALL recognize `@<bot> discuss <repo-substring> <free-form text>` as the `DiscussAction` command. The repo-substring follows the established case-insensitive substring-matching rules. The free-form text is everything after the substring (trimmed, line breaks preserved, capped at 10,000 characters).
+
+On a unique repo match, the dispatcher SHALL: generate a `request_id`, post a top-level channel message as the ack (the ack's `ts` becomes the session's `thread_ts`), write a `DiscussionState` file with `status: Active`, AND submit a `DiscussAction { repo_url, initial_text, channel, thread_ts, request_id, operator_user }` over the control socket.
+
+The ack message SHALL contain the phrase "Follow along in this thread." AND the phrase "Note: only replies starting with @<bot> are seen here."
+
+The daemon's dedicated discuss handler processes `DiscussAction` items as they arrive on the control socket, without waiting for the next repo polling iteration. The target elapsed time from control-socket receipt to first thread reply is under 60 seconds under normal load.
+
+#### Scenario: Happy-path — message received and ack posted immediately
+- **WHEN** an operator posts `@<bot> discuss myrepo how does the revision executor decide when to stop retrying?`
+- **AND** `myrepo` uniquely resolves to a configured repo
+- **THEN** the bot posts a top-level ack containing "Follow along in this thread." AND "Note: only replies starting with @<bot> are seen here."
+- **AND** a `DiscussionState` file is written with `status: Active`
+- **AND** the daemon's discuss handler begins processing within 60 seconds
+
+#### Scenario: Missing request text is rejected
+- **WHEN** an operator posts `@<bot> discuss myrepo` (no free-form text)
+- **THEN** the bot replies `✗ discuss: missing request text. Usage: @<bot> discuss <repo> <question or request>`
+- **AND** no state file is written
+
+#### Scenario: Ambiguous repo substring surfaces the candidate list
+- **WHEN** the repo-substring matches multiple configured repos
+- **THEN** the bot replies with the existing `match_repo`-style candidate list
+- **AND** no state file is written
+
+### Requirement: Discuss handler processes requests without waiting for the polling loop
+The daemon SHALL maintain a dedicated discuss handler as a persistent async task, separate from the per-repo polling loop. The handler listens for `DiscussAction`, `DiscussContinueAction`, and `DiscussSendItAction` control-socket submissions and processes them immediately upon receipt. The handler MUST NOT wait for a polling iteration's sleep timer. (`DiscussAction` and `DiscussContinueAction` are handled entirely within the read-only conversational phase described below; `DiscussSendItAction` is handled per the `send it` in a discuss thread creates an artifact sequentially requirement, which is the only path that leaves read-only mode.)
+
+During the conversational phase the discuss AGENT runs in a read-only sandbox: the sandboxed agentic session performs no file writes and no git commits. This read-only constraint scopes the AGENT's sandbox only — it does NOT constrain the daemon handler, which (outside the agent sandbox, as it does for every lifecycle) still writes daemon-owned state and lifecycle-marker files and commits them where its own requirements direct. Specifically, the handler persists session state — including a session ID usable for context resumption — to `DiscussionState` after each agent turn (so continuation messages and the eventual `send it` can resume the conversation), AND may write and commit the defer marker per `Auto-defer protects an existing spec under active discuss`. The AGENT itself gains file-write and commit capability only on `send it`, per `send it in a discuss thread creates an artifact sequentially`.
+
+The discuss-mode agent prompt SHALL instruct the agent to proactively read:
+- Canonical specs in `openspec/specs/*/spec.md` relevant to the topic.
+- `CHANGELOG.md`, `OCTOPUS.md`, and any `docs/*.md` present in the workspace.
+- Active and recently archived changes in `openspec/changes/`.
+- Source files an implementer would need to modify to carry out the discussed change.
+
+The agent SHALL reply conversationally in the thread — answering questions directly, describing proposed changes in plain terms, and waiting for operator input rather than acting unilaterally.
+
+#### Scenario: Agent replies within 60 seconds
+- **WHEN** a `DiscussAction` is submitted to the control socket
+- **THEN** the discuss handler begins the agentic session without waiting for any polling sleep
+- **AND** the first agent reply appears in the thread within 60 seconds under normal load
+
+#### Scenario: Agent reads relevant specs before responding
+- **WHEN** the operator's question references a daemon feature
+- **THEN** the agent reads the relevant canonical spec AND any active change touching that feature before replying
+- **AND** the reply reflects current canon, not a generic answer
+
+### Requirement: `@<bot>` replies in a discuss thread continue the conversation
+When an operator posts `@<bot> <text>` as a reply in an active discuss thread (any thread whose `thread_ts` matches an active `DiscussionState`), AND the text is NOT the `send it` verb (case-insensitive match on the leading `send it` token after stripping the `@<bot>` prefix), the listener SHALL submit a `DiscussContinueAction { repo_url, text, channel, thread_ts, request_id }`. The discuss handler resumes the session for that thread with the new text appended to context and posts a reply in the thread. `@<bot> send it` replies are handled exclusively by the `send it in a discuss thread creates an artifact sequentially` requirement and SHALL NOT also produce a `DiscussContinueAction`.
+
+Replies NOT prefixed with `@<bot>` in a discuss thread are silently ignored. A `DiscussContinueAction` submitted to a `thread_ts` that no longer has an active `DiscussionState` SHALL be refused with a thread reply: `✗ This discussion is no longer active. Start a new one with @<bot> discuss <repo> <text>.`
+
+#### Scenario: Operator follow-up continues in thread
+- **WHEN** an operator posts `@<bot> what about the revision-cap edge case?` in an active discuss thread
+- **THEN** a `DiscussContinueAction` is submitted
+- **AND** the discuss handler resumes the session and replies in the thread
+
+#### Scenario: Reply without @<bot> prefix is silently ignored
+- **WHEN** an operator posts `thanks, that makes sense` (no @<bot> prefix) in a discuss thread
+- **THEN** no action is submitted and no reply is posted
+
+### Requirement: `send it` in a discuss thread creates an artifact sequentially
+When an operator posts `@<bot> send it [optional trailing text]` in an active discuss thread, the listener SHALL submit a `DiscussSendItAction { repo_url, final_context: Option<String>, channel, thread_ts, request_id }`. Any text following `send it` (trimmed) becomes `final_context` and is appended to the session context before the artifact-creation step. The `DiscussionState` status transitions to `Executing`.
+
+The discuss handler queues the artifact-creation job so that it runs AFTER the current executor for that repo completes (if one is in flight). If no executor is in progress the job starts immediately. In the artifact-creation step the session resumes in write mode: the agent may create and modify files, commits the result, and the daemon opens a PR on the configured `agent-q` branch. The bot posts the PR URL as a thread reply.
+
+#### Scenario: `send it` with final context
+- **WHEN** an operator posts `@<bot> send it and let's go with Option B, keep the existing error format`
+- **THEN** the `DiscussSendItAction.final_context` is `and let's go with Option B, keep the existing error format`
+- **AND** the agent appends this context before writing the artifact
+
+#### Scenario: Artifact creation waits for current executor
+- **WHEN** a `DiscussSendItAction` arrives while the repo's implementation executor is in flight
+- **THEN** artifact creation does not start until the running executor finishes
+- **AND** no merge conflict is introduced on the `agent-q` branch
+
+#### Scenario: PR opened and URL posted to thread
+- **WHEN** the artifact-creation step completes and the daemon opens a PR on `agent-q`
+- **THEN** the bot posts the PR URL as a reply in the discuss thread
+- **AND** `DiscussionState.status` transitions to `Completed`
+
+### Requirement: Auto-defer protects an existing spec under active discuss
+When the discuss agent determines during the conversational phase that the operator is discussing a modification to an existing canonical spec or an active change's spec delta, the handler SHALL write the defer marker for the relevant change or spec entry, commit it to the workspace, and post a thread reply naming the deferred unit AND stating the exact command to clear it. This marker write and commit is a DAEMON-handler action performed outside the agent's read-only sandbox (consistent with the daemon's ownership of lifecycle-marker files); it does NOT grant the sandboxed conversational agent any write capability, which the agent gains only on `send it`. The reply text is: `"I've deferred <slug> while we discuss. If you decide not to follow through, clear it with @<bot> undefer <repo> <slug>. I'll clear it automatically when I open its PR."`
+
+On `send it` completion (PR opened), the handler SHALL clear the defer marker and commit/push the removal. If no `send it` arrives within 7 days of the last thread activity, the handler SHALL post a single idle reminder in the thread naming the deferred unit and restating the undefer command. The reminder fires once per stale discussion.
+
+#### Scenario: Auto-defer on existing-spec modification discussion
+- **WHEN** the discuss agent determines the operator is discussing a change to an existing spec
+- **THEN** the defer marker is written and committed
+- **AND** the thread reply names the spec and the `@<bot> undefer` command
+
+#### Scenario: Defer cleared on PR open
+- **WHEN** `send it` completes and a PR is opened
+- **THEN** the defer marker is removed and the removal is committed/pushed
+
+#### Scenario: 7-day idle reminder fires once
+- **WHEN** no thread activity in 7 days AND a defer marker is active
+- **THEN** one reminder is posted in the thread
+- **AND** no further reminders fire until activity resumes
+
+### Requirement: DiscussionState files are pruned after 14 days
+The daemon SHALL prune `DiscussionState` files whose `last_activity_at` is older than 14 days. The prune runs at iteration start or once per day per the existing housekeeping pattern. Stale entries are removed regardless of `status`.
+
+#### Scenario: Stale DiscussionState is removed
+- **WHEN** the prune runs AND a `DiscussionState` has `last_activity_at` more than 14 days in the past
+- **THEN** the state file is removed
+
+#### Scenario: Active discussion is preserved
+- **WHEN** the prune runs AND a `DiscussionState` has `last_activity_at` within the last 14 days
+- **THEN** the state file is NOT removed
+
+### Requirement: Open spec-revision PR parks its change in the queue without re-running the gate
+When the blocking-markers gate processes a pending change that has NO `.needs-spec-revision.json` marker, it SHALL also query GitHub for an open PR whose head branch is `<agent_branch>-spec-revision-<change-slug>`. When such a PR exists, the change is treated as parked — same blocking result and same queue-walk halt as when the marker is present — and the spec gate SHALL NOT be re-run for that change in this iteration.
+
+The park persists across iterations until the spec-revision PR is merged or closed. On merge, the updated spec lands on the base branch; the gate re-runs normally on the next iteration against the new spec. On close without merge, the gate re-runs on the next iteration; if the spec still needs revision the marker is re-written by the gate as before.
+
+On a forge query error for the spec-revision branch, the gate SHALL fail open (log a WARN, do NOT treat the change as parked) — consistent with the existing open-PR-check error policy: a transient GitHub failure must not permanently park a change.
+
+This requirement works in tandem with `A successfully applied revision clears the change's needs-spec-revision marker`. That requirement ensures the marker is deleted when the revision PR opens; this requirement ensures the deleted marker is not immediately re-written by the gate running on the next iteration.
+
+#### Scenario: Change is parked by an open spec-revision PR, not by the marker
+- **WHEN** a pending change has no `.needs-spec-revision.json` marker
+- **AND** an open PR exists on branch `agent-q-spec-revision-<change>`
+- **THEN** the blocking-markers gate returns a blocking/halt-queue-walk result for that change
+- **AND** the spec gate does NOT run for that change in this iteration
+- **AND** no `.needs-spec-revision.json` marker is written
+
+#### Scenario: Marker present — forge call for spec-revision PR is skipped
+- **WHEN** a pending change already has a `.needs-spec-revision.json` marker
+- **THEN** the blocking-markers gate returns blocking on the marker (short-circuit)
+- **AND** no forge call is made for the spec-revision branch (the marker check is the early-exit)
+
+#### Scenario: Park resolves on spec-revision PR close or merge
+- **WHEN** the spec-revision PR is merged or closed
+- **THEN** the next iteration finds no open spec-revision PR and no marker for that change
+- **AND** the gate runs normally on the updated spec (merge) or unchanged spec (close)
+- **AND** if the spec still needs revision after a close-without-merge, the gate re-writes the marker
+
+#### Scenario: Forge query error for spec-revision branch fails open
+- **WHEN** the GitHub query for an open PR on `agent-q-spec-revision-<change>` returns a transport error or non-2xx status
+- **THEN** the gate logs a WARN naming the failure
+- **AND** proceeds as if no spec-revision PR exists (does NOT park the change)
+- **AND** does NOT block execution or halt the queue walk on this error alone
 

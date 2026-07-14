@@ -62,7 +62,7 @@ pub const WIPE_CONFIRM_TTL_SECS: u64 = 60;
 /// not tracking. Wording matches the `audit-reply-acts` spec scenario
 /// "Send-it in untracked thread is politely refused".
 pub const SEND_IT_REFUSE_UNTRACKED: &str =
-    "✗ This reply is in a thread autocoder is not tracking. The `send it` verb only acts in an audit-notification, brownfield-survey, issue-candidate, or spec-revision thread.";
+    "✗ This reply is in a thread autocoder is not tracking. The `send it` verb only acts in an audit-notification, brownfield-survey, issue-candidate, spec-revision, or discuss thread.";
 
 /// Polite-refusal reply for `send it` against an audit thread whose
 /// `posted_at` is older than the 7-day staleness cap.
@@ -214,21 +214,21 @@ fn parse_priority_arg(tok: &str) -> Option<Option<u32>> {
 
 fn missing_request_text_reply() -> Reply {
     Reply::Sync(
-        "✗ propose: missing request text. Usage: @<bot> propose <repo> <free-form description>"
+        "✗ discuss: missing request text. Usage: @<bot> discuss <repo> <question or request>"
             .to_string(),
     )
 }
 
 fn missing_repo_substring_reply() -> Reply {
     Reply::Sync(
-        "✗ propose: missing repo-substring. Usage: @<bot> propose <repo> <free-form description>"
+        "✗ discuss: missing repo-substring. Usage: @<bot> discuss <repo> <question or request>"
             .to_string(),
     )
 }
 
 fn oversize_request_text_reply() -> Reply {
     Reply::Sync(format!(
-        "✗ propose: request text exceeds {MAX_PROPOSE_REQUEST_TEXT_LEN} characters. \
+        "✗ discuss: request text exceeds {MAX_PROPOSE_REQUEST_TEXT_LEN} characters. \
          Put longer descriptions in an issue or doc and reference it in a shorter request."
     ))
 }
@@ -373,6 +373,10 @@ pub enum OperatorCommand {
     /// `?` rather than treating channel-level mentions as triage requests.
     SendItOnAudit {
         thread_ts: String,
+        /// Optional trailing text after `send it` (preserved verbatim). Only
+        /// the discuss-thread context consumes it (as `final_context`); the
+        /// other `send it` contexts ignore it.
+        final_context: Option<String>,
     },
     /// `@<bot> audit <audit-substring> <repo-substring>` — queue an
     /// on-demand audit run for the matched repo on the next polling
@@ -876,10 +880,11 @@ fn parse_command_outcome_in_thread(
             }
             ParseOutcome::Ok(OperatorCommand::Help)
         }
-        "propose" => {
-            // `@<bot> propose <repo-substring> <free-form text>` — the
-            // repo substring is the first whitespace-separated token
-            // after `propose`; the request text is everything after
+        "propose" | "discuss" => {
+            // `@<bot> discuss <repo-substring> <free-form text>` (AND its
+            // permanent `propose` alias) — the repo substring is the first
+            // whitespace-separated token after the verb; the request text is
+            // everything after
             // that, preserving internal whitespace/newlines, with only
             // leading/trailing whitespace trimmed. The parser keys off
             // the body string directly (not `rest`) so multi-line
@@ -1193,19 +1198,35 @@ fn parse_command_outcome_in_thread(
             })
         }
         "send" => {
-            // `@<bot> send it` parses ONLY when the inbound message
-            // arrived inside a thread (non-empty `thread_ts`) AND the
-            // verb takes exactly one positional `it`. Any other arg
-            // count or shape falls through to the unknown-verb path,
-            // which the listener turns into a `?` reaction.
-            if rest.len() != 1 || !rest[0].eq_ignore_ascii_case("it") {
+            // `@<bot> send it [trailing final context]` parses ONLY when the
+            // inbound message arrived inside a thread (non-empty `thread_ts`)
+            // AND the first positional token is `it`. Any trailing text is
+            // captured as `final_context` (consumed only by the discuss-thread
+            // context; the other `send it` contexts ignore it). `send` alone,
+            // or `send <other>`, still falls through to the `?` reaction.
+            if rest.is_empty() || !rest[0].eq_ignore_ascii_case("it") {
                 return ParseOutcome::None;
             }
             let ts = match thread_ts {
                 Some(s) if !s.is_empty() => s.to_string(),
                 _ => return ParseOutcome::None,
             };
-            ParseOutcome::Ok(OperatorCommand::SendItOnAudit { thread_ts: ts })
+            // Slice the original body after the `it` token to preserve the
+            // trailing text's internal spacing.
+            let after_verb = after_mention[verb.len()..].trim_start(); // "it [trailing]"
+            let it_end = after_verb
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or(after_verb.len());
+            let trailing = after_verb[it_end..].trim();
+            let final_context = if trailing.is_empty() {
+                None
+            } else {
+                Some(trailing.to_string())
+            };
+            ParseOutcome::Ok(OperatorCommand::SendItOnAudit {
+                thread_ts: ts,
+                final_context,
+            })
         }
         "review" => {
             // `@<bot> review <repo-substring> <target...>` (a59). The repo
@@ -1658,6 +1679,20 @@ pub fn format_audit_no_match(substring: &str, registered: &[&str]) -> String {
 // Repo-status aggregate response shape
 // ====================================================================
 
+/// A pending change parked by an open spec-revision PR (head branch
+/// `<agent_branch>-spec-revision-<change>`), surfaced on the `currently:` line
+/// so operators see WHY the queue is parked instead of a misleading `idle`
+/// after the spec-revision executor clears the `.needs-spec-revision.json`
+/// marker (spec-revision-pr-parks-change). `None` when no pending change is so
+/// parked OR the forge query failed / was skipped — the line then falls
+/// through to the marker / open-PR / idle determination and never fabricates a
+/// park.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecRevisionParkSummary {
+    pub change: String,
+    pub pr_number: u64,
+}
+
 /// Daemon's view of a repo, returned by the control-socket `RepoStatus`
 /// action. Fields are independent: empty vectors mean "nothing in this
 /// section"; the formatter collapses empty sections rather than printing
@@ -1691,6 +1726,12 @@ pub struct RepoStatusResponse {
     /// wire-compatible with newer chatops formatters.
     #[serde(default)]
     pub open_agent_pr_numbers: Option<Vec<u64>>,
+    /// A pending change parked by an open spec-revision PR, when one exists AND
+    /// no busy marker / open agent-branch PR already determines the
+    /// `currently:` line. `#[serde(default)]` keeps older daemons wire-
+    /// compatible with newer chatops formatters (spec-revision-pr-parks-change).
+    #[serde(default)]
+    pub spec_revision_park: Option<SpecRevisionParkSummary>,
     pub perma_stuck_changes: Vec<MarkerEntry>,
     pub revision_marked_changes: Vec<MarkerEntry>,
     pub throttled_alerts: Vec<ThrottledAlertEntry>,
@@ -1902,9 +1943,10 @@ pub fn format_status_reply(resp: &RepoStatusResponse) -> String {
         }
 
         out.push('\n');
-        out.push_str(&format_currently_line_with_park(
+        out.push_str(&format_currently_line_with_parks(
             resp.currently_busy.as_ref(),
             resp.open_agent_pr_numbers.as_deref(),
+            resp.spec_revision_park.as_ref(),
         ));
         out.push('\n');
     }
@@ -2464,13 +2506,13 @@ pub fn format_help_reply() -> String {
     out.push_str("  • `confirm` — second step for ALL two-step destructive commands (`wipe-workspace`, `rollback`); same channel, within 60s, `@<bot> confirm` or bare `confirm`\n");
     out.push_str("  • `rebuild-specs <repo>` — schedule a canonical-spec rebuild for the next iteration\n");
     out.push_str("  • `audit <audit-substring> <repo>` — queue an on-demand audit run for the next polling iteration\n");
-    out.push_str("  • `propose <repo> <free-form text>` — queue a chat-driven triage request (question or directive)\n");
+    out.push_str("  • `discuss <repo> <free-form text>` — start a live conversational session (question or proposed change); reply in-thread to continue, `send it` to create the artifact. `propose` is a permanent alias.\n");
     out.push_str("  • `brownfield <repo> <capability-name> [optional guidance]` — draft a canonical spec for a capability that already exists\n");
     out.push_str("  • `scout <repo> [optional guidance]` — chat-driven workflow: survey the repo AND return a triage list of opportunities\n");
     out.push_str("  • `spec-it <N> [optional guidance]` — scout-thread-only: scope a scouted item into a propose-equivalent flow\n");
     out.push_str("  • `clear-scout <repo>` — operator-recovery: wipe every scout-run state file for the repo\n");
     out.push_str("  • `brownfield-survey <repo> [optional guidance]` — chat-driven workflow: survey the repo for proposed capability boundaries (use `send it` in the survey thread to batch-generate all specs)\n");
-    out.push_str("  • `send it` (in an audit-notification, brownfield-survey, issue-candidate, OR spec-revision thread) — act on the thread's findings: triage an audit, batch-generate specs from a survey (one item per iteration), promote an issue candidate, OR revise a contradiction-flagged change AND open a PR\n");
+    out.push_str("  • `send it` (in an audit-notification, brownfield-survey, issue-candidate, spec-revision, OR discuss thread) — act on the thread's findings: triage an audit, batch-generate specs from a survey (one item per iteration), promote an issue candidate, revise a contradiction-flagged change AND open a PR, OR create the artifact from a discussion\n");
     out.push_str("  • `clear-survey <repo>` — operator-recovery: wipe every brownfield-survey state file for the repo\n");
     out.push_str("  • `changelog <repo> [<args>]` — generate an LLM-styled CHANGELOG.md update via PR\n");
     out.push_str("  • `sync-upstream <repo>` — OSS-fork workflow: fetch+rebase the workspace's base branch onto upstream (no push)\n");
@@ -2587,9 +2629,10 @@ fn menu_queue_segment(label: &str, list: &[String]) -> String {
 /// marker. The `currently: ` prefix is stripped — the menu's section
 /// header already implies "currently".
 fn menu_busy_clause(resp: &RepoStatusResponse) -> String {
-    let line = format_currently_line_with_park(
+    let line = format_currently_line_with_parks(
         resp.currently_busy.as_ref(),
         resp.open_agent_pr_numbers.as_deref(),
+        resp.spec_revision_park.as_ref(),
     );
     line.strip_prefix("currently: ").unwrap_or(&line).to_string()
 }
@@ -2752,11 +2795,6 @@ pub struct OperatorCommandDispatcher {
     /// Defaults to `crate::audits::threads::default_state_root()` —
     /// tests override via `with_audit_thread_state_dir`.
     audit_thread_state_dir: PathBuf,
-    /// Directory under which proposal-request state files live (the
-    /// dispatcher writes `<proposal_request_state_dir>/proposal-requests/<repo-sanitized>/<request_id>.json`
-    /// in the `propose` branch). Defaults to
-    /// `crate::proposal_requests::default_state_root()`.
-    proposal_request_state_dir: PathBuf,
     /// Directory under which changelog-request state files live (the
     /// dispatcher writes
     /// `<changelog_request_state_dir>/changelog-requests/<repo-sanitized>/<request_id>.json`
@@ -2805,6 +2843,14 @@ pub struct OperatorCommandDispatcher {
     /// same root as the audit-thread state) — tests override via
     /// `with_revision_thread_state_dir`.
     revision_thread_state_dir: PathBuf,
+    /// Directory under which discuss-thread state files live (the `discuss`/
+    /// `propose` flow). The dispatcher writes
+    /// `<discussion_state_dir>/discussions/<thread_ts>.json` on a new discuss
+    /// request AND resolves the fifth `send it` context + in-thread
+    /// continuation against it. Defaults to
+    /// `crate::discussion_state::default_state_root()` — tests override via
+    /// `with_discussion_state_dir`.
+    discussion_state_dir: PathBuf,
 }
 
 impl OperatorCommandDispatcher {
@@ -2812,8 +2858,6 @@ impl OperatorCommandDispatcher {
         Self {
             pending: ConfirmationStore::new(),
             audit_thread_state_dir: crate::audits::threads::default_state_root(paths),
-            proposal_request_state_dir:
-                crate::proposal_requests::default_state_root(paths),
             changelog_request_state_dir:
                 crate::changelog_requests::default_state_root(paths),
             audit_types: Vec::new(),
@@ -2823,7 +2867,15 @@ impl OperatorCommandDispatcher {
             brownfield_survey_enabled: true,
             workspace_resolver: None,
             revision_thread_state_dir: crate::revision_thread::default_state_root(paths),
+            discussion_state_dir: crate::discussion_state::default_state_root(paths),
         }
+    }
+
+    /// Test/daemon override for the discussion-state directory.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_discussion_state_dir(mut self, dir: PathBuf) -> Self {
+        self.discussion_state_dir = dir;
+        self
     }
 
     /// Override the revision-thread state directory (a03). Tests use this the
@@ -2878,16 +2930,8 @@ impl OperatorCommandDispatcher {
         self
     }
 
-    /// Override the proposal-request state directory. Tests use this
-    /// the same way `with_audit_thread_state_dir` is used.
-    #[allow(dead_code)]
-    pub fn with_proposal_request_state_dir(mut self, dir: PathBuf) -> Self {
-        self.proposal_request_state_dir = dir;
-        self
-    }
-
     /// Override the changelog-request state directory. Tests use this
-    /// the same way `with_proposal_request_state_dir` is used.
+    /// the same way `with_audit_thread_state_dir` is used.
     #[allow(dead_code)]
     pub fn with_changelog_request_state_dir(mut self, dir: PathBuf) -> Self {
         self.changelog_request_state_dir = dir;
@@ -3002,7 +3046,7 @@ impl OperatorCommandDispatcher {
                 repo_substring,
                 request_text,
             }) => Some(
-                self.dispatch_propose_request(
+                self.dispatch_discuss_request(
                     &repo_substring,
                     &request_text,
                     channel_id,
@@ -3116,9 +3160,18 @@ impl OperatorCommandDispatcher {
                 // revision thread falls through to `None` (the `?` reaction).
                 if let Some(ts) = thread_ts.filter(|t| !t.is_empty())
                     && message_addresses_bot(text, bot_mention)
-                    && let Some(reply) = self.try_revision_advise(ts, text, submitter).await
                 {
-                    return Some(reply);
+                    if let Some(reply) = self.try_revision_advise(ts, text, submitter).await {
+                        return Some(reply);
+                    }
+                    // discuss-thread continuation: a bot-addressed, non-verb
+                    // reply in an active discuss thread continues the session.
+                    if let Some(reply) = self
+                        .try_discuss_continue(ts, text, bot_mention, submitter)
+                        .await
+                    {
+                        return Some(reply);
+                    }
                 }
                 None
             }
@@ -3568,9 +3621,17 @@ impl OperatorCommandDispatcher {
             OperatorCommand::StatusMenu => {
                 self.dispatch_status_menu(repositories, submitter).await
             }
-            OperatorCommand::SendItOnAudit { thread_ts } => {
-                self.dispatch_send_it_on_audit(&thread_ts, repositories, submitter)
-                    .await
+            OperatorCommand::SendItOnAudit {
+                thread_ts,
+                final_context,
+            } => {
+                self.dispatch_send_it_on_audit(
+                    &thread_ts,
+                    final_context.as_deref(),
+                    repositories,
+                    submitter,
+                )
+                .await
             }
             OperatorCommand::AuditNow {
                 audit_substring,
@@ -3823,17 +3884,15 @@ impl OperatorCommandDispatcher {
         }
     }
 
-    /// Handle the `propose` verb. Resolves the repo, posts a top-level
-    /// ack message via the configured chatops backend (capturing the
-    /// ack's `ts` as the request's lifecycle thread), writes a
-    /// `ProposalRequestState` file with `status: Pending`, and submits a
-    /// `queue_proposal_request` control-socket action so the next
-    /// polling iteration picks up the request. Returns `Reply::Silent`
-    /// on success (the dispatcher has already posted the ack) and
-    /// `Reply::Sync(...)` on every failure shape so the operator's
-    /// `propose` message gets a threaded reply explaining what went
-    /// wrong.
-    async fn dispatch_propose_request(
+    /// Handle the `discuss` verb (AND its permanent `propose` alias). Resolves
+    /// the repo, posts a top-level ack via the configured chatops backend
+    /// (capturing the ack's `ts` as the discussion's `thread_ts`), writes a
+    /// `DiscussionState` file with `status: Active`, and submits a
+    /// `queue_discuss_action` control-socket action so the always-on discuss
+    /// handler starts the conversational session immediately (no polling
+    /// delay). Returns `Reply::Silent` on success (the ack is already posted)
+    /// and `Reply::Sync(...)` on every failure shape.
+    async fn dispatch_discuss_request(
         &self,
         repo_substring: &str,
         request_text: &str,
@@ -3856,23 +3915,22 @@ impl OperatorCommandDispatcher {
         // 2. Generate a fresh request_id.
         let request_id = uuid::Uuid::new_v4().to_string();
 
-        // 3. Build the ack text. The trailing "Follow along in this thread."
-        //    is mandatory per spec so operators know subsequent updates
-        //    will land in the thread.
+        // 3. Ack text. MUST contain "Follow along in this thread." AND the
+        //    "@<bot>-only-seen" note per the discuss-verb requirement.
         let ack_text = format!(
-            "✓ Queued proposal request for {repo_url}. \
-             The next polling iteration will run it. Follow along in this thread.",
+            "💬 Starting discussion for {repo_url}. Follow along in this thread. \
+             Note: only replies starting with @<bot> are seen here.",
             repo_url = repo.url,
         );
 
-        // 4. Post the ack via the chatops backend and capture the `ts`.
-        //    Without chatops we cannot produce the lifecycle thread anchor
-        //    the spec requires — surface that as an error reply.
+        // 4. Post the ack via the chatops backend and capture the `ts` — this
+        //    becomes the discussion's `thread_ts`. Without chatops there is no
+        //    thread anchor.
         let backend = match self.chatops.as_ref() {
             Some(b) => b.clone(),
             None => {
                 return Reply::Sync(
-                    "✗ propose: chatops backend not configured; cannot post the proposal-request ack"
+                    "✗ discuss: chatops backend not configured; cannot post the discussion ack"
                         .to_string(),
                 );
             }
@@ -3880,53 +3938,53 @@ impl OperatorCommandDispatcher {
         let ack_ts = match backend.post_message_capturing_ts(channel_id, &ack_text).await {
             Ok(ts) => ts,
             Err(e) => {
-                tracing::warn!("propose: backend post_message_capturing_ts failed: {e:#}");
-                return Reply::Sync(format!(
-                    "✗ propose: could not post ack to chat: {e}"
-                ));
+                tracing::warn!("discuss: backend post_message_capturing_ts failed: {e:#}");
+                return Reply::Sync(format!("✗ discuss: could not post ack to chat: {e}"));
             }
         };
 
-        // 5. Write the state file.
-        let state = crate::proposal_requests::ProposalRequestState {
-            request_id: request_id.clone(),
-            repo_url: repo.url.clone(),
-            channel: channel_id.to_string(),
+        // 5. Write the DiscussionState file (status: Active).
+        let now = chrono::Utc::now();
+        let state = crate::discussion_state::DiscussionState {
             thread_ts: ack_ts.clone(),
-            ack_message_ts: ack_ts.clone(),
+            channel: channel_id.to_string(),
+            repo_url: repo.url.clone(),
+            request_id: request_id.clone(),
             operator_user: operator_user.unwrap_or("").to_string(),
-            request_text: request_text.to_string(),
-            submitted_at: chrono::Utc::now(),
-            status: crate::proposal_requests::ProposalRequestStatus::Pending,
-            reason: None,
+            status: crate::discussion_state::DiscussionStatus::Active,
+            session_id: None,
+            deferred_slug: None,
+            reminded_at: None,
+            last_activity_at: now,
+            created_at: now,
         };
-        if let Err(e) =
-            crate::proposal_requests::write_state(&self.proposal_request_state_dir, &state)
-        {
-            tracing::warn!(request_id = %request_id, "propose: write_state failed: {e:#}");
-            // Best-effort: tell the chat thread the ack landed but the
-            // state file didn't.
+        if let Err(e) = crate::discussion_state::write_state(&self.discussion_state_dir, &state) {
+            tracing::warn!(request_id = %request_id, "discuss: write_state failed: {e:#}");
             if let Err(reply_err) = backend
                 .post_threaded_reply(
                     channel_id,
                     &ack_ts,
-                    &format!("✗ propose: could not persist state file: {e}"),
+                    &format!("✗ discuss: could not persist discussion state: {e}"),
                 )
                 .await
             {
                 tracing::warn!(
-                    "propose: subsequent thread reply for state-write failure also failed: {reply_err:#}"
+                    "discuss: subsequent thread reply for state-write failure also failed: {reply_err:#}"
                 );
             }
             return Reply::Silent;
         }
 
-        // 6. Submit the queue_proposal_request control-socket action.
+        // 6. Submit the queue_discuss_action control-socket action.
         let resp = submitter
             .submit(serde_json::json!({
-                "action": "queue_proposal_request",
+                "action": "queue_discuss_action",
                 "url": repo.url,
                 "request_id": request_id,
+                "channel": channel_id,
+                "thread_ts": ack_ts,
+                "operator_user": operator_user.unwrap_or(""),
+                "initial_text": request_text,
             }))
             .await;
         if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -3934,14 +3992,10 @@ impl OperatorCommandDispatcher {
                 .get("error")
                 .and_then(|v| v.as_str())
                 .unwrap_or("(no error message)");
-            // Tell the operator in the thread.
-            let body = format!("✗ propose: could not enqueue proposal-request: {err}");
-            if let Err(reply_err) = backend
-                .post_threaded_reply(channel_id, &ack_ts, &body)
-                .await
-            {
+            let body = format!("✗ discuss: could not start the discussion: {err}");
+            if let Err(reply_err) = backend.post_threaded_reply(channel_id, &ack_ts, &body).await {
                 tracing::warn!(
-                    "propose: subsequent thread reply for queue failure also failed: {reply_err:#}"
+                    "discuss: subsequent thread reply for queue failure also failed: {reply_err:#}"
                 );
             }
             return Reply::Silent;
@@ -4588,6 +4642,67 @@ impl OperatorCommandDispatcher {
         Some(Reply::Sync(
             "🤔 Reconstructing the revision context (change deltas, canon, this thread) — I'll reply here read-only; nothing is written.".to_string(),
         ))
+    }
+
+    /// A non-`send it` `@<bot>` reply whose `thread_ts` matches an active
+    /// `DiscussionState` continues the conversation: submits a
+    /// `queue_discuss_continue` action carrying the follow-up text (the
+    /// always-on discuss handler resumes the session AND replies in-thread).
+    /// Returns `Some(Reply::Silent)` on a match (so the listener does NOT apply
+    /// the `?` reaction), `Some(Reply::Sync(...))` when the discussion is no
+    /// longer active or the submit fails, `None` when no discussion matches.
+    async fn try_discuss_continue(
+        &self,
+        thread_ts: &str,
+        text: &str,
+        bot_mention: &str,
+        submitter: &dyn ActionSubmitter,
+    ) -> Option<Reply> {
+        use crate::discussion_state::{DiscussionStatus, read_state};
+        let state = match read_state(&self.discussion_state_dir, thread_ts) {
+            Ok(Some(s)) => s,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(
+                    thread_ts = %thread_ts,
+                    "discuss-thread state read failed; treating reply as untracked: {e:#}"
+                );
+                return None;
+            }
+        };
+        if state.status != DiscussionStatus::Active {
+            return Some(Reply::Sync(
+                "✗ This discussion is no longer active. Start a new one with @<bot> discuss <repo> <text>."
+                    .to_string(),
+            ));
+        }
+        // Strip the leading @<bot> mention so the handler gets just the
+        // operator's follow-up text.
+        let follow_up = text
+            .trim()
+            .strip_prefix(bot_mention.trim())
+            .unwrap_or(text)
+            .trim()
+            .to_string();
+        let payload = serde_json::json!({
+            "action": "queue_discuss_continue",
+            "url": state.repo_url,
+            "request_id": state.request_id,
+            "channel": state.channel,
+            "thread_ts": state.thread_ts,
+            "text": follow_up,
+        });
+        let resp = submitter.submit(payload).await;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no error message)");
+            return Some(Reply::Sync(format!(
+                "✗ discuss: could not continue the discussion: {err}"
+            )));
+        }
+        Some(Reply::Silent)
     }
 
     /// Handle the `clear-scout` verb (a25). Submits a `queue_clear_scout`
@@ -5242,19 +5357,41 @@ pub fn format_currently_line_with_park(
     busy: Option<&BusySummary>,
     open_agent_pr_numbers: Option<&[u64]>,
 ) -> String {
-    if busy.is_none()
-        && let Some(prs) = open_agent_pr_numbers
-        && let Some(&lowest) = prs.iter().min()
-    {
-        let extra = prs.len() - 1;
-        let more = if extra > 0 {
-            format!(" (+{extra} more)")
-        } else {
-            String::new()
-        };
-        return format!(
-            "currently: parked: open PR #{lowest}{more} awaiting review — no new work until it is merged or closed"
-        );
+    format_currently_line_with_parks(busy, open_agent_pr_numbers, None)
+}
+
+/// As [`format_currently_line_with_park`], additionally surfacing a
+/// spec-revision-PR park (spec-revision-pr-parks-change). Precedence when NO
+/// busy marker is present: an open agent-branch PR (the skip-iteration gate
+/// skips the whole iteration) wins over a spec-revision park (a queue-walk halt
+/// on one change); both win over `idle`. A busy marker always dominates all
+/// three. `spec_revision_park` is `None` unless the daemon confirmed a pending
+/// change is parked by an open spec-revision PR, so we never fabricate a park.
+pub fn format_currently_line_with_parks(
+    busy: Option<&BusySummary>,
+    open_agent_pr_numbers: Option<&[u64]>,
+    spec_revision_park: Option<&SpecRevisionParkSummary>,
+) -> String {
+    if busy.is_none() {
+        if let Some(prs) = open_agent_pr_numbers
+            && let Some(&lowest) = prs.iter().min()
+        {
+            let extra = prs.len() - 1;
+            let more = if extra > 0 {
+                format!(" (+{extra} more)")
+            } else {
+                String::new()
+            };
+            return format!(
+                "currently: parked: open PR #{lowest}{more} awaiting review — no new work until it is merged or closed"
+            );
+        }
+        if let Some(park) = spec_revision_park {
+            return format!(
+                "currently: parked: change `{}` has an open spec-revision PR #{} — not re-gated until it merges or closes",
+                park.change, park.pr_number
+            );
+        }
     }
     format_currently_line(busy)
 }
@@ -6128,6 +6265,7 @@ mod tests {
             cmd,
             OperatorCommand::SendItOnAudit {
                 thread_ts: "1748293445.001234".into(),
+                final_context: None,
             }
         );
     }
@@ -6144,6 +6282,7 @@ mod tests {
             cmd,
             OperatorCommand::SendItOnAudit {
                 thread_ts: "1748.999".into(),
+                final_context: None,
             }
         );
         let cmd2 = parse_command_in_thread(
@@ -6175,15 +6314,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_send_it_with_trailing_args_returns_none() {
-        // `send it` must be the entire verb. Anything after parses as
-        // unknown verb (no `send it <args>` shape in this iteration).
-        assert!(
-            parse_command_in_thread(&format!("{BOT} send it now"), BOT, Some("1.0")).is_none()
+    fn parse_send_it_with_trailing_args_captures_final_context() {
+        // `send it <trailing>` now parses, carrying the trailing text as
+        // `final_context` (only the discuss-thread context consumes it).
+        let cmd = parse_command_in_thread(&format!("{BOT} send it now"), BOT, Some("1.0")).unwrap();
+        assert_eq!(
+            cmd,
+            OperatorCommand::SendItOnAudit {
+                thread_ts: "1.0".into(),
+                final_context: Some("now".into()),
+            }
         );
-        assert!(
+        let cmd2 =
             parse_command_in_thread(&format!("{BOT} send it but ignore 3"), BOT, Some("1.0"))
-                .is_none()
+                .unwrap();
+        assert_eq!(
+            cmd2,
+            OperatorCommand::SendItOnAudit {
+                thread_ts: "1.0".into(),
+                final_context: Some("but ignore 3".into()),
+            }
         );
     }
 
@@ -7020,6 +7170,33 @@ mod tests {
         stale.pid_alive = false;
         let out = format_currently_line_with_park(Some(&stale), Some(&[5]));
         assert!(out.starts_with("currently: stale marker from pid 12345"), "{out}");
+    }
+
+    #[test]
+    fn currently_line_surfaces_spec_revision_park() {
+        // spec-revision-pr-parks-change: no busy marker AND no open
+        // agent-branch PR, but a pending change is parked by an open
+        // spec-revision PR → name the change + PR instead of idle.
+        let park = SpecRevisionParkSummary {
+            change: "my-change".into(),
+            pr_number: 42,
+        };
+        let out = format_currently_line_with_parks(None, Some(&[]), Some(&park));
+        assert!(out.contains("parked"), "must surface a park: {out}");
+        assert!(out.contains("my-change"), "must name the parked change: {out}");
+        assert!(out.contains("#42"), "must name the spec-revision PR: {out}");
+        assert!(!out.contains("idle"), "park line must never read idle: {out}");
+
+        // An open agent-branch PR (whole-iteration skip) dominates the
+        // spec-revision park (single-change queue halt).
+        let out = format_currently_line_with_parks(None, Some(&[7]), Some(&park));
+        assert!(out.contains("open PR #7"), "open agent-branch PR wins: {out}");
+        assert!(!out.contains("spec-revision"), "{out}");
+
+        // A busy marker dominates everything.
+        let b = busy("executor", "a05-foo", 120);
+        let out = format_currently_line_with_parks(Some(&b), None, Some(&park));
+        assert_eq!(out, "currently: working on a05-foo (started 2m ago)");
     }
 
     #[test]
@@ -9783,20 +9960,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_propose_happy_path_posts_ack_and_writes_state_and_submits_action() {
+    async fn dispatch_discuss_happy_path_posts_ack_and_writes_state_and_submits_action() {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1748399999.001234"));
         let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
-            .with_proposal_request_state_dir(tmp.path().to_path_buf())
+            .with_discussion_state_dir(tmp.path().to_path_buf())
             .with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
-        submitter.set_response(
-            "queue_proposal_request",
-            serde_json::json!({"ok": true, "poll_interval_sec": 60}),
-        );
+        submitter.set_response("queue_discuss_action", serde_json::json!({"ok": true}));
         let reply = dispatcher
             .handle_message_with_context(
-                &format!("{BOT} propose myrepo add a /healthz endpoint"),
+                &format!("{BOT} discuss myrepo add a /healthz endpoint"),
                 "C_OPS",
                 None,
                 Some("U_RAB"),
@@ -9805,47 +9979,211 @@ mod tests {
                 &submitter,
             )
             .await
-            .expect("propose must produce a reply");
+            .expect("discuss must produce a reply");
         unwrap_silent(reply);
 
-        // Backend captured the top-level ack post.
+        // Backend captured the top-level ack post with BOTH mandatory phrases.
         let posts = backend.posts.lock().unwrap().clone();
         assert_eq!(posts.len(), 1, "exactly one top-level ack post: {posts:?}");
         let (channel, ack_text) = &posts[0];
         assert_eq!(channel, "C_OPS");
-        assert!(ack_text.starts_with("✓ Queued proposal request for "), "{ack_text}");
         assert!(
             ack_text.contains("git@github.com:acme/myrepo.git"),
             "{ack_text}"
         );
         assert!(ack_text.contains("Follow along in this thread."), "{ack_text}");
+        assert!(
+            ack_text.contains("only replies starting with @<bot> are seen here"),
+            "{ack_text}"
+        );
 
         // Exactly one control-socket action was submitted.
         let calls = submitter.calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0]["action"], "queue_proposal_request");
+        assert_eq!(calls[0]["action"], "queue_discuss_action");
         assert_eq!(calls[0]["url"], "git@github.com:acme/myrepo.git");
+        assert_eq!(calls[0]["initial_text"], "add a /healthz endpoint");
+        assert_eq!(calls[0]["thread_ts"], "1748399999.001234");
         let request_id = calls[0]["request_id"]
             .as_str()
             .expect("action carries request_id")
             .to_string();
 
-        // State file exists with the expected fields.
-        let st = crate::proposal_requests::read_state(
-            tmp.path(),
-            "git@github.com:acme/myrepo.git",
-            &request_id,
-        )
-        .unwrap()
-        .expect("state file present");
+        // DiscussionState file exists (Active) with the expected fields.
+        let st = crate::discussion_state::read_state(tmp.path(), "1748399999.001234")
+            .unwrap()
+            .expect("discussion state file present");
         assert_eq!(st.thread_ts, "1748399999.001234");
-        assert_eq!(st.ack_message_ts, "1748399999.001234");
         assert_eq!(st.channel, "C_OPS");
+        assert_eq!(st.repo_url, "git@github.com:acme/myrepo.git");
         assert_eq!(st.operator_user, "U_RAB");
-        assert_eq!(st.request_text, "add a /healthz endpoint");
+        assert_eq!(st.request_id, request_id);
+        assert_eq!(st.status, crate::discussion_state::DiscussionStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn discuss_verb_and_propose_alias_submit_identical_discuss_action() {
+        // Task 5.1: `discuss` verb AND `propose` alias both submit
+        // `queue_discuss_action` with identical fields.
+        async fn run_verb(verb: &str) -> serde_json::Value {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1700.abc"));
+            let dispatcher =
+                OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
+                    .with_discussion_state_dir(tmp.path().to_path_buf())
+                    .with_chatops(backend.clone());
+            let submitter = FakeSubmitter::new();
+            submitter.set_response("queue_discuss_action", serde_json::json!({"ok": true}));
+            dispatcher
+                .handle_message_with_context(
+                    &format!("{BOT} {verb} myrepo add a /healthz endpoint"),
+                    "C_OPS",
+                    None,
+                    Some("U_RAB"),
+                    BOT,
+                    &fixture_repos(),
+                    &submitter,
+                )
+                .await
+                .expect("verb must produce a reply");
+            let calls = submitter.calls();
+            assert_eq!(calls.len(), 1);
+            calls[0].clone()
+        }
+        let via_discuss = run_verb("discuss").await;
+        let via_propose = run_verb("propose").await;
+        // Identical except for the random request_id.
+        for key in ["action", "url", "channel", "thread_ts", "operator_user", "initial_text"] {
+            assert_eq!(via_discuss[key], via_propose[key], "field `{key}` must match");
+        }
+        assert_eq!(via_discuss["action"], "queue_discuss_action");
+    }
+
+    #[tokio::test]
+    async fn discuss_ack_contains_at_bot_only_seen_note() {
+        // Task 5.2.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1700.abc"));
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
+            .with_discussion_state_dir(tmp.path().to_path_buf())
+            .with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        submitter.set_response("queue_discuss_action", serde_json::json!({"ok": true}));
+        let _ = dispatcher
+            .handle_message_with_context(
+                &format!("{BOT} discuss myrepo how does the revision executor stop retrying?"),
+                "C_OPS",
+                None,
+                Some("U_RAB"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await;
+        let posts = backend.posts.lock().unwrap().clone();
+        assert!(
+            posts[0].1.contains("only replies starting with @<bot> are seen here"),
+            "{}",
+            posts[0].1
+        );
+    }
+
+    #[tokio::test]
+    async fn in_thread_reply_routes_to_discuss_continue_not_new_discuss() {
+        // Task 5.3: an in-thread `@<bot>` reply routes to queue_discuss_continue.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1700.abc"));
+        // Seed an active discussion keyed by thread_ts.
+        let now = chrono::Utc::now();
+        crate::discussion_state::write_state(
+            tmp.path(),
+            &crate::discussion_state::DiscussionState {
+                thread_ts: "1700.abc".into(),
+                channel: "C_OPS".into(),
+                repo_url: "git@github.com:acme/myrepo.git".into(),
+                request_id: "req-1".into(),
+                operator_user: "U_RAB".into(),
+                status: crate::discussion_state::DiscussionStatus::Active,
+                session_id: None,
+                deferred_slug: None,
+                reminded_at: None,
+                last_activity_at: now,
+                created_at: now,
+            },
+        )
+        .unwrap();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
+            .with_discussion_state_dir(tmp.path().to_path_buf())
+            .with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        submitter.set_response("queue_discuss_continue", serde_json::json!({"ok": true}));
+        let reply = dispatcher
+            .handle_message_with_context(
+                &format!("{BOT} what about the revision-cap edge case?"),
+                "C_OPS",
+                Some("1700.abc"),
+                Some("U_RAB"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await;
+        // Handled (Silent) — the handler posts the reply, not the listener.
+        assert!(matches!(reply, Some(Reply::Silent)), "{reply:?}");
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "queue_discuss_continue");
+        assert_eq!(calls[0]["text"], "what about the revision-cap edge case?");
+    }
+
+    #[tokio::test]
+    async fn in_thread_send_it_routes_to_discuss_send_it_not_continue() {
+        // Task 5.4 + 5.5: `send it` in a discuss thread routes to
+        // queue_discuss_send_it, carrying trailing text as final_context.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1700.abc"));
+        let now = chrono::Utc::now();
+        crate::discussion_state::write_state(
+            tmp.path(),
+            &crate::discussion_state::DiscussionState {
+                thread_ts: "1700.abc".into(),
+                channel: "C_OPS".into(),
+                repo_url: "git@github.com:acme/myrepo.git".into(),
+                request_id: "req-1".into(),
+                operator_user: "U_RAB".into(),
+                status: crate::discussion_state::DiscussionStatus::Active,
+                session_id: None,
+                deferred_slug: None,
+                reminded_at: None,
+                last_activity_at: now,
+                created_at: now,
+            },
+        )
+        .unwrap();
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
+            .with_discussion_state_dir(tmp.path().to_path_buf())
+            .with_chatops(backend.clone());
+        let submitter = FakeSubmitter::new();
+        submitter.set_response("queue_discuss_send_it", serde_json::json!({"ok": true}));
+        let reply = dispatcher
+            .handle_message_with_context(
+                &format!("{BOT} send it and let's go with Option B, keep the existing error format"),
+                "C_OPS",
+                Some("1700.abc"),
+                Some("U_RAB"),
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("send it must produce a reply");
+        let _ = unwrap_sync(reply); // the ✅ ack
+        let calls = submitter.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "queue_discuss_send_it");
         assert_eq!(
-            st.status,
-            crate::proposal_requests::ProposalRequestStatus::Pending
+            calls[0]["final_context"],
+            "and let's go with Option B, keep the existing error format"
         );
     }
 
@@ -9854,7 +10192,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
         let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
-            .with_proposal_request_state_dir(tmp.path().to_path_buf())
+            .with_discussion_state_dir(tmp.path().to_path_buf())
             .with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
         // Both fixture repos contain the substring "acme" → ambiguous.
@@ -9881,7 +10219,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
         let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
-            .with_proposal_request_state_dir(tmp.path().to_path_buf())
+            .with_discussion_state_dir(tmp.path().to_path_buf())
             .with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
@@ -9952,7 +10290,7 @@ mod tests {
         // top-level ack so it surfaces an error.
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
-            .with_proposal_request_state_dir(tmp.path().to_path_buf());
+            .with_discussion_state_dir(tmp.path().to_path_buf());
         let submitter = FakeSubmitter::new();
         let reply = dispatcher
             .handle_message(
@@ -9975,7 +10313,7 @@ mod tests {
         let backend = std::sync::Arc::new(FakeChatOpsBackend::new("1.0"));
         backend.force_capture_failure();
         let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1)
-            .with_proposal_request_state_dir(tmp.path().to_path_buf())
+            .with_discussion_state_dir(tmp.path().to_path_buf())
             .with_chatops(backend.clone());
         let submitter = FakeSubmitter::new();
         let reply = dispatcher

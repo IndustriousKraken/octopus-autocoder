@@ -45,6 +45,7 @@ impl OperatorCommandDispatcher {
     pub(super) async fn dispatch_send_it_on_audit(
         &self,
         thread_ts: &str,
+        final_context: Option<&str>,
         repositories: &[RepoIdentity],
         submitter: &dyn ActionSubmitter,
     ) -> String {
@@ -74,6 +75,12 @@ impl OperatorCommandDispatcher {
                 if let Some(reply) = self.try_send_it_on_revision(thread_ts, submitter).await {
                     return reply;
                 }
+                if let Some(reply) = self
+                    .try_send_it_on_discuss(thread_ts, final_context, submitter)
+                    .await
+                {
+                    return reply;
+                }
                 return SEND_IT_REFUSE_UNTRACKED.to_string();
             }
             Err(e) => {
@@ -94,6 +101,12 @@ impl OperatorCommandDispatcher {
                     return reply;
                 }
                 if let Some(reply) = self.try_send_it_on_revision(thread_ts, submitter).await {
+                    return reply;
+                }
+                if let Some(reply) = self
+                    .try_send_it_on_discuss(thread_ts, final_context, submitter)
+                    .await
+                {
                     return reply;
                 }
                 return SEND_IT_REFUSE_UNTRACKED.to_string();
@@ -379,5 +392,66 @@ impl OperatorCommandDispatcher {
             "✓ Revising `{change}` along the discussed direction. autocoder will re-run the [in] and [canon] gates AND reply in this thread with the PR link (or the remaining contradiction).",
             change = state.change_slug,
         ))
+    }
+
+    /// The dispatcher's FIFTH `send it` context (per `send it in a discuss
+    /// thread creates an artifact sequentially`): a `thread_ts` matching an
+    /// active `DiscussionState` routes to the artifact-creation job. Submits
+    /// `queue_discuss_send_it` carrying any trailing text as `final_context`.
+    /// Returns `None` when no active discussion matches — the caller falls
+    /// through to the canonical untracked-thread refusal.
+    async fn try_send_it_on_discuss(
+        &self,
+        thread_ts: &str,
+        final_context: Option<&str>,
+        submitter: &dyn ActionSubmitter,
+    ) -> Option<String> {
+        use crate::discussion_state::{DiscussionStatus, read_state};
+        let state = match read_state(&self.discussion_state_dir, thread_ts) {
+            Ok(Some(s)) => s,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(
+                    thread_ts = %thread_ts,
+                    "discuss-thread state read failed; treating send it as untracked: {e:#}"
+                );
+                return None;
+            }
+        };
+        match state.status {
+            DiscussionStatus::Executing => {
+                return Some(
+                    "✗ send it: this discussion's artifact job is already running. No new action taken."
+                        .to_string(),
+                );
+            }
+            DiscussionStatus::Completed => {
+                return Some(
+                    "✗ send it: this discussion already produced its artifact PR. No new action taken."
+                        .to_string(),
+                );
+            }
+            DiscussionStatus::Active => {}
+        }
+        let payload = serde_json::json!({
+            "action": "queue_discuss_send_it",
+            "url": state.repo_url,
+            "request_id": state.request_id,
+            "channel": state.channel,
+            "thread_ts": state.thread_ts,
+            "final_context": final_context.unwrap_or(""),
+        });
+        let resp = submitter.submit(payload).await;
+        if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no error message)");
+            return Some(format!("✗ send it: could not start the artifact job: {err}"));
+        }
+        Some(
+            "✅ On it — I'll create the artifact after any running executor finishes, then reply here with the PR link."
+                .to_string(),
+        )
     }
 }

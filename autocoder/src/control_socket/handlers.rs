@@ -238,6 +238,23 @@ async fn build_repo_status(
         }
     }
 
+    // Spec-revision-PR park (spec-revision-pr-parks-change): surface a pending
+    // change parked by an open spec-revision PR on the `currently:` line, so
+    // the status reply agrees with the gate after it clears the
+    // `.needs-spec-revision.json` marker. `pending_changes` already excludes
+    // marker-blocked changes, matching the gate's candidate set. Skipped when
+    // an open agent-branch PR already parks the whole iteration (that park
+    // dominates the line) or when there are no candidates — so no wasted forge
+    // call in the common cases.
+    let agent_pr_parked = resp
+        .open_agent_pr_numbers
+        .as_ref()
+        .is_some_and(|prs| !prs.is_empty());
+    if !agent_pr_parked && !resp.pending_changes.is_empty() {
+        resp.spec_revision_park =
+            fetch_spec_revision_park(repo, github_cfg, &resp.pending_changes).await;
+    }
+
     // Best-effort last-iteration: failure-state's most recent entry
     // gives us a timestamp for "something happened recently"; without a
     // central iteration log there's no archive-vs-failure outcome to
@@ -385,6 +402,70 @@ pub(crate) async fn fetch_open_agent_prs_at(
             None
         }
     }
+}
+
+/// Find the first pending change parked by an open spec-revision PR (head
+/// `<agent_branch>-spec-revision-<change>`), mirroring the blocking-markers
+/// gate's own check so the status reply's `currently:` line agrees with the
+/// gate (spec-revision-pr-parks-change). `pending` is `list_pending`'s output,
+/// which already excludes `.needs-spec-revision.json`-marked changes — exactly
+/// the gate's candidate set. One `list_open_prs_all` call filtered in-process
+/// (the gate does per-change `find_pr_by_head`, but the status path only needs
+/// whether ANY candidate is parked). Any failure logs a WARN and returns
+/// `None`, degrading to no-park (never fabricating one), like
+/// `fetch_open_agent_prs`.
+async fn fetch_spec_revision_park(
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    pending: &[String],
+) -> Option<crate::chatops::operator_commands::SpecRevisionParkSummary> {
+    fetch_spec_revision_park_at(github::DEFAULT_API_BASE, repo, github_cfg, pending).await
+}
+
+/// Test-instrumentable variant of `fetch_spec_revision_park`.
+pub(crate) async fn fetch_spec_revision_park_at(
+    api_base: &str,
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    pending: &[String],
+) -> Option<crate::chatops::operator_commands::SpecRevisionParkSummary> {
+    if pending.is_empty() {
+        return None;
+    }
+    let (owner, repo_name) = match github::parse_repo_url(&repo.url) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(url = %repo.url, "status: parse_repo_url failed (spec-revision park): {e:#}");
+            return None;
+        }
+    };
+    let token = match github_credentials::resolve_token(github_cfg, &owner) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(url = %repo.url, "status: github token resolve failed (spec-revision park): {e:#}");
+            return None;
+        }
+    };
+    let open = match github::list_open_prs_all(api_base, &token, &owner, &repo_name).await {
+        Ok(prs) => prs,
+        Err(e) => {
+            tracing::warn!(url = %repo.url, "status: list_open_prs_all failed (spec-revision park): {e:#}");
+            return None;
+        }
+    };
+    // First pending change (queue order) whose spec-revision branch has an open
+    // PR — matching the gate, which halts the queue walk on the first parked
+    // change.
+    for change in pending {
+        let head = format!("{}-spec-revision-{}", repo.agent_branch, change);
+        if let Some(pr) = open.iter().find(|p| p.head.ref_ == head) {
+            return Some(crate::chatops::operator_commands::SpecRevisionParkSummary {
+                change: change.clone(),
+                pr_number: pr.number,
+            });
+        }
+    }
+    None
 }
 
 fn read_perma_marker(path: &Path) -> (DateTime<Utc>, String) {
