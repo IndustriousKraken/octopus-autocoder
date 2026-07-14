@@ -221,12 +221,16 @@ pub async fn process_proposal_requests(
     Ok(())
 }
 
-/// Handle a `Completed` chat-triage outcome. Checks for the
-/// `.chat-reply.md` marker FIRST; if present, posts the contents to the
-/// lifecycle thread and flips to `Discussed`. Otherwise discards non-spec
-/// writes and opens AT MOST ONE PR — the spec PR (a43) — identical in
-/// shape to the audit-triage handler. `final_summary` carries the
-/// executor's final-answer text (used for the empty-diff reply).
+/// Handle a `Completed` chat-triage outcome (scout→spec-it path). Discards
+/// non-spec writes and opens AT MOST ONE PR — the spec PR (a43) — identical in
+/// shape to the audit-triage handler. `final_summary` carries the executor's
+/// final-answer text (used for the empty-diff reply).
+///
+/// The `.chat-reply.md` QUESTION path (and the `Discussed` status) was removed
+/// with the conversational `discuss` flow: the discuss/propose verb now replies
+/// directly via chatops rather than through this handler. The scout→spec-it
+/// consumer that still drives this handler only ever produces DIRECTIVE
+/// triage, so the removed QUESTION branch never fired for it.
 pub(crate) async fn process_completed_proposal(
     paths: &DaemonPaths,
     workspace: &Path,
@@ -239,13 +243,7 @@ pub(crate) async fn process_completed_proposal(
     use crate::proposal_requests::{self, ProposalRequestStatus};
     let state_root = proposal_requests::default_state_root(paths);
 
-    // Marker-file check: a `.chat-reply.md` means the LLM classified the
-    // request as a QUESTION; handle it inline and return early on a reply.
-    if handle_chat_reply_marker(workspace, chatops_ctx, state, &state_root).await? {
-        return Ok(());
-    }
-
-    // 2. No `.chat-reply.md`. a43: produce a SPEC-ONLY PR. Code-path
+    // a43: produce a SPEC-ONLY PR. Code-path
     //    writes are discarded before commit; implementation flows through
     //    the standard implementer pipeline on a later iteration after the
     //    operator merges the spec PR. Mirrors `process_completed_triage`.
@@ -368,79 +366,6 @@ pub(crate) async fn process_completed_proposal(
     Ok(())
 }
 
-/// Handle the `.chat-reply.md` QUESTION marker: post the threaded reply,
-/// scrub stray writes, mark Discussed. Returns true when the caller should
-/// return early. Extracted from `process_completed_proposal` (a68 split).
-async fn handle_chat_reply_marker(
-    workspace: &Path,
-    chatops_ctx: Option<&ChatOpsContext>,
-    state: &mut crate::proposal_requests::ProposalRequestState,
-    state_root: &std::path::Path,
-) -> Result<bool> {
-    use crate::proposal_requests::{self, ProposalRequestStatus};
-    let chat_reply_path = workspace.join(".chat-reply.md");
-    if chat_reply_path.exists() {
-        let contents = match std::fs::read_to_string(&chat_reply_path) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    path = %chat_reply_path.display(),
-                    "chat-triage: reading .chat-reply.md failed: {e}; treating as empty"
-                );
-                String::new()
-            }
-        };
-        // Non-empty? Treat as a QUESTION outcome.
-        if !contents.trim().is_empty() {
-            let truncated = proposal_requests::truncate_chat_reply_with_pointer(
-                &contents,
-                &state.request_id,
-                proposal_requests::CHAT_REPLY_BODY_CAP,
-            );
-            if let Some(ctx) = chatops_ctx
-                && let Err(e) = ctx
-                    .chatops
-                    .post_threaded_reply(&state.channel, &state.thread_ts, &truncated)
-                    .await
-            {
-                tracing::warn!(
-                    request_id = %state.request_id,
-                    "chat-triage: posting Discussed reply failed: {e:#}"
-                );
-            }
-            // Best-effort: delete the marker.
-            if let Err(e) = std::fs::remove_file(&chat_reply_path) {
-                tracing::warn!(
-                    path = %chat_reply_path.display(),
-                    "chat-triage: removing .chat-reply.md failed: {e}"
-                );
-            }
-            // Detect any OTHER modifications and WARN + revert.
-            let unexpected: Vec<String> = git::status_entries(workspace)
-                .unwrap_or_default()
-                .into_iter()
-                .flat_map(|e| std::iter::once(e.path).chain(e.orig_path))
-                .filter(|p| !p.is_empty() && p != ".chat-reply.md")
-                .collect();
-            if !unexpected.is_empty() {
-                tracing::warn!(
-                    request_id = %state.request_id,
-                    "chat-triage: Discussed-mode run produced unexpected modifications: {unexpected:?} — reverting"
-                );
-                let _ = git::reset_hard_head(workspace);
-                let _ = git::clean_force(workspace);
-            }
-            state.status = ProposalRequestStatus::Discussed;
-            let _ = proposal_requests::write_state(state_root, state);
-            return Ok(true);
-        }
-        // Empty file: treat as "no reply"; fall through to the
-        // diff-split path (likely an empty diff too, which posts the
-        // no-action reply).
-        let _ = std::fs::remove_file(&chat_reply_path);
-    }
-    Ok(false)
-}
 
 /// Post the "no actionable / no spec content" thread reply and set the
 /// terminal status (Acted vs. TriageFailed). Extracted from

@@ -125,6 +125,7 @@
             submission_store: crate::submission_store::SubmissionStore::new(),
             paths: Arc::new(paths),
             relay_identity: None,
+            discuss_tx: None,
         }
     }
 

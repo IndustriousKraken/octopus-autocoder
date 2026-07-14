@@ -266,6 +266,58 @@ impl Default for RevisionRequestQueues {
     }
 }
 
+/// A new conversational `discuss` request (the `discuss`/`propose` verb). The
+/// chatops dispatcher has already posted the ack AND written the
+/// `DiscussionState` file; this carries the initial message to the always-on
+/// discuss handler.
+#[derive(Debug, Clone)]
+pub struct DiscussAction {
+    pub repo_url: String,
+    pub initial_text: String,
+    pub channel: String,
+    pub thread_ts: String,
+    pub request_id: String,
+    pub operator_user: String,
+}
+
+/// A follow-up `@<bot>` reply in an active discuss thread (NOT `send it`).
+#[derive(Debug, Clone)]
+pub struct DiscussContinueAction {
+    pub repo_url: String,
+    pub text: String,
+    pub channel: String,
+    pub thread_ts: String,
+    pub request_id: String,
+}
+
+/// `@<bot> send it [trailing final context]` in an active discuss thread. The
+/// handler resumes the session in write mode, the agent commits the artifact,
+/// AND the daemon opens a PR on `agent-q`.
+#[derive(Debug, Clone)]
+pub struct DiscussSendItAction {
+    pub repo_url: String,
+    pub final_context: Option<String>,
+    pub channel: String,
+    pub thread_ts: String,
+    pub request_id: String,
+}
+
+/// One item on the always-on discuss handler's mpsc channel. The control-socket
+/// dispatcher forwards each discuss control action here so the handler picks it
+/// up immediately — no polling-loop delay.
+#[derive(Debug, Clone)]
+pub enum DiscussEvent {
+    Start(DiscussAction),
+    Continue(DiscussContinueAction),
+    SendIt(DiscussSendItAction),
+}
+
+/// Sender half of the discuss handler's event channel. Held on
+/// [`ControlState`] so the `queue_discuss_*` handlers can forward events to the
+/// always-on handler. `None` on the minimal control states (submission-only,
+/// relay) that run no discuss handler.
+pub type DiscussEventSender = tokio::sync::mpsc::UnboundedSender<DiscussEvent>;
+
 /// Handle for a per-repository polling task. The reload handler uses
 /// `cancel` to ask one task to exit (without affecting siblings), and
 /// `config` to hot-swap the `RepositoryConfig` so a still-running task
@@ -481,6 +533,12 @@ pub struct ControlState {
     ///      or act for another repo/change. `None` on the daemon's own socket
     ///      and the standalone `verify` submission listener (unchanged).
     pub relay_identity: Option<Arc<RelayIdentity>>,
+    /// Sender to the always-on discuss handler (the `discuss`/`propose` flow).
+    /// The `queue_discuss_*` handlers forward a [`DiscussEvent`] here so the
+    /// handler processes it immediately, without waiting for a polling
+    /// iteration. `None` on the minimal control states (submission-only,
+    /// relay) that run no discuss handler.
+    pub discuss_tx: Option<DiscussEventSender>,
 }
 
 /// The `(workspace_basename, change, role)` a per-session relay socket is bound
@@ -603,6 +661,7 @@ fn submission_only_state(
         submission_store,
         paths,
         relay_identity: None,
+        discuss_tx: None,
     }
 }
 
@@ -758,6 +817,7 @@ fn session_relay_state(deps: &SessionRelayDeps, identity: RelayIdentity) -> Cont
         submission_store: deps.submission_store.clone(),
         paths: deps.paths.clone(),
         relay_identity: Some(Arc::new(identity)),
+        discuss_tx: None,
     }
 }
 
@@ -980,6 +1040,15 @@ const DISPATCH: &[(&str, Handler)] = &[
     }),
     ("queue_proposal_request", |p, s| {
         Box::pin(async move { handle_queue_proposal_request(p, s) })
+    }),
+    ("queue_discuss_action", |p, s| {
+        Box::pin(async move { handle_queue_discuss_action(p, s) })
+    }),
+    ("queue_discuss_continue", |p, s| {
+        Box::pin(async move { handle_queue_discuss_continue(p, s) })
+    }),
+    ("queue_discuss_send_it", |p, s| {
+        Box::pin(async move { handle_queue_discuss_send_it(p, s) })
     }),
     ("queue_changelog_request", |p, s| {
         Box::pin(async move { handle_queue_changelog_request(p, s) })

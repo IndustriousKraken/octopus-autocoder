@@ -94,41 +94,43 @@ Most operators will not need to touch these. If you're seeing duplicate replies 
 
 These verbs drive entire work flows — chat is the entry point and the bot delivers PRs or threaded replies as the output. All three triage-style verbs (`propose`, `send it`, the implicit triage initiated by certain audits) share the same downstream plumbing: explore the codebase, classify each finding/request as a quick-fix vs spec-worthy, and produce a single **spec-only PR** carrying the new `openspec/changes/<slug>/` proposal. As of a43 the triage agent does NOT touch code — any out-of-scope write is discarded before the spec PR commits, and code fixes flow through the standard implementer pipeline on the next iteration after the operator merges the spec PR.
 
-### Chat-driven proposals: `propose`
+### Chat-driven discussion: `discuss` (alias `propose`)
 
-The `propose` verb is the chat entry point for "I want autocoder to look at this and either fix it or talk about it":
+The `discuss` verb starts a live, threaded conversation with autocoder about a repo. `propose` is a permanent alias — both behave identically, so existing `propose` habits keep working with no deprecation warning.
 
 ```
-@<bot> propose <repo-substring> <free-form text>
+@<bot> discuss <repo-substring> <free-form text>
 ```
 
 Examples:
 
-- `@<bot> propose myrepo add a /healthz endpoint that returns 200 OK with the daemon's version and uptime` — directive; triage produces a spec-only PR whose `tasks.md` describes the work; the implementer builds it on the next iteration after merge.
-- `@<bot> propose myrepo what would it take to extract the auth logic into a separate module?` — question; triage replies in the thread, no PR.
-- `@<bot> propose myrepo something something handler logic` — ambiguous; triage emits AskUser, the standard chatops escalation fires, the operator clarifies, the executor resumes.
+- `@<bot> discuss myrepo how does the revision executor decide when to stop retrying?` — a question; the agent reads the relevant specs/source and answers directly in the thread.
+- `@<bot> discuss myrepo add a /healthz endpoint returning 200 with version and uptime` — a proposed change; the agent outlines its understanding, names the affected files, and waits. When you're satisfied, reply `@<bot> send it` to create the artifact.
 
-**Ack and lifecycle thread.** The bot's response to `@<bot> propose ...` is a top-level message in the channel:
+**Immediate response.** Unlike the old one-shot flow, `discuss` does NOT wait for the next polling iteration. An always-on discuss handler picks the request up off the control socket and starts an agentic session immediately (target: first thread reply under 60 s under normal load).
+
+**Ack and lifecycle thread.** The bot's response is a top-level message whose `ts` becomes the discussion's thread:
 
 ```
-✓ Queued proposal request for <repo_url>. The next polling iteration will run it. Follow along in this thread.
+💬 Starting discussion for <repo_url>. Follow along in this thread. Note: only replies starting with @<bot> are seen here.
 ```
 
-The ack message's `ts` becomes the proposal-request's lifecycle thread. Subsequent status updates, the LLM's discussion reply (when the input is a question), and any AskUser escalations all post into that thread.
+Only replies that start with `@<bot>` in this thread reach the bot — this is the universal convention for every autocoder lifecycle thread (revision, audit, brownfield, discuss). A plain reply (no `@<bot>`) is silently ignored.
 
-**Three-way classification.** The chat-triage prompt instructs the LLM to classify the operator's text into one of three buckets BEFORE acting:
+**Continuing the conversation.** Reply `@<bot> <follow-up text>` in the thread to continue. The handler resumes the same session (cached context) and replies again in the thread. There is no classification step — a question is answered, a proposed change is described and held for `send it`, and a genuinely unclear request gets a clarifying question, all as a natural back-and-forth.
 
-- **DIRECTIVE** — a specific action a reasonable engineer would know how to build. The LLM proceeds to explore the codebase, classify each work item as quick-fix vs spec-worthy, and create a new `openspec/changes/chat-request-<short-hash>/` proposal that captures the work as `tasks.md` items (quick fixes included — the agent does NOT apply them itself). The result is a single spec-only PR, exactly like `send it`.
-- **QUESTION** — the operator is asking for analysis or opinion, not asking for code changes. The LLM writes its reply to `<workspace>/.chat-reply.md` and stops. The polling iteration then reads the file, posts the contents (truncated to 35,000 chars with a daemon-log pointer when over) as a threaded reply in the lifecycle thread, deletes the file, and sets the proposal-request's status to `Discussed`. No PRs are created.
-- **AMBIGUOUS** — the request might be a directive but the LLM can't pin down what to build. The LLM calls the `ask_user` MCP tool. The existing chatops escalation posts the clarifying question into the lifecycle thread and resumes the executor once the operator replies.
+**Creating the artifact: `send it`.** When you're ready, reply `@<bot> send it [optional final context]`. Any text after `send it` is folded into the session as final context (e.g. `@<bot> send it and let's go with Option B, keep the existing error format`). The handler:
 
-**Spec-only PR.** Same shape as `send it`: a single spec PR carrying the new `openspec/changes/chat-request-<short-hash>/` directory. Code-path writes the agent made despite the prompt restriction are discarded before the commit (and a chatops warning names what was dropped), so the PR diff is genuinely spec-only. If the diff has only code and no spec, no PR opens and the bot replies that no spec content was produced. The spec PR is a normal autocoder-opened PR and participates in [PR-comment revisions](OPERATIONS.md#revising-an-open-pr-via-comment), so `@<bot> revise <text>` gets revisions through the standard channel.
+- Waits for any running executor on that repo to finish (the artifact-creation job shares the `agent-q` branch, so it runs sequentially to avoid conflicts), or starts immediately if none is running.
+- Resumes the session in **write mode**, so the agent may now create files. It produces the ONE artifact the conversation converged on — a spec change under `openspec/changes/<slug>/`, a roadmap item, an issue, or a docs update — and the daemon commits it and opens a PR on `agent-q`, posting the PR URL in the thread.
 
-**What changed in a43.** Before a43, `propose` directives opened TWO simultaneous PRs — a fixes PR (code already written and pushed) and a spec PR. That gave the operator a spec to review while the code was already committed. a43 collapses this to one spec-only PR: the operator reviews (and can revise) the spec proposal first, and the implementer writes the code through the standard pipeline only after the spec PR merges.
+During the discussion phase (before `send it`) the agent runs **read-only**: it reads specs, `CHANGELOG.md`, `OCTOPUS.md`, `docs/*`, active/archived changes, and implementer source to answer precisely, but writes nothing.
 
-**7-day staleness rule.** Proposal-request state files are pruned after 7 days regardless of terminal status (`Acted`, `Discussed`, `TriageFailed`). The directory stays bounded the same way audit-thread state does.
+**Auto-defer for existing-spec discussions.** If the agent determines you're discussing a modification to an already-existing spec or archived change, it defers that unit while you discuss and tells you the exact `@<bot> undefer <repo> <slug>` command to release it. The marker is cleared automatically when the `send it` PR opens; if the discussion goes idle for 7 days with a defer still held, the bot posts a single reminder.
 
-**Polite-refusal cases.** A request whose repo substring resolves to multiple repos gets the standard "be more specific" reply with the candidate URLs. A request with no text after the substring gets `✗ propose: missing request text.`. A request whose text exceeds the 10,000-character cap gets `✗ propose: request text exceeds 10000 characters.` — put longer descriptions in an issue or doc and reference it in a shorter request.
+**Housekeeping.** `DiscussionState` files are pruned after 14 days of inactivity (regardless of status), the same way audit-thread state is kept bounded.
+
+**Polite-refusal cases.** A request whose repo substring resolves to multiple repos gets the standard "be more specific" reply with the candidate URLs. A request with no text after the substring gets `✗ discuss: missing request text. Usage: @<bot> discuss <repo> <question or request>`. A request whose text exceeds the 10,000-character cap is rejected — put longer descriptions in an issue or doc and reference it in a shorter request.
 
 ### Drafting a spec for existing behavior: `brownfield`
 
@@ -300,12 +302,13 @@ The `send it` verb has several valid posting contexts:
 2. **Inside a brownfield-survey lifecycle thread** (a29). The survey handler stamps a `BrownfieldSurveyState` on disk; replying with `send it` triggers batch generation of one spec PR per surveyed capability.
 3. **Inside an issue-candidate thread.** Replying with `send it` promotes the candidate into the issues lane.
 4. **Inside a spec-revision thread** (a03). When the `[in]` / `[canon]` contradiction gate flags a change at implement time, autocoder posts a `SpecNeedsRevision` alert AND stamps a `RevisionThreadState`; replying with `send it` revises the change's spec deltas, re-runs the gates, AND opens a PR. See [Discussing AND revising a contradiction-flagged change](#discussing-and-revising-a-contradiction-flagged-change-send-it-in-a-spec-revision-thread).
+5. **Inside a `discuss` thread.** When a discussion converges, replying with `@<bot> send it [optional final context]` runs the artifact-creation job: it resumes the discuss session in write mode, the agent produces the agreed artifact, and the daemon opens a PR on `agent-q`. The trailing text (if any) is folded in as final context. See [Chat-driven discussion: `discuss`](#chat-driven-discussion-discuss-alias-propose).
 
 ```
-@<bot> send it       (posted as a reply inside the audit, brownfield-survey, issue-candidate, OR spec-revision thread)
+@<bot> send it       (posted as a reply inside the audit, brownfield-survey, issue-candidate, spec-revision, OR discuss thread)
 ```
 
-Outside ANY known thread context, `@<bot> send it` parses as an unknown verb and gets the standard `?` reaction (the rejection text names all four valid contexts so operators see their options). The dispatcher routes based on the parent thread's `ts`: it looks up the audit-thread set first, the brownfield-survey set second, the issue-candidate set third, the spec-revision set fourth; whichever matches dictates the action (a `thread_ts` resolves to at most one record across the four sets).
+Outside ANY known thread context, `@<bot> send it` parses as an unknown verb and gets the standard `?` reaction (the rejection text names all five valid contexts so operators see their options). The dispatcher routes based on the parent thread's `ts`: it looks up the audit-thread set first, the brownfield-survey set second, the issue-candidate set third, the spec-revision set fourth, the discuss set fifth; whichever matches dictates the action (a `thread_ts` resolves to at most one record across the five sets).
 
 **Audit-thread context (canonical).** Inside a tracked, fresh, open audit thread `send it` spawns the executor in **triage mode**: the agent reads the findings, explores the codebase, classifies each finding as a **quick fix** or **spec-worthy**, and writes a new `openspec/changes/<slug>/` proposal capturing the work as `tasks.md` items (quick fixes included — the agent does NOT touch source code). The polling iteration that drains the triage queue runs immediately after the chatops scheduling, so the operator usually sees the produced spec PR within one polling cycle.
 

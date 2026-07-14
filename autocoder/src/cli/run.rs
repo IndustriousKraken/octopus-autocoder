@@ -1034,6 +1034,11 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     // store.
     let outcome_store = crate::outcome_store::OutcomeStore::new();
     let submission_store = crate::submission_store::SubmissionStore::new();
+    // Always-on discuss handler channel: the control socket's `queue_discuss_*`
+    // handlers push events here; the spawned handler task consumes them with no
+    // polling-loop delay.
+    let (discuss_tx, discuss_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::control_socket::DiscussEvent>();
     let control_state = ControlState {
         github: github_holder.clone(),
         reviewer: reviewer_holder.clone(),
@@ -1049,6 +1054,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         submission_store: submission_store.clone(),
         paths: daemon_paths.clone(),
         relay_identity: None,
+        discuss_tx: Some(discuss_tx),
     };
     // Register the gate (`[in]`/`[canon]`/`[rules]`) AND advisory-audit
     // `submit_*` payload schemas on the shared submission store BEFORE the
@@ -1086,6 +1092,31 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
             tracing::error!("control socket listener exited: {e:#}");
         }
     });
+
+    // Always-on discuss handler: consumes DiscussEvents fed by the control
+    // socket's `queue_discuss_*` handlers, running the conversational
+    // `discuss`/`propose` sessions with no polling-loop delay.
+    let discuss_handle: JoinHandle<()> = {
+        let paths = daemon_paths.clone();
+        let executor = executor.clone();
+        let github = github_holder.clone();
+        let chatops = chatops_holder.clone();
+        let task_map = task_map.clone();
+        let discuss_cancel = cancel.clone();
+        tokio::spawn(async move {
+            crate::polling::discuss_handler::run(
+                paths,
+                executor,
+                github,
+                chatops,
+                task_map,
+                stuck_threshold_secs,
+                discuss_rx,
+                discuss_cancel,
+            )
+            .await;
+        })
+    };
 
     // Spawn the inbound ChatOps listener (Slack Socket Mode) as a
     // sibling task. The listener is only started when:
@@ -1126,6 +1157,9 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     }
     if let Err(e) = control_handle.await {
         tracing::error!("control socket task panicked: {e}");
+    }
+    if let Err(e) = discuss_handle.await {
+        tracing::error!("discuss handler task panicked: {e}");
     }
     for h in inbound_handles {
         if let Err(e) = h.await {
