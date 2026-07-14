@@ -1679,6 +1679,20 @@ pub fn format_audit_no_match(substring: &str, registered: &[&str]) -> String {
 // Repo-status aggregate response shape
 // ====================================================================
 
+/// A pending change parked by an open spec-revision PR (head branch
+/// `<agent_branch>-spec-revision-<change>`), surfaced on the `currently:` line
+/// so operators see WHY the queue is parked instead of a misleading `idle`
+/// after the spec-revision executor clears the `.needs-spec-revision.json`
+/// marker (spec-revision-pr-parks-change). `None` when no pending change is so
+/// parked OR the forge query failed / was skipped — the line then falls
+/// through to the marker / open-PR / idle determination and never fabricates a
+/// park.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecRevisionParkSummary {
+    pub change: String,
+    pub pr_number: u64,
+}
+
 /// Daemon's view of a repo, returned by the control-socket `RepoStatus`
 /// action. Fields are independent: empty vectors mean "nothing in this
 /// section"; the formatter collapses empty sections rather than printing
@@ -1712,6 +1726,12 @@ pub struct RepoStatusResponse {
     /// wire-compatible with newer chatops formatters.
     #[serde(default)]
     pub open_agent_pr_numbers: Option<Vec<u64>>,
+    /// A pending change parked by an open spec-revision PR, when one exists AND
+    /// no busy marker / open agent-branch PR already determines the
+    /// `currently:` line. `#[serde(default)]` keeps older daemons wire-
+    /// compatible with newer chatops formatters (spec-revision-pr-parks-change).
+    #[serde(default)]
+    pub spec_revision_park: Option<SpecRevisionParkSummary>,
     pub perma_stuck_changes: Vec<MarkerEntry>,
     pub revision_marked_changes: Vec<MarkerEntry>,
     pub throttled_alerts: Vec<ThrottledAlertEntry>,
@@ -1923,9 +1943,10 @@ pub fn format_status_reply(resp: &RepoStatusResponse) -> String {
         }
 
         out.push('\n');
-        out.push_str(&format_currently_line_with_park(
+        out.push_str(&format_currently_line_with_parks(
             resp.currently_busy.as_ref(),
             resp.open_agent_pr_numbers.as_deref(),
+            resp.spec_revision_park.as_ref(),
         ));
         out.push('\n');
     }
@@ -2608,9 +2629,10 @@ fn menu_queue_segment(label: &str, list: &[String]) -> String {
 /// marker. The `currently: ` prefix is stripped — the menu's section
 /// header already implies "currently".
 fn menu_busy_clause(resp: &RepoStatusResponse) -> String {
-    let line = format_currently_line_with_park(
+    let line = format_currently_line_with_parks(
         resp.currently_busy.as_ref(),
         resp.open_agent_pr_numbers.as_deref(),
+        resp.spec_revision_park.as_ref(),
     );
     line.strip_prefix("currently: ").unwrap_or(&line).to_string()
 }
@@ -5335,19 +5357,41 @@ pub fn format_currently_line_with_park(
     busy: Option<&BusySummary>,
     open_agent_pr_numbers: Option<&[u64]>,
 ) -> String {
-    if busy.is_none()
-        && let Some(prs) = open_agent_pr_numbers
-        && let Some(&lowest) = prs.iter().min()
-    {
-        let extra = prs.len() - 1;
-        let more = if extra > 0 {
-            format!(" (+{extra} more)")
-        } else {
-            String::new()
-        };
-        return format!(
-            "currently: parked: open PR #{lowest}{more} awaiting review — no new work until it is merged or closed"
-        );
+    format_currently_line_with_parks(busy, open_agent_pr_numbers, None)
+}
+
+/// As [`format_currently_line_with_park`], additionally surfacing a
+/// spec-revision-PR park (spec-revision-pr-parks-change). Precedence when NO
+/// busy marker is present: an open agent-branch PR (the skip-iteration gate
+/// skips the whole iteration) wins over a spec-revision park (a queue-walk halt
+/// on one change); both win over `idle`. A busy marker always dominates all
+/// three. `spec_revision_park` is `None` unless the daemon confirmed a pending
+/// change is parked by an open spec-revision PR, so we never fabricate a park.
+pub fn format_currently_line_with_parks(
+    busy: Option<&BusySummary>,
+    open_agent_pr_numbers: Option<&[u64]>,
+    spec_revision_park: Option<&SpecRevisionParkSummary>,
+) -> String {
+    if busy.is_none() {
+        if let Some(prs) = open_agent_pr_numbers
+            && let Some(&lowest) = prs.iter().min()
+        {
+            let extra = prs.len() - 1;
+            let more = if extra > 0 {
+                format!(" (+{extra} more)")
+            } else {
+                String::new()
+            };
+            return format!(
+                "currently: parked: open PR #{lowest}{more} awaiting review — no new work until it is merged or closed"
+            );
+        }
+        if let Some(park) = spec_revision_park {
+            return format!(
+                "currently: parked: change `{}` has an open spec-revision PR #{} — not re-gated until it merges or closes",
+                park.change, park.pr_number
+            );
+        }
     }
     format_currently_line(busy)
 }
@@ -7126,6 +7170,33 @@ mod tests {
         stale.pid_alive = false;
         let out = format_currently_line_with_park(Some(&stale), Some(&[5]));
         assert!(out.starts_with("currently: stale marker from pid 12345"), "{out}");
+    }
+
+    #[test]
+    fn currently_line_surfaces_spec_revision_park() {
+        // spec-revision-pr-parks-change: no busy marker AND no open
+        // agent-branch PR, but a pending change is parked by an open
+        // spec-revision PR → name the change + PR instead of idle.
+        let park = SpecRevisionParkSummary {
+            change: "my-change".into(),
+            pr_number: 42,
+        };
+        let out = format_currently_line_with_parks(None, Some(&[]), Some(&park));
+        assert!(out.contains("parked"), "must surface a park: {out}");
+        assert!(out.contains("my-change"), "must name the parked change: {out}");
+        assert!(out.contains("#42"), "must name the spec-revision PR: {out}");
+        assert!(!out.contains("idle"), "park line must never read idle: {out}");
+
+        // An open agent-branch PR (whole-iteration skip) dominates the
+        // spec-revision park (single-change queue halt).
+        let out = format_currently_line_with_parks(None, Some(&[7]), Some(&park));
+        assert!(out.contains("open PR #7"), "open agent-branch PR wins: {out}");
+        assert!(!out.contains("spec-revision"), "{out}");
+
+        // A busy marker dominates everything.
+        let b = busy("executor", "a05-foo", 120);
+        let out = format_currently_line_with_parks(Some(&b), None, Some(&park));
+        assert_eq!(out, "currently: working on a05-foo (started 2m ago)");
     }
 
     #[test]

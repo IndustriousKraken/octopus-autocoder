@@ -255,6 +255,16 @@ async fn on_send_it(
         .await;
         return;
     };
+    // Double-fire guard. Two rapid `send it`s can both pass the dispatcher's
+    // `Active` check before this handler flips the status, queueing two SendIt
+    // events; the handler drains events sequentially, so without re-checking
+    // here the second event would run a SECOND artifact job (and open a second
+    // PR) against an already Executing/Completed discussion. Only an Active
+    // discussion may start the job.
+    if let Some(msg) = send_it_refusal(state.status) {
+        post(chatops, &action.channel, &action.thread_ts, msg).await;
+        return;
+    }
     let Some(repo) = resolve_repo(repo_tasks, &action.repo_url) else {
         post(chatops, &action.channel, &action.thread_ts, "✗ discuss: no live task for this repo.")
             .await;
@@ -263,10 +273,27 @@ async fn on_send_it(
     let github_cfg = github.load_full().as_ref().clone();
     let workspace = crate::workspace::resolve_path(paths, &repo);
 
-    // Mark Executing so a repeat `send it` doesn't double-fire.
+    // Mark Executing so a repeat `send it` doesn't double-fire. This persisted
+    // status is exactly what the dispatcher AND the re-check above read to
+    // refuse a second job, so a failed write here is NOT best-effort: leaving
+    // the status at `Active` would let a concurrent `send it` double-fire.
+    // Abort rather than run the job on an unpersisted lock.
     state.status = DiscussionStatus::Executing;
     state.last_activity_at = Utc::now();
-    let _ = discussion_state::write_state(&state_root, &state);
+    if let Err(e) = discussion_state::write_state(&state_root, &state) {
+        tracing::warn!(
+            thread_ts = %action.thread_ts,
+            "discuss send-it: could not persist Executing status: {e:#}; aborting to avoid a double-fire"
+        );
+        post(
+            chatops,
+            &action.channel,
+            &action.thread_ts,
+            "✗ send it: could not lock the discussion for the artifact job; please try `send it` again.",
+        )
+        .await;
+        return;
+    }
 
     // Sequential executor gate: wait for a running executor to finish (start
     // immediately if none). Held for the whole artifact-creation + PR.
@@ -639,6 +666,24 @@ fn update_state(state_root: &Path, thread_ts: &str, f: impl FnOnce(&mut Discussi
     }
 }
 
+/// The `send it` double-fire guard: `Some(msg)` refuses the artifact job (the
+/// discussion is not `Active`), `None` lets it proceed. A queued second
+/// `send it` reaches `on_send_it` only after the first already flipped the
+/// status, so the handler re-checks here rather than trusting the dispatcher's
+/// earlier `Active` read. Messages mirror the dispatcher's
+/// (`try_send_it_on_discuss`).
+fn send_it_refusal(status: DiscussionStatus) -> Option<&'static str> {
+    match status {
+        DiscussionStatus::Active => None,
+        DiscussionStatus::Executing => Some(
+            "✗ send it: this discussion's artifact job is already running. No new action taken.",
+        ),
+        DiscussionStatus::Completed => Some(
+            "✗ send it: this discussion already produced its artifact PR. No new action taken.",
+        ),
+    }
+}
+
 /// Fall back to a friendly line when the agent returned an empty reply.
 fn reply_or_placeholder(visible: &str) -> String {
     if visible.trim().is_empty() {
@@ -760,6 +805,16 @@ mod tests {
             assert_eq!(slug, None, "traversal slug must be rejected: {bad}");
             assert!(!visible.contains("DISCUSS-DEFER"), "signal line still stripped");
         }
+    }
+
+    #[test]
+    fn send_it_refusal_guards_double_fire() {
+        // Only an Active discussion may start the artifact job. A queued second
+        // `send it` that reaches the handler after the first flipped the status
+        // is refused — no second executor run, no second PR.
+        assert!(send_it_refusal(DiscussionStatus::Active).is_none());
+        assert!(send_it_refusal(DiscussionStatus::Executing).is_some());
+        assert!(send_it_refusal(DiscussionStatus::Completed).is_some());
     }
 
     #[test]

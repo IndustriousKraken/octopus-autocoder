@@ -2779,6 +2779,108 @@ github:
         }
     }
 
+    // ---------- spec-revision-PR park: daemon-side query ----------
+
+    /// spec-revision-pr-parks-change: `fetch_spec_revision_park_at` lists open
+    /// PRs once AND reports the first pending change whose spec-revision branch
+    /// (`<agent_branch>-spec-revision-<change>`) has an open PR.
+    #[tokio::test]
+    async fn fetch_spec_revision_park_reports_parked_change() {
+        let env_var = "STATUS_SPEC_REVISION_PARK_OK";
+        // SAFETY: tests run sequentially; the env var is unique here.
+        unsafe {
+            std::env::set_var(env_var, "tok");
+        }
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::UrlEncoded("state".into(), "open".into()))
+            .with_status(200)
+            .with_body(
+                r#"[{"number":42,"title":"revise spec","html_url":"https://github.com/owner/repo/pull/42","state":"open","created_at":"2026-07-14T00:00:00Z","head":{"ref":"agent-q-spec-revision-my-change"},"base":{"ref":"main"}}]"#,
+            )
+            .create_async()
+            .await;
+
+        let park = super::fetch_spec_revision_park_at(
+            &server.url(),
+            &open_pr_park_repo(),
+            &open_pr_park_github(env_var),
+            &["my-change".to_string()],
+        )
+        .await
+        .expect("a parked change must be reported");
+        assert_eq!(park.change, "my-change");
+        assert_eq!(park.pr_number, 42);
+        mock.assert_async().await;
+
+        unsafe {
+            std::env::remove_var(env_var);
+        }
+    }
+
+    /// No open PR on any candidate's spec-revision branch → no park (even when
+    /// other unrelated PRs are open).
+    #[tokio::test]
+    async fn fetch_spec_revision_park_none_when_no_matching_pr() {
+        let env_var = "STATUS_SPEC_REVISION_PARK_NONE";
+        unsafe {
+            std::env::set_var(env_var, "tok");
+        }
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .with_status(200)
+            .with_body(
+                r#"[{"number":9,"title":"other","html_url":"https://github.com/owner/repo/pull/9","state":"open","created_at":"2026-07-14T00:00:00Z","head":{"ref":"agent-q"},"base":{"ref":"main"}}]"#,
+            )
+            .create_async()
+            .await;
+
+        let park = super::fetch_spec_revision_park_at(
+            &server.url(),
+            &open_pr_park_repo(),
+            &open_pr_park_github(env_var),
+            &["my-change".to_string()],
+        )
+        .await;
+        assert!(park.is_none(), "no matching spec-revision PR → no park");
+
+        unsafe {
+            std::env::remove_var(env_var);
+        }
+    }
+
+    /// A GitHub failure degrades to `None` (never a fabricated park), matching
+    /// the open-PR-park error policy.
+    #[tokio::test]
+    async fn fetch_spec_revision_park_degrades_to_none_on_github_error() {
+        let env_var = "STATUS_SPEC_REVISION_PARK_ERR";
+        unsafe {
+            std::env::set_var(env_var, "tok");
+        }
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(500)
+            .with_body("boom")
+            .create_async()
+            .await;
+
+        let park = super::fetch_spec_revision_park_at(
+            &server.url(),
+            &open_pr_park_repo(),
+            &open_pr_park_github(env_var),
+            &["my-change".to_string()],
+        )
+        .await;
+        assert!(park.is_none(), "a GitHub error must degrade to None, not Some");
+
+        unsafe {
+            std::env::remove_var(env_var);
+        }
+    }
+
     // -----------------------------------------------------------------
     // a27a0: record_outcome + consume_outcome control-socket actions
     // -----------------------------------------------------------------
