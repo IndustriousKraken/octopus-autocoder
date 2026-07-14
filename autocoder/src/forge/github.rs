@@ -176,9 +176,14 @@ pub async fn latest_pr_for_head(
 
 /// Create a fork of the upstream repo via the GitHub REST API. The fork's
 /// destination is implicit from the PAT's owner — GitHub forks to the
-/// authenticated user's account by default. Returns Ok on 2xx (including
-/// the idempotent case where the fork already exists).
-pub async fn create_fork(upstream_owner: &str, upstream_repo: &str, token: &str) -> Result<()> {
+/// authenticated user's account by default. On 2xx (including the idempotent
+/// case where the fork already exists) returns the created/existing fork's
+/// `full_name` identity, or `None` when the response body yields none.
+pub async fn create_fork(
+    upstream_owner: &str,
+    upstream_repo: &str,
+    token: &str,
+) -> Result<Option<String>> {
     create_fork_at(DEFAULT_API_BASE, upstream_owner, upstream_repo, token).await
 }
 
@@ -191,7 +196,7 @@ pub(crate) async fn create_fork_at_for_test(
     upstream_owner: &str,
     upstream_repo: &str,
     token: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
     create_fork_at(api_base, upstream_owner, upstream_repo, token).await
 }
 
@@ -200,7 +205,7 @@ pub(crate) async fn create_fork_at(
     upstream_owner: &str,
     upstream_repo: &str,
     token: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let url = format!("{api_base}/repos/{upstream_owner}/{upstream_repo}/forks");
     let client = reqwest::Client::new();
     let resp = client
@@ -222,7 +227,24 @@ pub(crate) async fn create_fork_at(
             "github fork POST {upstream_owner}/{upstream_repo} returned {status}: {body_snippet}"
         ));
     }
-    Ok(())
+    // GitHub's fork endpoint is idempotent: a 2xx may carry the *existing*
+    // fork's metadata, which after an upstream rename still names the old
+    // repo. Return the fork's `full_name` so the caller can detect a name
+    // mismatch. A missing/empty/unparseable body yields `None` — the caller
+    // falls back to the reachability poll, so a response-shape change never
+    // fails a fork setup that would otherwise succeed.
+    #[derive(Deserialize)]
+    struct ForkIdentity {
+        full_name: Option<String>,
+    }
+    let full_name = resp
+        .text()
+        .await
+        .ok()
+        .and_then(|body| serde_json::from_str::<ForkIdentity>(&body).ok())
+        .and_then(|parsed| parsed.full_name)
+        .filter(|name| !name.trim().is_empty());
+    Ok(full_name)
 }
 
 /// Outcome of a `DELETE /repos/{owner}/{repo}` call. Distinguishes the
@@ -1316,8 +1338,8 @@ mod tests {
 
     use crate::code_reviewer::{ReviewReport, ReviewVerdict};
 
-    /// `mockito` smoke test: verify the request shape (path, headers, JSON
-    /// body) and decoding of the `html_url` from a 201 response.
+    /// `mockito` smoke test: verify the request shape (path, headers) and that
+    /// a 2xx body's `full_name` is returned as the fork identity.
     #[tokio::test]
     async fn create_fork_posts_to_forks_endpoint() {
         let mut server = mockito::Server::new_async().await;
@@ -1330,10 +1352,40 @@ mod tests {
             .create_async()
             .await;
 
-        create_fork_at_for_test(&server.url(), "upstream-org", "repo", "testtoken")
+        let identity = create_fork_at_for_test(&server.url(), "upstream-org", "repo", "testtoken")
             .await
             .expect("fork POST succeeds on 202");
+        assert_eq!(
+            identity.as_deref(),
+            Some("machine-user/repo"),
+            "the 2xx body's full_name is returned as the fork identity"
+        );
         mock.assert_async().await;
+    }
+
+    /// A 2xx whose body carries no parseable fork identity (empty body, or a
+    /// shape without `full_name`) yields `None`, so the caller falls back to
+    /// the reachability poll rather than failing setup.
+    #[tokio::test]
+    async fn create_fork_returns_none_on_shapeless_body() {
+        for body in ["", "{}", r#"{"unexpected":true}"#, r#"{"full_name":""}"#] {
+            let mut server = mockito::Server::new_async().await;
+            let _mock = server
+                .mock("POST", "/repos/upstream-org/repo/forks")
+                .with_status(202)
+                .with_header("content-type", "application/json")
+                .with_body(body)
+                .create_async()
+                .await;
+
+            let identity = create_fork_at_for_test(&server.url(), "upstream-org", "repo", "t")
+                .await
+                .expect("2xx always succeeds regardless of body shape");
+            assert_eq!(
+                identity, None,
+                "a 2xx without a parseable full_name yields None; body was {body:?}"
+            );
+        }
     }
 
     #[tokio::test]

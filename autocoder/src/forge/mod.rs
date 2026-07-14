@@ -334,7 +334,12 @@ impl Forge for GithubForge {
         upstream_repo: &str,
         token: &str,
     ) -> Result<()> {
-        github::create_fork_at(&self.api_base, upstream_owner, upstream_repo, token).await
+        // The recreate-fork recovery path only needs create-or-exists success;
+        // the returned fork identity is a startup-verification concern handled
+        // in `ensure_forks_exist_with`, so discard it here.
+        github::create_fork_at(&self.api_base, upstream_owner, upstream_repo, token)
+            .await
+            .map(|_| ())
     }
 
     async fn list_open_issues(
