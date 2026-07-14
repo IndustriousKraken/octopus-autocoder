@@ -1,0 +1,3 @@
+{
+  "question": "The `submit_canon_contradictions` MCP tool keeps failing with \"connecting to control socket at /run/user/1000/autocoder/control.sock\" — the autocoder daemon appears unreachable. My analysis found zero contradictions. Can you confirm the daemon is running, or should I retry the submission?"
+}
