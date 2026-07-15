@@ -219,6 +219,23 @@ pub fn ensure_initialized(
             "could not register .ignore-for-queue.json in .git/info/exclude: {e:#}"
         );
     }
+    // The per-execution MCP child's ask-user fallback marker can land either
+    // inside a change dir (`.askuser-pending.json`) or at the workspace root
+    // (`.askuser-pending-<key>.json`) when the control-socket relay is
+    // unreachable. The single bare glob `.askuser-pending*` (no slash → matches
+    // the basename at ANY depth, like the `*.perma-stuck.json` entries) covers
+    // both placements, so a fallback marker is never committed NOR misread as an
+    // unexpected working-tree change. The pattern is defined by the MCP server
+    // (single source of truth) so it cannot drift from the marker names it writes.
+    if let Err(e) =
+        ensure_git_info_excluded(workspace, crate::mcp_askuser_server::ASKUSER_MARKER_EXCLUDE_PATTERN)
+    {
+        tracing::warn!(
+            workspace = %workspace.display(),
+            "could not register {} in .git/info/exclude: {e:#}",
+            crate::mcp_askuser_server::ASKUSER_MARKER_EXCLUDE_PATTERN
+        );
+    }
     // Per-run, server-specific CLI config artifacts the wrapped agent CLIs
     // auto-discover from the workspace root (claude's `.mcp.json`, opencode's
     // `opencode.json` + `.opencode/`, agy's `mcp_config.json`). `a16` excluded
@@ -838,6 +855,69 @@ mod tests {
             exclude2.matches("opencode.json").count(),
             1,
             "no duplicate opencode.json entry after re-init:\n{exclude2}"
+        );
+    }
+
+    #[test]
+    fn ensure_initialized_excludes_askuser_fallback_markers_at_both_placements() {
+        // askuser-fallback-marker-hygiene: the single bare `.askuser-pending*`
+        // pattern must be registered at init AND must gitignore BOTH the in-dir
+        // marker and the workspace-root marker so neither trips the dirty check
+        // nor is swept into a commit.
+        let (_temp_paths, _paths_test) = test_daemon_paths();
+        let dir = TempDir::new().unwrap();
+        let remote = dir.path().join("remote");
+        let workspace = dir.path().join("local");
+        make_fixture_remote(&remote);
+        let url = remote.to_string_lossy().to_string();
+        ensure_initialized(&_paths_test, &workspace, &url, None).unwrap();
+
+        let pat = crate::mcp_askuser_server::ASKUSER_MARKER_EXCLUDE_PATTERN;
+        let exclude = std::fs::read_to_string(workspace.join(".git/info/exclude")).unwrap();
+        assert!(
+            exclude.lines().any(|l| l.trim() == pat),
+            "`{pat}` must be registered at init; exclude file:\n{exclude}"
+        );
+
+        // Drop a root marker (role-keyed session) AND an in-dir marker
+        // (implementer session). Neither may appear in `git status --porcelain`.
+        std::fs::write(
+            workspace.join(".askuser-pending-canon_contradiction_check.json"),
+            "{}",
+        )
+        .unwrap();
+        let change_dir = workspace.join("openspec/changes/real-change");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join(".askuser-pending.json"), "{}").unwrap();
+
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        let status = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            !status.contains(".askuser-pending"),
+            "both ask-user fallback markers must be gitignored: {status:?}"
+        );
+
+        // Survives idempotent re-registration — the pattern appears exactly once.
+        ensure_initialized(&_paths_test, &workspace, &url, None).unwrap();
+        let exclude2 = std::fs::read_to_string(workspace.join(".git/info/exclude")).unwrap();
+        assert_eq!(
+            exclude2.lines().filter(|l| l.trim() == pat).count(),
+            1,
+            "no duplicate `{pat}` entry after re-init:\n{exclude2}"
+        );
+        // …and the markers are still gitignored after re-init.
+        let status2 = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&status2.stdout).contains(".askuser-pending"),
+            "markers must stay gitignored after idempotent re-init"
         );
     }
 

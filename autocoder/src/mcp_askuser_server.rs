@@ -36,6 +36,24 @@ pub const ENV_WORKSPACE_BASENAME: &str = "ORCH_MCP_WORKSPACE_BASENAME";
 /// alongside the common tools. Absent → no submission tool is advertised.
 pub const ENV_ROLE: &str = "ORCH_MCP_ROLE";
 
+/// Basename of the ask-user fallback marker written INSIDE a real change's
+/// directory (`openspec/changes/<change>/.askuser-pending.json`) — the
+/// placement for implementer sessions working a change that already exists.
+pub const ASKUSER_MARKER_IN_DIR_NAME: &str = ".askuser-pending.json";
+/// Filename prefix for the ROOT fallback marker
+/// (`<workspace>/.askuser-pending-<sanitized-key>.json`) written by every
+/// session whose change key does NOT name an existing change directory
+/// (verifier gates, audits, the changelog stylist — any role-named key).
+pub const ASKUSER_MARKER_ROOT_PREFIX: &str = ".askuser-pending-";
+/// Single git-exclude glob covering BOTH marker placements at any depth
+/// (bare, no slash → matches the basename anywhere, like the existing
+/// `*.perma-stuck.json` suffix entries). Registered in `.git/info/exclude`
+/// at workspace init (`workspace::ensure_initialized`) AND by `autocoder
+/// verify` so a fallback marker is never swept into a commit. This is the
+/// single source of truth for the pattern, consumed by both call sites so
+/// the exclude cannot drift from the marker names above.
+pub const ASKUSER_MARKER_EXCLUDE_PATTERN: &str = ".askuser-pending*";
+
 /// The MCP server name registered in `.mcp.json`'s `mcpServers` key.
 /// MUST match the key used in `ClaudeCliExecutor::write_mcp_config`.
 /// Claude CLI exposes MCP tools to the agent as `mcp__<server>__<tool>`,
@@ -111,10 +129,7 @@ pub fn run() -> Result<()> {
         .with_context(|| format!("missing {ENV_WORKSPACE} in MCP server env"))?;
     let change = std::env::var(ENV_CHANGE)
         .with_context(|| format!("missing {ENV_CHANGE} in MCP server env"))?;
-    let marker_path = PathBuf::from(&workspace)
-        .join("openspec/changes")
-        .join(&change)
-        .join(".askuser-pending.json");
+    let marker_path = fallback_marker_path(Path::new(&workspace), &change);
 
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
@@ -1330,12 +1345,56 @@ fn relay_to_control_socket(
     Ok(value)
 }
 
+/// Restrict a change key to `[A-Za-z0-9_-]`, mapping every other character
+/// to `-`. The key comes from an env var (`ORCH_MCP_CHANGE`); filename-joining
+/// it unsanitized would let a hostile or malformed value (`../`, `/`) traverse
+/// out of the workspace root. The filtered result is always a single path
+/// component, so the root marker cannot escape the workspace.
+fn sanitize_change_key(key: &str) -> String {
+    key.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Compute the ask-user fallback marker path WITHOUT creating any directory.
+/// When `<workspace>/openspec/changes/<change>/` already exists (a real
+/// implementer session working a change created by the queue/authoring flow),
+/// the marker stays in that directory as `.askuser-pending.json`. Otherwise —
+/// verifier gates, audits, the stylist, or any role-named key whose change
+/// directory does not exist — it lands at the workspace ROOT as
+/// `.askuser-pending-<sanitized-key>.json`, so the fallback never fabricates a
+/// phantom `openspec/changes/<role>/` entry. Depends only on the workspace root
+/// existing, so it behaves identically on a daemon-managed server workspace and
+/// a directly-cloned spec box.
+pub fn fallback_marker_path(workspace: &Path, change: &str) -> PathBuf {
+    // Sanitize BEFORE the is_dir() lookup so BOTH branches stay inside the
+    // workspace root. A legitimate change slug is already `[A-Za-z0-9_-]`, so
+    // this is a no-op for real implementer sessions; a hostile key (`../`, `/`)
+    // collapses to a single path component, so it can neither traverse out via
+    // the in-dir join nor escape via the root filename.
+    let key = sanitize_change_key(change);
+    let change_dir = workspace.join("openspec/changes").join(&key);
+    if change_dir.is_dir() {
+        change_dir.join(ASKUSER_MARKER_IN_DIR_NAME)
+    } else {
+        workspace.join(format!("{ASKUSER_MARKER_ROOT_PREFIX}{key}.json"))
+    }
+}
+
 fn write_marker(marker_path: &std::path::Path, question: &str) -> Result<()> {
+    // No directory creation: `fallback_marker_path` only ever returns a path
+    // whose parent already exists (an existing change dir, or the workspace
+    // root). Creating one here is how the old fallback fabricated phantom
+    // `openspec/changes/<role>/` directories.
     let parent = marker_path
         .parent()
         .ok_or_else(|| anyhow!("marker path has no parent: {}", marker_path.display()))?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("creating {}", parent.display()))?;
     let payload = serde_json::json!({ "question": question });
     let tmp = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("creating tempfile in {}", parent.display()))?;
@@ -2305,6 +2364,10 @@ mod tests {
     fn tools_call_ask_user_writes_marker_file() {
         let dir = TempDir::new().unwrap();
         let marker = dir.path().join("openspec/changes/feature/.askuser-pending.json");
+        // `write_marker` no longer creates directories; its caller
+        // (`fallback_marker_path`) only ever returns a path whose parent
+        // already exists. Model that invariant here.
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         let resps = run_with(
             &marker,
             &[r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ask_user","arguments":{"question":"What should we name the project?"}}}"#],
@@ -2316,6 +2379,118 @@ mod tests {
         let contents: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
         assert_eq!(contents["question"], "What should we name the project?");
+    }
+
+    // ---- Fallback marker placement (askuser-fallback-marker-hygiene) ----
+
+    #[test]
+    fn role_keyed_session_writes_root_marker_and_fabricates_no_change_dir() {
+        // A verifier-gate/audit session's change key is a ROLE name with no
+        // matching `openspec/changes/<role>/` directory. Its fallback marker
+        // must land at the workspace root, and nothing must be created under
+        // `openspec/changes/`.
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        let change = "canon_contradiction_check";
+        let marker = fallback_marker_path(ws, change);
+        assert_eq!(
+            marker,
+            ws.join(".askuser-pending-canon_contradiction_check.json"),
+            "role-keyed session must use the root marker path"
+        );
+
+        write_marker(&marker, "am I stuck?").unwrap();
+        assert!(marker.is_file(), "root marker must be written");
+        assert!(
+            !ws.join("openspec/changes").exists(),
+            "the fallback must NOT fabricate any openspec/changes/ directory"
+        );
+    }
+
+    #[test]
+    fn existing_change_session_keeps_in_dir_marker() {
+        // An implementer session whose change key names an EXISTING change
+        // directory keeps the in-directory `.askuser-pending.json`.
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        let change = "my-real-change";
+        let change_dir = ws.join("openspec/changes").join(change);
+        std::fs::create_dir_all(&change_dir).unwrap();
+
+        let marker = fallback_marker_path(ws, change);
+        assert_eq!(
+            marker,
+            change_dir.join(".askuser-pending.json"),
+            "existing-change session must keep the in-dir marker"
+        );
+
+        write_marker(&marker, "which approach?").unwrap();
+        assert!(marker.is_file(), "in-dir marker must be written");
+    }
+
+    #[test]
+    fn hostile_change_key_is_sanitized_inside_workspace_root() {
+        // A key with path separators / traversal must not escape the workspace
+        // root: offending characters become `-`, yielding a single-component
+        // filename directly under the root.
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        for key in ["../../etc/passwd", "a/b", ".."] {
+            let marker = fallback_marker_path(ws, key);
+            assert_eq!(
+                marker.parent().unwrap(),
+                ws,
+                "sanitized marker for key {key:?} must sit directly in the workspace root"
+            );
+            let name = marker.file_name().unwrap().to_str().unwrap();
+            assert!(
+                name.starts_with(ASKUSER_MARKER_ROOT_PREFIX) && name.ends_with(".json"),
+                "sanitized filename shape for key {key:?}: {name}"
+            );
+            assert!(
+                !name.contains('/') && !name.contains(".."),
+                "sanitized filename for key {key:?} must not carry separators/traversal: {name}"
+            );
+            // The marker actually writes inside the workspace root.
+            write_marker(&marker, "q").unwrap();
+            assert!(marker.is_file());
+            assert!(marker.starts_with(ws), "marker must stay within workspace");
+        }
+    }
+
+    #[test]
+    fn hostile_key_reaching_existing_dir_cannot_escape_in_dir_branch() {
+        // The is_dir() lookup joins the SANITIZED key, so a traversal key that —
+        // unsanitized — would resolve to an existing directory outside the
+        // workspace no longer takes the in-dir branch and escapes. Lay out a
+        // sibling dir the raw join would reach, then confirm the marker stays at
+        // the workspace root.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // Raw `ws/openspec/changes/../../../outside` resolves to `outside`
+        // (exists); sanitized it collapses to a single component under changes/.
+        let key = "../../../outside";
+        let marker = fallback_marker_path(&ws, key);
+        assert_eq!(
+            marker.parent().unwrap(),
+            ws,
+            "sanitized in-dir lookup must not follow traversal into an existing sibling dir"
+        );
+        assert!(
+            marker.starts_with(&ws) && !marker.starts_with(&outside),
+            "marker must stay within the workspace root, not escape to {}",
+            outside.display()
+        );
+        write_marker(&marker, "q").unwrap();
+        assert!(marker.is_file());
+        assert!(
+            !outside.join(ASKUSER_MARKER_IN_DIR_NAME).exists(),
+            "nothing may be written into the escaped directory"
+        );
     }
 
     #[test]

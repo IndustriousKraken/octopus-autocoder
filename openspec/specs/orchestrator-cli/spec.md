@@ -8358,7 +8358,7 @@ autocoder SHALL provide a `verify <change-slug>` subcommand that runs the pre-ex
 
 `verify` SHALL stand up the submission transport in-process via `control_socket::spawn_submission_listener(paths)` as a hard precondition for the duration of the run; without it the gates fail closed and `verify` cannot pass. `verify` SHALL resolve its agentic-session timeout from `ExecutorConfig::agentic_session_timeout()` (reading `executor.agentic_session_timeout_secs`, default `3600` when omitted) — NOT a verify-local literal.
 
-The subcommand SHALL run in the repository's working directory, reading `openspec/changes/<change-slug>/specs/**` (the deltas) and the local `openspec/specs/**` (canon) — the working copy, before any push. It SHALL NOT run the executor, SHALL NOT write `.needs-spec-revision.json`, AND SHALL NOT make spec or source edits. It MAY create transient run artifacts (`.mcp.json`, the control socket) AND SHALL clean them up on exit. It reports findings to stdout, grouped by gate AND labeled with the gate identifier, each carrying the finding narrative the server marker's `revision_suggestion` would carry.
+The subcommand SHALL run in the repository's working directory, reading `openspec/changes/<change-slug>/specs/**` (the deltas) and the local `openspec/specs/**` (canon) — the working copy, before any push. It SHALL NOT run the executor, SHALL NOT write `.needs-spec-revision.json`, AND SHALL NOT make spec or source edits. It MAY create transient run artifacts (`.mcp.json`, the control socket, AND any ask-user fallback markers its gate sessions leave when the in-process socket becomes unreachable) AND SHALL clean them up on exit. Because `verify` runs in an operator's own clone — not a daemon-managed workspace with its own exclude registration — `verify` SHALL, at run start, idempotently register the per-run artifact patterns (including `.askuser-pending*`) in the target repository's `.git/info/exclude`, so an artifact that survives an interrupted or crashed run cannot be swept into a commit by a later broad `git add`. `.git/info/exclude` is local-only and never itself committed. It reports findings to stdout, grouped by gate AND labeled with the gate identifier, each carrying the finding narrative the server marker's `revision_suggestion` would carry.
 
 By default `verify` SHALL run the gates ENABLED in config (so its verdict matches server enforcement); a selector MAY override (`--all` for every realized spec-checking gate, `--gate <list>` for a named subset). Exit code SHALL be CI-usable, conforming to the `gatekeepers-fail-closed` standard: `0` ONLY when every gate that ran returned no findings; non-zero when any gate finds a contradiction; AND non-zero when an enabled gate CANNOT run (model unconfigured, transport error, unregistered strategy, no submission captured) — `verify` SHALL report "gate could not run" AND fail, never reporting clean for a gate that did not actually evaluate. When the resolved gate set is EMPTY (no spec-checking gate enabled AND no selector forcing one), `verify` SHALL NOT exit `0` silently: it SHALL report that no gate evaluated the change AND exit non-zero, conforming to the `gatekeepers-contain-no-judgment` standard (code never manufactures a clean pass when nothing was evaluated).
 
@@ -8406,6 +8406,21 @@ By default `verify` SHALL run the gates ENABLED in config (so its verdict matche
 - **WHEN** `verify <slug> --all` or `verify <slug> --gate in,canon` is run
 - **THEN** it runs the selected gates regardless of their enabled state (reporting any that cannot run as fail-closed)
 - **AND** an unknown gate name in `--gate` is an error, not a silent skip
+
+#### Scenario: Gate-session ask-user fallback markers are cleaned up on exit
+- **WHEN** a gate session during `verify` hits the ask-user fallback and writes a pending-question marker
+- **THEN** `verify` deletes the marker during its exit cleanup, alongside its other transient run artifacts
+- **AND** the repository's working tree is left as the operator had it
+
+#### Scenario: An interrupted verify run cannot leak artifacts into a commit
+- **WHEN** a `verify` run is interrupted (crash, kill) after a gate session wrote an ask-user fallback marker but before cleanup ran
+- **AND** the operator later stages broadly (e.g. `git add openspec/` or `git add -A`)
+- **THEN** the surviving marker is not staged (the `.askuser-pending*` pattern was registered in `.git/info/exclude` at run start)
+- **AND** no `.gitignore` change appears in the repository (the exclude file is local-only)
+
+#### Scenario: Exclude registration is idempotent across verify runs
+- **WHEN** `verify` runs several times against the same repository
+- **THEN** each artifact pattern appears at most once in `.git/info/exclude`
 
 #### Scenario: Check-only install runs without a daemon or a source build
 - **WHEN** an operator runs the check-only install on a spec-authoring machine

@@ -401,6 +401,13 @@ pub fn add_all(workspace: &Path) -> Result<()> {
                 .iter()
                 .copied(),
         )
+        // The ask-user fallback marker (both placements, at any depth) rides the
+        // same defensive pre-staging registration so it is never swept into a
+        // `git add -A`, mirroring the init-time registration in
+        // `workspace::ensure_initialized`.
+        .chain(std::iter::once(
+            crate::mcp_askuser_server::ASKUSER_MARKER_EXCLUDE_PATTERN,
+        ))
         .collect();
     let _ = ensure_local_excludes(workspace, &add_all_excludes);
     run_git(workspace, "add -A", &["add", "-A"])?;
