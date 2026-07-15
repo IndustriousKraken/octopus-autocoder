@@ -1373,14 +1373,17 @@ fn sanitize_change_key(key: &str) -> String {
 /// existing, so it behaves identically on a daemon-managed server workspace and
 /// a directly-cloned spec box.
 pub fn fallback_marker_path(workspace: &Path, change: &str) -> PathBuf {
-    let change_dir = workspace.join("openspec/changes").join(change);
+    // Sanitize BEFORE the is_dir() lookup so BOTH branches stay inside the
+    // workspace root. A legitimate change slug is already `[A-Za-z0-9_-]`, so
+    // this is a no-op for real implementer sessions; a hostile key (`../`, `/`)
+    // collapses to a single path component, so it can neither traverse out via
+    // the in-dir join nor escape via the root filename.
+    let key = sanitize_change_key(change);
+    let change_dir = workspace.join("openspec/changes").join(&key);
     if change_dir.is_dir() {
         change_dir.join(ASKUSER_MARKER_IN_DIR_NAME)
     } else {
-        workspace.join(format!(
-            "{ASKUSER_MARKER_ROOT_PREFIX}{}.json",
-            sanitize_change_key(change)
-        ))
+        workspace.join(format!("{ASKUSER_MARKER_ROOT_PREFIX}{key}.json"))
     }
 }
 
@@ -2453,6 +2456,41 @@ mod tests {
             assert!(marker.is_file());
             assert!(marker.starts_with(ws), "marker must stay within workspace");
         }
+    }
+
+    #[test]
+    fn hostile_key_reaching_existing_dir_cannot_escape_in_dir_branch() {
+        // The is_dir() lookup joins the SANITIZED key, so a traversal key that —
+        // unsanitized — would resolve to an existing directory outside the
+        // workspace no longer takes the in-dir branch and escapes. Lay out a
+        // sibling dir the raw join would reach, then confirm the marker stays at
+        // the workspace root.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // Raw `ws/openspec/changes/../../../outside` resolves to `outside`
+        // (exists); sanitized it collapses to a single component under changes/.
+        let key = "../../../outside";
+        let marker = fallback_marker_path(&ws, key);
+        assert_eq!(
+            marker.parent().unwrap(),
+            ws,
+            "sanitized in-dir lookup must not follow traversal into an existing sibling dir"
+        );
+        assert!(
+            marker.starts_with(&ws) && !marker.starts_with(&outside),
+            "marker must stay within the workspace root, not escape to {}",
+            outside.display()
+        );
+        write_marker(&marker, "q").unwrap();
+        assert!(marker.is_file());
+        assert!(
+            !outside.join(ASKUSER_MARKER_IN_DIR_NAME).exists(),
+            "nothing may be written into the escaped directory"
+        );
     }
 
     #[test]
