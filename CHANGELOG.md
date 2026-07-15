@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.3.1] - 2026-07-14
+
+Maintenance release: no changelog-tracked changes shipped in this window.
+
 ## [v1.3.0] - 2026-07-01
 
 This release completes the migration of every LLM step onto a provider-swappable,
