@@ -261,14 +261,38 @@ pub fn remove_state(
     }
 }
 
-/// Remove every state file whose PR number is not in `open_pr_numbers`.
+/// Prune the state files belonging to ONE revision flow whose PRs are
+/// closed. `branch_matches` selects which state files this flow owns,
+/// tested against the file's recorded `agent_branch`: the primary walk
+/// passes "equals `repo.agent_branch`", the changelog walk passes
+/// "starts with `changelog-`". A candidate `<pr>.json` is deleted only
+/// when its recorded branch matches the predicate AND its PR number is
+/// absent from `open_pr_numbers`.
+///
+/// Files this flow does not own are left in place: a state file whose
+/// branch matches neither flow — or whose JSON does not parse — is
+/// preserved and logged at WARN rather than deleted. Deleting an open
+/// PR's state on ignorance is exactly the failure mode this scoping
+/// fixes (a deleted changelog-PR state resets `last_seen_comment_at` and
+/// re-dispatches every past `revise` comment forever), so preservation is
+/// the fail-safe default.
+///
 /// Returns the number of files removed. A missing revisions directory is
 /// not an error — it returns `0`.
 pub fn prune_closed_prs(
     paths: &crate::paths::DaemonPaths,
     workspace: &Path,
     open_pr_numbers: &HashSet<u64>,
+    branch_matches: impl Fn(&str) -> bool,
 ) -> Result<usize> {
+    /// Minimal probe: read just the recorded branch, tolerating any other
+    /// schema drift so an unparseable-as-`RevisionState` file only trips
+    /// the WARN path when `agent_branch` itself is missing/malformed.
+    #[derive(Deserialize)]
+    struct BranchProbe {
+        agent_branch: String,
+    }
+
     let dir = revisions_dir(paths, workspace);
     if !dir.exists() {
         return Ok(0);
@@ -288,10 +312,41 @@ pub fn prune_closed_prs(
             Ok(n) => n,
             Err(_) => continue,
         };
-        if !open_pr_numbers.contains(&pr_number) {
-            if let Err(e) = std::fs::remove_file(entry.path()) {
+        let path = entry.path();
+        // Read the recorded branch before deciding to delete. An
+        // unreadable or unparseable file is preserved + WARNed, not
+        // deleted (fail-safe: see the doc comment).
+        let branch = match std::fs::read_to_string(&path) {
+            Ok(raw) => match serde_json::from_str::<BranchProbe>(&raw) {
+                Ok(probe) => probe.agent_branch,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "revision-state file did not parse; preserving rather than pruning: {e}"
+                    );
+                    continue;
+                }
+            },
+            Err(e) => {
                 tracing::warn!(
-                    path = %entry.path().display(),
+                    path = %path.display(),
+                    "could not read revision-state file; preserving rather than pruning: {e}"
+                );
+                continue;
+            }
+        };
+        if !branch_matches(&branch) {
+            tracing::warn!(
+                path = %path.display(),
+                branch = %branch,
+                "revision-state branch matches neither revision flow; preserving rather than pruning"
+            );
+            continue;
+        }
+        if !open_pr_numbers.contains(&pr_number) {
+            if let Err(e) = std::fs::remove_file(&path) {
+                tracing::warn!(
+                    path = %path.display(),
                     "failed to prune closed-PR revision state: {e}"
                 );
             } else {
@@ -625,7 +680,13 @@ pub async fn process_revision_requests_at(
         )
     })?;
     let open_numbers: HashSet<u64> = open_prs.iter().map(|p| p.number).collect();
-    let _pruned = prune_closed_prs(paths, workspace, &open_numbers)?;
+    // Flow-scoped prune: this walk owns only agent-branch state, so it
+    // must not delete a changelog PR's state (whose head is
+    // `changelog-<hash>`) just because that PR is absent from the
+    // agent-branch open set.
+    let _pruned = prune_closed_prs(paths, workspace, &open_numbers, |b| {
+        b == repo.agent_branch.as_str()
+    })?;
     let push_remote = if github_cfg.fork_owner.is_some() {
         "fork"
     } else {
@@ -1282,6 +1343,16 @@ mod tests {
         }
     }
 
+    /// Like `sample_state` but records an explicit head branch — lets a
+    /// flow-scoped-prune test place agent-branch and `changelog-*` state
+    /// in the same directory.
+    fn state_with_branch(pr: u64, branch: &str) -> RevisionState {
+        RevisionState {
+            agent_branch: branch.to_string(),
+            ..sample_state(pr)
+        }
+    }
+
     // -------- state-file IO --------
 
     #[test]
@@ -1409,7 +1480,7 @@ mod tests {
 
         let mut open = HashSet::new();
         open.insert(2u64);
-        let removed = prune_closed_prs(&paths, tmp.path(), &open).unwrap();
+        let removed = prune_closed_prs(&paths, tmp.path(), &open, |b| b == "agent-q").unwrap();
         assert_eq!(removed, 2);
         assert!(read_state(&paths, tmp.path(), 1).unwrap().is_none());
         assert!(read_state(&paths, tmp.path(), 2).unwrap().is_some());
@@ -1422,7 +1493,7 @@ mod tests {
         let (_td, paths) = crate::testing::test_daemon_paths();
         let mut open = HashSet::new();
         open.insert(1u64);
-        let removed = prune_closed_prs(&paths, tmp.path(), &open).unwrap();
+        let removed = prune_closed_prs(&paths, tmp.path(), &open, |_| true).unwrap();
         assert_eq!(removed, 0);
     }
 
@@ -1437,14 +1508,132 @@ mod tests {
         std::fs::write(dir.join("not-a-number.json"), "x").unwrap();
         write_state(&paths, tmp.path(), &sample_state(1)).unwrap();
         let mut open = HashSet::new();
-        let removed = prune_closed_prs(&paths, tmp.path(), &open).unwrap();
+        let removed = prune_closed_prs(&paths, tmp.path(), &open, |b| b == "agent-q").unwrap();
         // Only `1.json` removed; non-numeric stems left alone.
         assert_eq!(removed, 1);
         assert!(dir.join("readme.txt").exists());
         assert!(dir.join("not-a-number.json").exists());
         open.insert(99u64);
-        let _ = prune_closed_prs(&paths, tmp.path(), &open).unwrap();
+        let _ = prune_closed_prs(&paths, tmp.path(), &open, |b| b == "agent-q").unwrap();
         assert!(dir.join("readme.txt").exists());
+    }
+
+    /// Task 2.1: the primary (agent-branch) walk's prune removes a
+    /// closed agent-branch PR's state but leaves an open changelog PR's
+    /// state — which lives in the same directory — untouched.
+    #[test]
+    fn primary_prune_spares_open_changelog_state_removes_closed_agent_state() {
+        let tmp = TempDir::new().unwrap();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        // PR 10: agent-branch PR, now closed. PR 20: open changelog PR.
+        write_state(&paths, tmp.path(), &state_with_branch(10, "agent-q")).unwrap();
+        write_state(&paths, tmp.path(), &state_with_branch(20, "changelog-abc12345")).unwrap();
+
+        // Primary walk: its open set holds only agent-branch PRs; PR 10 is
+        // closed so the set is empty. Changelog PR 20 is NOT in it.
+        let open: HashSet<u64> = HashSet::new();
+        let removed =
+            prune_closed_prs(&paths, tmp.path(), &open, |b| b == "agent-q").unwrap();
+
+        assert_eq!(removed, 1, "only the closed agent-branch PR state is removed");
+        assert!(
+            read_state(&paths, tmp.path(), 10).unwrap().is_none(),
+            "closed agent-branch PR state is pruned"
+        );
+        let survived = read_state(&paths, tmp.path(), 20)
+            .unwrap()
+            .expect("open changelog PR state survives the primary walk's prune");
+        assert_eq!(survived.agent_branch, "changelog-abc12345");
+        assert_eq!(
+            survived.auto_revisions_applied, 1,
+            "the changelog PR's applied-revision count is unchanged"
+        );
+        assert_eq!(
+            survived.last_seen_comment_at,
+            ts("2026-05-25T10:00:00Z"),
+            "the changelog PR's last_seen_comment_at is unchanged"
+        );
+    }
+
+    /// Task 2.2: the changelog walk's prune removes state for a closed
+    /// changelog PR and leaves both open changelog PRs and agent-branch
+    /// state untouched.
+    #[test]
+    fn changelog_prune_removes_closed_changelog_leaves_open_and_agent_state() {
+        let tmp = TempDir::new().unwrap();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        write_state(&paths, tmp.path(), &state_with_branch(30, "changelog-open00001")).unwrap();
+        write_state(&paths, tmp.path(), &state_with_branch(31, "changelog-closed0001")).unwrap();
+        write_state(&paths, tmp.path(), &state_with_branch(40, "agent-q")).unwrap();
+
+        // Changelog walk: only PR 30 remains open among changelog PRs.
+        let mut open = HashSet::new();
+        open.insert(30u64);
+        let removed = prune_closed_prs(&paths, tmp.path(), &open, |b| {
+            b.starts_with("changelog-")
+        })
+        .unwrap();
+
+        assert_eq!(removed, 1, "only the closed changelog PR state is removed");
+        assert!(
+            read_state(&paths, tmp.path(), 30).unwrap().is_some(),
+            "open changelog PR state survives"
+        );
+        assert!(
+            read_state(&paths, tmp.path(), 31).unwrap().is_none(),
+            "closed changelog PR state is pruned by the changelog walk"
+        );
+        assert!(
+            read_state(&paths, tmp.path(), 40).unwrap().is_some(),
+            "agent-branch state is not this walk's to prune"
+        );
+    }
+
+    /// Task 2.3: a state file whose branch matches neither flow — or that
+    /// does not parse — is preserved by BOTH walks' predicates, and a WARN
+    /// names the file.
+    #[tracing_test::traced_test]
+    #[test]
+    fn unrecognized_branch_and_unparseable_state_preserved_with_warn() {
+        let tmp = TempDir::new().unwrap();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        // PR 50: recognizable state, but branch belongs to neither flow.
+        write_state(&paths, tmp.path(), &state_with_branch(50, "some-other-flow-branch")).unwrap();
+        // PR 51: numeric-stem file that does not parse as JSON state.
+        let dir = state_path(&paths, tmp.path(), 51);
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        std::fs::write(&dir, "{ not valid json").unwrap();
+
+        // Both PRs absent from every open set: prune would delete them if
+        // it did not honor the fail-safe preservation.
+        let open: HashSet<u64> = HashSet::new();
+
+        // Agent-branch predicate: neither file is owned → nothing removed.
+        let removed_agent =
+            prune_closed_prs(&paths, tmp.path(), &open, |b| b == "agent-q").unwrap();
+        assert_eq!(removed_agent, 0, "agent walk deletes neither file");
+
+        // Changelog predicate: same — neither file is owned.
+        let removed_changelog = prune_closed_prs(&paths, tmp.path(), &open, |b| {
+            b.starts_with("changelog-")
+        })
+        .unwrap();
+        assert_eq!(removed_changelog, 0, "changelog walk deletes neither file");
+
+        assert!(
+            read_state(&paths, tmp.path(), 50).unwrap().is_some(),
+            "unrecognized-branch state is preserved"
+        );
+        assert!(dir.exists(), "unparseable state file is preserved");
+
+        assert!(
+            logs_contain("matches neither revision flow"),
+            "a WARN names the unrecognized-branch file"
+        );
+        assert!(
+            logs_contain("did not parse"),
+            "a WARN names the unparseable file"
+        );
     }
 
     /// 2.2: an interrupted write must not leave a partial canonical file
