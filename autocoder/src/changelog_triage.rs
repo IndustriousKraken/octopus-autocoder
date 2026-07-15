@@ -331,8 +331,15 @@ enum StylistPayload {
 
 /// Wrap one or more section objects into the `{ "sections": [ … ] }`
 /// envelope the stylist prompt consumes. Pretty-printed for readability.
-fn wrap_sections(sections: Vec<serde_json::Value>) -> Result<String> {
-    let doc = serde_json::json!({ "sections": sections });
+/// When `rebuild` is set, the envelope also carries `"mode": "rebuild"` so
+/// the stylist REPLACES each existing version section in place rather than
+/// inserting (a72 gap-fill inserts; `--rebuild` regenerates).
+fn wrap_sections(sections: Vec<serde_json::Value>, rebuild: bool) -> Result<String> {
+    let doc = if rebuild {
+        serde_json::json!({ "mode": "rebuild", "sections": sections })
+    } else {
+        serde_json::json!({ "sections": sections })
+    };
     let mut text = serde_json::to_string_pretty(&doc)
         .map_err(|e| anyhow!("serializing combined changelog sections: {e}"))?;
     text.push('\n');
@@ -343,36 +350,54 @@ fn wrap_sections(sections: Vec<serde_json::Value>) -> Result<String> {
 ///
 /// With an explicit `--since` AND/OR `--to`, the single-range behavior is
 /// preserved: one section for the operator-specified `(since … to]`.
-/// Otherwise gap-fill runs: every undocumented stable release tag becomes
-/// its own section, oldest-first — OR a `NoOp` when there is nothing to
-/// document (all stable tags already documented, or no stable tags yet).
+/// Otherwise a tag-driven run happens:
+/// - Flagless: every UNDOCUMENTED stable release tag becomes its own
+///   section, oldest-first — OR a `NoOp` when there is nothing to document
+///   (all stable tags already documented, or no stable tags yet).
+/// - `--rebuild`: EVERY stable release tag becomes its own section,
+///   oldest-first, regardless of what `CHANGELOG.md` already documents; the
+///   payload is marked as a rebuild so the stylist replaces sections in
+///   place. The only NoOp for a rebuild is "no stable tags yet".
 fn build_stylist_payload(
     workspace: &Path,
     parsed: &ParsedChangelogArgs,
 ) -> Result<StylistPayload> {
     // Explicit range overrides gap-fill: one section for the
-    // operator-specified `(since … to]`.
+    // operator-specified `(since … to]`. (`--rebuild` never combines with a
+    // range — the parser refuses it — so this branch is flagless-only.)
     if parsed.since.is_some() || parsed.to.is_some() {
         let section = extract_section_json(
             workspace,
             parsed.since.as_deref(),
             parsed.to.as_deref().unwrap_or("HEAD"),
         )?;
-        return Ok(StylistPayload::Sections(wrap_sections(vec![section])?));
+        return Ok(StylistPayload::Sections(wrap_sections(vec![section], false)?));
     }
 
-    // Flagless: tag-driven gap-fill.
+    // Tag-driven: flagless gap-fill OR `--rebuild`. Both share the
+    // no-stable-tags NoOp.
     let tags = list_repo_tags(workspace)?;
     let stable = stable_release_tags(&tags);
     if stable.is_empty() {
         return Ok(StylistPayload::NoOp(NoOpReason::NoStableTags));
     }
-    let changelog = read_changelog(workspace)?;
-    let documented = documented_versions(&changelog);
-    let ranges = gap_fill_ranges(&stable, &documented);
-    if ranges.is_empty() {
-        return Ok(StylistPayload::NoOp(NoOpReason::AlreadyCurrent));
-    }
+    let ranges = if parsed.rebuild {
+        // Rebuild drops the documented-versions subtraction: every stable
+        // tag gets a range. `gap_fill_ranges` with an empty documented set
+        // yields exactly that (nothing is skipped), oldest-first, each over
+        // its `(previous stable tag … this tag]` window. `stable` is
+        // non-empty here, so this always produces ≥1 range — a rebuild is
+        // never an "already current" NoOp.
+        gap_fill_ranges(&stable, &BTreeSet::new())
+    } else {
+        let changelog = read_changelog(workspace)?;
+        let documented = documented_versions(&changelog);
+        let ranges = gap_fill_ranges(&stable, &documented);
+        if ranges.is_empty() {
+            return Ok(StylistPayload::NoOp(NoOpReason::AlreadyCurrent));
+        }
+        ranges
+    };
     let mut sections = Vec::with_capacity(ranges.len());
     for range in &ranges {
         // A `None` lower bound means "from the beginning of archive
@@ -384,7 +409,7 @@ fn build_stylist_payload(
         let section = extract_section_json(workspace, Some(since), &range.to)?;
         sections.push(section);
     }
-    Ok(StylistPayload::Sections(wrap_sections(sections)?))
+    Ok(StylistPayload::Sections(wrap_sections(sections, parsed.rebuild)?))
 }
 
 /// Drain handler for chat-driven changelog requests. The polling loop's
@@ -1765,6 +1790,7 @@ mod tests {
             since: Some("v1.0.0".to_string()),
             to: Some("v1.1.0".to_string()),
             workspace_override: None,
+            rebuild: false,
         };
         let json = match build_stylist_payload(ws, &parsed).unwrap() {
             StylistPayload::Sections(j) => j,
@@ -1780,5 +1806,106 @@ mod tests {
         let entries = sections[0]["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["slug"], "beta");
+    }
+
+    // -----------------------------------------------------------------
+    // --rebuild: regenerate every stable-tag section
+    // -----------------------------------------------------------------
+
+    /// Build a repo with three stable tags (v1.0.0/v1.1.0/v1.2.0), each
+    /// shipping one archive, with `CHANGELOG.md` already documenting the
+    /// first two. Returns the workspace TempDir.
+    fn three_tags_two_documented() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = dir.path();
+        init_repo(ws);
+        write_file(ws, "README.md", "seed\n");
+        commit_all(ws, "seed");
+        write_archive(ws, "2026-05-01", "alpha", "## Why\n\nAlpha.\n");
+        commit_all(ws, "ship alpha");
+        git_run(ws, &["tag", "v1.0.0"]);
+        write_archive(ws, "2026-05-02", "beta", "## Why\n\nBeta.\n");
+        commit_all(ws, "ship beta");
+        git_run(ws, &["tag", "v1.1.0"]);
+        write_archive(ws, "2026-05-03", "gamma", "## Why\n\nGamma.\n");
+        commit_all(ws, "ship gamma");
+        git_run(ws, &["tag", "v1.2.0"]);
+        write_file(
+            ws,
+            "CHANGELOG.md",
+            "# Changelog\n\n## [Unreleased]\n\n## [1.1.0] - 2026-05-02\n- beta\n\n## [1.0.0] - 2026-05-01\n- alpha\n",
+        );
+        commit_all(ws, "document v1.0.0 and v1.1.0");
+        dir
+    }
+
+    /// `--rebuild` regenerates ALL three stable-tag sections oldest-first,
+    /// ignoring the documented-versions subtraction, and marks the payload
+    /// as a rebuild so the stylist replaces in place.
+    #[test]
+    fn build_payload_rebuild_regenerates_all_sections_oldest_first() {
+        let dir = three_tags_two_documented();
+        let ws = dir.path();
+        let parsed = ParsedChangelogArgs {
+            rebuild: true,
+            ..Default::default()
+        };
+        let json = match build_stylist_payload(ws, &parsed).unwrap() {
+            StylistPayload::Sections(j) => j,
+            StylistPayload::NoOp(_) => panic!("rebuild must produce sections, not a no-op"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["mode"], "rebuild", "payload must carry the rebuild marker");
+        let sections = v["sections"].as_array().unwrap();
+        assert_eq!(sections.len(), 3, "every stable tag regenerated, even documented ones");
+        assert_eq!(sections[0]["version"], "v1.0.0");
+        assert_eq!(sections[0]["since"], "ever");
+        assert_eq!(sections[1]["version"], "v1.1.0");
+        assert_eq!(sections[1]["since"], "v1.0.0");
+        assert_eq!(sections[2]["version"], "v1.2.0");
+        assert_eq!(sections[2]["since"], "v1.1.0");
+    }
+
+    /// Same fixture, flagless: only the single undocumented tag (v1.2.0) is
+    /// added, no rebuild marker — proving `--rebuild` changed nothing about
+    /// the flagless path.
+    #[test]
+    fn build_payload_flagless_on_rebuild_fixture_adds_only_missing() {
+        let dir = three_tags_two_documented();
+        let ws = dir.path();
+        let parsed = ParsedChangelogArgs::default();
+        let json = match build_stylist_payload(ws, &parsed).unwrap() {
+            StylistPayload::Sections(j) => j,
+            StylistPayload::NoOp(_) => panic!("expected the one missing section"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("mode").is_none(), "flagless payload carries no rebuild marker");
+        let sections = v["sections"].as_array().unwrap();
+        assert_eq!(sections.len(), 1, "only the undocumented tag is added");
+        assert_eq!(sections[0]["version"], "v1.2.0");
+    }
+
+    /// No stable tags → the same `NoStableTags` NoOp for BOTH flagless and
+    /// `--rebuild` (rebuild has nothing to regenerate).
+    #[test]
+    fn build_payload_no_stable_tags_is_noop_for_both_modes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = dir.path();
+        init_repo(ws);
+        write_file(ws, "README.md", "seed\n");
+        commit_all(ws, "seed");
+        git_run(ws, &["tag", "v1.0.0-rc.1"]);
+
+        for rebuild in [false, true] {
+            let parsed = ParsedChangelogArgs {
+                rebuild,
+                ..Default::default()
+            };
+            let payload = build_stylist_payload(ws, &parsed).unwrap();
+            assert!(
+                matches!(payload, StylistPayload::NoOp(NoOpReason::NoStableTags)),
+                "rebuild={rebuild}: only a pre-release tag → NoStableTags no-op"
+            );
+        }
     }
 }

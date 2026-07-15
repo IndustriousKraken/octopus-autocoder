@@ -1533,12 +1533,20 @@ pub struct ParsedChangelogArgs {
     pub since: Option<String>,
     pub to: Option<String>,
     pub workspace_override: Option<String>,
+    /// `--rebuild`: regenerate EVERY stable-tag section from scratch,
+    /// oldest-first, replacing already-documented sections in place.
+    /// Mutually exclusive with `--since`/`--to` (an explicit range is a
+    /// partial regeneration and would be an ambiguous second way to say
+    /// the same thing).
+    pub rebuild: bool,
 }
 
 /// Parse the raw-args remainder of `@<bot> changelog <repo> [<args>]`.
 /// Accepts a subset of the CLI's flag surface (`--since`, `--to`, AND
-/// `--workspace`, the last of which is default-denied at higher layers).
-/// Bad flags surface as descriptive errors so the dispatcher can post
+/// `--workspace`, the last of which is default-denied at higher layers)
+/// plus the verb-only `--rebuild` flag. `--rebuild` combined with
+/// `--since`/`--to` is refused (they are mutually exclusive). Bad flags
+/// surface as descriptive errors so the dispatcher can post
 /// `✗ changelog: bad arg: <text>`.
 pub fn parse_changelog_args(raw: &str) -> Result<ParsedChangelogArgs, String> {
     let mut out = ParsedChangelogArgs::default();
@@ -1579,10 +1587,22 @@ pub fn parse_changelog_args(raw: &str) -> Result<ParsedChangelogArgs, String> {
                 out.workspace_override = Some(val.to_string());
                 i += 2;
             }
+            "--rebuild" => {
+                out.rebuild = true;
+                i += 1;
+            }
             other => {
                 return Err(format!("unrecognized arg `{other}`"));
             }
         }
+    }
+    if out.rebuild && (out.since.is_some() || out.to.is_some()) {
+        return Err(
+            "`--rebuild` and `--since`/`--to` are mutually exclusive — `--rebuild` \
+             regenerates every stable-tag section, while `--since`/`--to` select a \
+             single explicit range. Pick one."
+                .to_string(),
+        );
     }
     Ok(out)
 }
@@ -10414,6 +10434,26 @@ mod tests {
     fn parse_changelog_args_accepts_workspace_for_higher_layers_to_reject() {
         let p = parse_changelog_args("--workspace /tmp/ws").unwrap();
         assert_eq!(p.workspace_override.as_deref(), Some("/tmp/ws"));
+    }
+
+    #[test]
+    fn parse_changelog_args_rebuild_alone_parses() {
+        let p = parse_changelog_args("--rebuild").unwrap();
+        assert!(p.rebuild);
+        assert!(p.since.is_none());
+        assert!(p.to.is_none());
+        // Existing forms are unchanged: no `--rebuild` → `rebuild == false`.
+        assert!(!parse_changelog_args("--since v1").unwrap().rebuild);
+        assert!(!parse_changelog_args("").unwrap().rebuild);
+    }
+
+    #[test]
+    fn parse_changelog_args_rebuild_with_range_is_refused() {
+        for raw in ["--rebuild --since v1.0.0", "--rebuild --to v1.1.0"] {
+            let err = parse_changelog_args(raw).unwrap_err();
+            assert!(err.contains("mutually exclusive"), "{raw}: {err}");
+            assert!(err.contains("--rebuild"), "{raw}: {err}");
+        }
     }
 
     #[tokio::test]
