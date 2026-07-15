@@ -78,19 +78,23 @@ fn extract_section_json(
     let discovered = cli_changelog::find_archives_in_range(workspace, &range)
         .with_context(|| "changelog-stylist: discovering archives".to_string())?;
 
+    let lane_shas: BTreeSet<String> =
+        discovered.iter().map(|e| e.shipped_commit.clone()).collect();
+
     let mut entries: Vec<ArchiveEntry> = Vec::new();
     let mut skipped: Vec<SkippedEntry> = Vec::new();
     for raw in discovered {
         let slug = raw.slug.clone();
         let metadata = match cli_changelog::read_archive_metadata(
-            workspace,
-            &raw.archive_dir,
+            &raw.summary_path,
+            raw.lane,
             &mut stderr_buf,
         ) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(
-                    "changelog-stylist: skipping `{slug}`: failed to read proposal.md: {e:#}"
+                    "changelog-stylist: skipping `{slug}`: failed to read {}: {e:#}",
+                    raw.summary_path.display()
                 );
                 continue;
             }
@@ -105,8 +109,10 @@ fn extract_section_json(
             }
         }
     }
+    let unattributed = cli_changelog::find_unattributed_commits(workspace, &range, &lane_shas)
+        .with_context(|| "changelog-stylist: sweeping unattributed commits".to_string())?;
     let version = range.to_label.clone();
-    let json = render_json(&version, &range, &entries, &skipped)
+    let json = render_json(&version, &range, &entries, &skipped, &unattributed)
         .map_err(|e| anyhow!("rendering changelog JSON: {e}"))?;
     serde_json::from_str(&json).map_err(|e| anyhow!("parsing rendered changelog JSON: {e}"))
 }

@@ -26,18 +26,28 @@ version's deterministic data:
           "slug": "<change-slug>",
           "archive_dir": "<absolute path to the archive directory>",
           "primary_capability": "<capability name or null>",
-          "summary": "<first paragraph of ## Why>",
+          "summary": "<first paragraph of ## Why (or issue body)>",
           "shipped_commit": "<sha>",
-          "shipped_date": "<YYYY-MM-DD>"
+          "shipped_date": "<YYYY-MM-DD>",
+          "lane": "change | issue"
         }
       ],
       "skipped": [
         { "slug": "...", "reason": "..." }
+      ],
+      "unattributed_commits": [
+        { "sha": "<sha>", "date": "<YYYY-MM-DD>", "subject": "<commit subject>" }
       ]
     }
   ]
 }
 ```
+
+Each entry carries a `lane`: `"change"` (an OpenSpec change with an owning
+capability) or `"issue"` (an issues-lane correction — a bugfix or cleanup
+with no capability). `unattributed_commits` are range commits that added
+neither an archive nor an issue entry (direct commits that bypassed both
+workflows); merge commits are already excluded.
 
 The `sections` array carries **one OR MORE** version sections. A flagless
 gap-fill run supplies one section per previously-undocumented stable
@@ -114,6 +124,35 @@ changelog: skip
 
 Future releases inherit the decision automatically — the deterministic
 extractor honors the frontmatter on subsequent runs.
+
+## Fixes and unattributed commits
+
+Each section carries three kinds of shipped work. Fold ALL of them into the
+one release section — never emit a separate "Fixes" or "Other changes"
+heading that mirrors the raw JSON; integrate them thematically like any
+other entry.
+
+- **`lane: "issue"` entries** are corrections (bugfixes, small cleanups).
+  Write them as `Fixes X` release notes and group them thematically with
+  related change entries, or gather them under a `### Fixes` sub-group when
+  they don't cluster with anything else. They are release-worthy — a
+  timezone fix or a batch of security fixes is exactly what operators want
+  to see.
+- **`unattributed_commits`** are direct commits that bypassed both
+  workflows. Classify each from its subject: a bugfix → a `Fixes` note; a
+  docs or internal/refactor commit → `### Also included` or omit if it is
+  pure trivia (dependency bumps, formatting, "wip", merge-noise). Do not
+  list raw SHAs in the output; summarize in prose. When several share a
+  theme, collapse them into one line.
+
+## Empty releases
+
+Describe a release as a **maintenance release** (or "no user-facing
+changes") ONLY when its `entries`, its issue entries, AND its
+`unattributed_commits` are ALL empty. If any of the three is non-empty, the
+release shipped work — summarize it; never assert "no changes". A section
+whose lanes are empty but whose `unattributed_commits` is not is NOT a
+maintenance release: classify those commits instead.
 
 ## Output contract
 
