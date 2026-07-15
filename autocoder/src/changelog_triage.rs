@@ -78,19 +78,23 @@ fn extract_section_json(
     let discovered = cli_changelog::find_archives_in_range(workspace, &range)
         .with_context(|| "changelog-stylist: discovering archives".to_string())?;
 
+    let lane_shas: BTreeSet<String> =
+        discovered.iter().map(|e| e.shipped_commit.clone()).collect();
+
     let mut entries: Vec<ArchiveEntry> = Vec::new();
     let mut skipped: Vec<SkippedEntry> = Vec::new();
     for raw in discovered {
         let slug = raw.slug.clone();
         let metadata = match cli_changelog::read_archive_metadata(
-            workspace,
-            &raw.archive_dir,
+            &raw.summary_path,
+            raw.lane,
             &mut stderr_buf,
         ) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(
-                    "changelog-stylist: skipping `{slug}`: failed to read proposal.md: {e:#}"
+                    "changelog-stylist: skipping `{slug}`: failed to read {}: {e:#}",
+                    raw.summary_path.display()
                 );
                 continue;
             }
@@ -105,8 +109,10 @@ fn extract_section_json(
             }
         }
     }
+    let unattributed = cli_changelog::find_unattributed_commits(workspace, &range, &lane_shas)
+        .with_context(|| "changelog-stylist: sweeping unattributed commits".to_string())?;
     let version = range.to_label.clone();
-    let json = render_json(&version, &range, &entries, &skipped)
+    let json = render_json(&version, &range, &entries, &skipped, &unattributed)
         .map_err(|e| anyhow!("rendering changelog JSON: {e}"))?;
     serde_json::from_str(&json).map_err(|e| anyhow!("parsing rendered changelog JSON: {e}"))
 }
@@ -741,6 +747,18 @@ pub async fn process_changelog_revision_requests(
         .iter()
         .filter(|p| p.head.ref_.starts_with(CHANGELOG_BRANCH_PREFIX))
         .collect();
+    // Flow-scoped prune: this walk owns only `changelog-*` state. Prune
+    // before the empty-check so a just-closed changelog PR's state is
+    // removed even when no changelog PR remains open. It never touches
+    // agent-branch state (a different flow's open set prunes that).
+    let open_changelog_numbers: std::collections::HashSet<u64> =
+        changelog_prs.iter().map(|p| p.number).collect();
+    let _pruned = crate::revisions::prune_closed_prs(
+        paths,
+        workspace,
+        &open_changelog_numbers,
+        |b| b.starts_with(CHANGELOG_BRANCH_PREFIX),
+    )?;
     if changelog_prs.is_empty() {
         return Ok(());
     }
@@ -1244,6 +1262,131 @@ mod tests {
             classify_changelog_revision_comment(&c, "bot", &auth),
             ChangelogRevisionDisposition::Dispatch("apply reviewer feedback".to_string())
         );
+    }
+
+    /// Task 2.4: regression for the unbounded-revision loop shape. With
+    /// state persisted across polling iterations AND the changelog walk's
+    /// prune preserving that state (because the PR is still open), a single
+    /// revise comment dispatches exactly once — the next iteration fetches
+    /// only comments newer than the persisted `last_seen_comment_at` and
+    /// finds nothing — and a later second comment increments the applied
+    /// count to 2. Reproduces coterie PR #100: before the flow-scoped
+    /// prune, the primary walk deleted this state every iteration, resetting
+    /// `last_seen_comment_at` to PR creation and re-dispatching the same
+    /// comment forever, every reply reading "Total revisions on this PR: 1".
+    #[test]
+    fn changelog_revision_loop_dispatches_once_and_counter_is_truthful() {
+        use std::collections::HashSet;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let auth = default_auth();
+        let pr_number = 100u64;
+        let branch = "changelog-deadbeef";
+        let created_at: chrono::DateTime<chrono::Utc> = "2026-05-25T09:00:00Z".parse().unwrap();
+
+        let comment_at = |body: &str, at: &str| {
+            let mut c = make_comment("maint", Some("COLLABORATOR"), body);
+            c.created_at = at.parse().unwrap();
+            c
+        };
+        let c1 = comment_at("@bot revise tighten intro", "2026-05-25T10:00:00Z");
+        let c2 = comment_at("@bot revise fix a typo", "2026-05-25T12:00:00Z");
+
+        // One polling iteration over `all_comments`, mirroring
+        // `process_one_changelog_pr_revision`'s decide → count → advance-seen
+        // → persist loop (minus the HTTP/executor effects), then running the
+        // flow-scoped prune with the PR still OPEN. Returns dispatch count.
+        let run_iteration = |all_comments: &[github::IssueComment]| -> u32 {
+            let mut state =
+                match crate::revisions::read_state(&paths, tmp.path(), pr_number).unwrap() {
+                    Some(s) => s,
+                    None => crate::revisions::RevisionState {
+                        pr_number,
+                        agent_branch: branch.to_string(),
+                        last_seen_comment_at: created_at,
+                        auto_revisions_applied: 0,
+                        revision_cap: u32::MAX,
+                        cap_decline_posted: false,
+                        human_revise_count: 0,
+                        human_revise_cap_decline_posted: false,
+                        code_reviews_applied: 0,
+                        code_review_cap: Some(5),
+                        cap_decline_posted_for_code_review: false,
+                        last_suggested_rereview_at_revisions_count: None,
+                        original_review_head_sha: None,
+                    },
+                };
+            let mut dispatched = 0u32;
+            let mut latest_seen: Option<chrono::DateTime<chrono::Utc>> = None;
+            // `list_issue_comments_since` returns only comments newer than the
+            // persisted marker; model that "new since" contract here.
+            for comment in all_comments
+                .iter()
+                .filter(|c| c.created_at > state.last_seen_comment_at)
+            {
+                if let ChangelogRevisionDisposition::Dispatch(_) =
+                    classify_changelog_revision_comment(comment, "bot", &auth)
+                {
+                    state.auto_revisions_applied =
+                        state.auto_revisions_applied.saturating_add(1);
+                    dispatched += 1;
+                    crate::revisions::write_state(&paths, tmp.path(), &state).unwrap();
+                }
+                advance_seen(&mut latest_seen, comment.created_at);
+            }
+            if let Some(t) = latest_seen
+                && t > state.last_seen_comment_at
+            {
+                state.last_seen_comment_at = t;
+                crate::revisions::write_state(&paths, tmp.path(), &state).unwrap();
+            }
+            // The regression guard: this prune must NOT delete an OPEN
+            // changelog PR's state.
+            let mut open = HashSet::new();
+            open.insert(pr_number);
+            crate::revisions::prune_closed_prs(&paths, tmp.path(), &open, |b| {
+                b.starts_with(CHANGELOG_BRANCH_PREFIX)
+            })
+            .unwrap();
+            dispatched
+        };
+
+        // Iteration 1: the single revise comment dispatches exactly once.
+        assert_eq!(run_iteration(&[c1.clone()]), 1, "first comment dispatches once");
+        let after1 = crate::revisions::read_state(&paths, tmp.path(), pr_number)
+            .unwrap()
+            .expect("state survives the prune while the PR is open");
+        assert_eq!(after1.auto_revisions_applied, 1);
+        assert_eq!(after1.last_seen_comment_at, c1.created_at);
+
+        // Iteration 2: same comment set, nothing newer than last_seen. The
+        // stylist is NOT re-dispatched — this is the loop that used to run
+        // forever — and the counter stays truthful.
+        assert_eq!(
+            run_iteration(&[c1.clone()]),
+            0,
+            "second iteration finds nothing new"
+        );
+        assert_eq!(
+            crate::revisions::read_state(&paths, tmp.path(), pr_number)
+                .unwrap()
+                .unwrap()
+                .auto_revisions_applied,
+            1,
+            "the applied count is not re-incremented"
+        );
+
+        // A genuinely new second comment dispatches once and the count is 2.
+        assert_eq!(
+            run_iteration(&[c1, c2.clone()]),
+            1,
+            "the second comment dispatches once"
+        );
+        let after3 = crate::revisions::read_state(&paths, tmp.path(), pr_number)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after3.auto_revisions_applied, 2, "applied count reaches 2");
+        assert_eq!(after3.last_seen_comment_at, c2.created_at);
     }
 
     #[test]
