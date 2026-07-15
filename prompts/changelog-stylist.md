@@ -55,6 +55,13 @@ release tag, oldest-first; an explicit `--since`/`--to` run supplies a
 single section. Treat each section independently — produce one changelog
 section per array element.
 
+The document MAY also carry a top-level `"mode": "rebuild"` field. When
+present, this is a **rebuild** run: the provided sections cover EVERY
+stable release tag (oldest-first), and each one is meant to REPLACE the
+existing section for that version rather than be inserted alongside it. See
+"Critical existence check" below for exactly how to apply a rebuild. When
+`"mode"` is absent, treat the run as an ordinary insert-only gap-fill.
+
 The exact JSON data follows below the `## Deterministic data` heading.
 
 When you need more context than the JSON summary provides, READ the
@@ -70,13 +77,24 @@ workspace root.
 
 - If `CHANGELOG.md` IS present, READ it AND match its established style:
   heading hierarchy, item phrasing register, grouping convention, presence
-  or absence of dates and PR links. Insert **each** provided section in
-  its correct chronological position (a newer version sits above an older
-  one; typically above the previous release, below any `## [Unreleased]`
-  placeholder). When the input carries multiple sections, insert every one
-  — do not document only the newest. Never regenerate, reorder, or
-  duplicate a version that the file already documents; add only the
-  sections you were given.
+  or absence of dates and PR links.
+  - **Ordinary (insert-only) run** — no `"mode"` field: insert **each**
+    provided section in its correct chronological position (a newer version
+    sits above an older one; typically above the previous release, below
+    any `## [Unreleased]` placeholder). When the input carries multiple
+    sections, insert every one — do not document only the newest. Never
+    regenerate, reorder, or duplicate a version that the file already
+    documents; add only the sections you were given.
+  - **Rebuild run** — `"mode": "rebuild"`: the input covers EVERY stable
+    version. REPLACE each existing version section with the regenerated one
+    for the same version, in chronological order (newest above oldest). For
+    a version the file does not yet document, insert it in its chronological
+    position as usual. Preserve everything that is NOT a version section:
+    the title/`# Changelog` heading, any explanatory preamble, and the
+    `## [Unreleased]` section stay exactly as they are. After the rewrite
+    there MUST be exactly one section per version — never leave the old
+    section and the regenerated one both present. The result is the full
+    set of version sections, each reflecting the current extractor data.
 - If `CHANGELOG.md` is NOT present, CREATE it in the Keep a Changelog
   v1.1.0 format. The file MUST begin with:
   1. A top-level `# Changelog` heading (or the project's name).
