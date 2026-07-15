@@ -231,6 +231,16 @@ async fn run_verify(
         });
     }
 
+    // Register the per-run artifact excludes in the OPERATOR's clone BEFORE any
+    // gate session runs. verify runs in a real clone, not a daemon-managed
+    // workspace with its own init-time registration, so it must register these
+    // itself. This covers the interrupted-run window where the exit cleanup
+    // below never executes: a surviving `.askuser-pending*` marker (or a
+    // generated `.mcp.json`) is then not swept into a later broad `git add`.
+    // `.git/info/exclude` is local-only (never itself committed) AND
+    // `ensure_git_info_excluded` is idempotent.
+    register_run_artifact_excludes(workspace);
+
     // HARD precondition: without the in-process submission transport every
     // gate drains `None` and fails closed. Held for the whole run.
     let _listener = crate::control_socket::spawn_submission_listener(paths)
@@ -238,7 +248,67 @@ async fn run_verify(
 
     let ctxs = build_ctxs(cfg, paths)?;
     let report = evaluate_gates(workspace, change_slug, &selected, &ctxs).await;
+
+    // Exit cleanup: the gate runner already removes its own `.mcp.json`
+    // (`delete_mcp_config`) AND the listener guard removes the control socket on
+    // drop; delete any ask-user fallback markers its gate sessions left too, so
+    // the operator's working tree is left exactly as they had it.
+    cleanup_askuser_markers(workspace, change_slug);
     Ok(report)
+}
+
+/// Idempotently register verify's per-run artifact patterns in the target
+/// repo's `.git/info/exclude`, reusing [`crate::workspace::ensure_git_info_excluded`]:
+/// the CLI strategies' auto-discovered configs (`.mcp.json`, `opencode.json`,
+/// `.opencode/`, `mcp_config.json`) AND the ask-user fallback marker glob
+/// (`.askuser-pending*`, both placements at any depth). Best-effort: a
+/// non-repo/permission failure logs a WARN and does not abort the run.
+fn register_run_artifact_excludes(workspace: &Path) {
+    for pattern in crate::agentic_run::WORKSPACE_CLI_ARTIFACT_EXCLUDES
+        .iter()
+        .copied()
+        .chain(std::iter::once(
+            crate::mcp_askuser_server::ASKUSER_MARKER_EXCLUDE_PATTERN,
+        ))
+    {
+        if let Err(e) = crate::workspace::ensure_git_info_excluded(workspace, pattern) {
+            tracing::warn!(
+                workspace = %workspace.display(),
+                "verify: could not register `{pattern}` in .git/info/exclude: {e:#}"
+            );
+        }
+    }
+}
+
+/// Delete any ask-user fallback markers a gate session left, at BOTH placements:
+/// the workspace root (`.askuser-pending-<key>.json`) and the verified change's
+/// directory (`.askuser-pending.json`). The marker stem is derived from the MCP
+/// server's own exclude pattern (single source of truth), so it cannot drift
+/// from the names the server writes. Best-effort: a missing file or unreadable
+/// directory is a no-op.
+fn cleanup_askuser_markers(workspace: &Path, change_slug: &str) {
+    // `.askuser-pending*` → stem `.askuser-pending`; a marker is any file whose
+    // basename starts with it (covers both the in-dir and root filenames).
+    let stem = crate::mcp_askuser_server::ASKUSER_MARKER_EXCLUDE_PATTERN.trim_end_matches('*');
+    for dir in [
+        workspace.to_path_buf(),
+        workspace.join("openspec").join("changes").join(change_slug),
+    ] {
+        let read = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            let is_marker = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(stem));
+            if is_marker && path.is_file() {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
 }
 
 /// The per-gate contexts, each `Some` only when its model config is present
@@ -821,5 +891,66 @@ mod tests {
             ctxs2.in_ctx.unwrap().timeout,
             std::time::Duration::from_secs(3600)
         );
+    }
+
+    #[test]
+    fn askuser_marker_cleaned_on_run_and_excluded_on_interrupt() {
+        // askuser-fallback-marker-hygiene task 3.3: a completed verify run
+        // deletes any ask-user fallback marker its gate sessions left; a run
+        // interrupted BEFORE cleanup leaves the marker on disk but the
+        // start-of-run exclude registration keeps a later broad `git add -A`
+        // from staging it.
+        fn git(ws: &Path, args: &[&str]) {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(ws)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path();
+        git(ws, &["init", "-q", "-b", "main"]);
+        git(ws, &["config", "user.email", "t@example.com"]);
+        git(ws, &["config", "user.name", "t"]);
+        std::fs::write(ws.join("README.md"), "hi\n").unwrap();
+        git(ws, &["add", "README.md"]);
+        git(ws, &["commit", "-q", "-m", "init"]);
+
+        let change = "real-change";
+        let change_dir = ws.join("openspec/changes").join(change);
+        std::fs::create_dir_all(&change_dir).unwrap();
+
+        // verify's start-of-run registration.
+        register_run_artifact_excludes(ws);
+
+        let root_marker = ws.join(".askuser-pending-canon_contradiction_check.json");
+        let in_dir_marker = change_dir.join(".askuser-pending.json");
+
+        // Interrupt case: a gate session dropped both markers, then the run was
+        // killed before cleanup. A later broad `git add -A` must NOT stage them.
+        std::fs::write(&root_marker, "{}").unwrap();
+        std::fs::write(&in_dir_marker, "{}").unwrap();
+        git(ws, &["add", "-A"]);
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(ws)
+            .output()
+            .unwrap();
+        let status = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            !status.contains(".askuser-pending"),
+            "an interrupted-run marker must not be staged (exclude registered at start): {status:?}"
+        );
+        // Cleanup was skipped, so the markers are still on disk.
+        assert!(root_marker.is_file(), "marker survives an interrupted run on disk");
+        assert!(in_dir_marker.is_file());
+
+        // Completed run: exit cleanup removes both markers.
+        cleanup_askuser_markers(ws, change);
+        assert!(!root_marker.exists(), "completed run must delete the root marker");
+        assert!(!in_dir_marker.exists(), "completed run must delete the in-dir marker");
     }
 }
