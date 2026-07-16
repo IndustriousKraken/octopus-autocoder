@@ -810,7 +810,7 @@ fn render_single_file_body(issue_md: &str, tasks_md: &str) -> String {
 /// [`reconcile_promoted_units`] (re-materialization after a workspace-
 /// cleaning path destroyed the loose files), so a resurrected unit is
 /// byte-identical to the original promotion — same form decision, same file
-/// contents, same atomic writes.
+/// contents.
 ///
 /// A CURATED (maintainer-origin) candidate carries no untrusted body, so it
 /// is written as the default SINGLE FILE `issues/<slug>.md` (description +
