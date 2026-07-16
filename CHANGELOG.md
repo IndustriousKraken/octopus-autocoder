@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.3.3] - 2026-07-16
+
+This release hardens the issues lane — a maintainer-promoted issue no longer
+vanishes to a workspace cleanup, and an excluded or stuck issue is now visible in
+`status` instead of sitting invisible-stuck — and stops the canon-edit task scan
+from raising false positives by moving that judgment to the `[in]` gate.
+
+### Highlights
+
+- **Promoted issues survive workspace cleaning** — a maintainer-promoted issue is no longer silently destroyed when a cleanup path (dirty-tree recovery, `wipe_workspace`, a re-clone, or the changelog cleanup) runs before the issues lane picks it up.
+- **Issues-lane exclusions are visible** — an issue dropped by a stale `.in-progress` lock or a `.perma-stuck.json` park marker now surfaces in `repo_status` and the chatops `status` reply, and is logged with the reason, instead of sitting invisible-stuck while later issues run.
+- **Fewer spurious canon-edit flags** — the keyword scan that flagged any task merely mentioning canon is replaced by the `[in]` gate's judgment, so a read-only mention of canon for context no longer trips a false canon-edit rejection.
+
+### Changed
+
+- Report issues-lane state in `repo_status` and the chatops `status` reply, and log the reason an issue is excluded, so a stale `.in-progress` lock or a `.perma-stuck.json` park marker no longer removes an issue from selection with no trace.
+- Move the "does this task edit canon?" judgment off the mechanical keyword scan and onto the `[in]` gate, which reads the change and judges intent instead of matching a mutation verb against a canon-target token anywhere in the sentence.
+
+### Fixed
+
+- Stop a maintainer-promoted issue from being destroyed by a workspace-cleaning path that runs before the issues lane processes it, so a promoted unit reliably reaches the queue.
+- Fix a condition that could leave the issues lane stuck, so a stuck issue no longer blocks alphabetically-later issues indefinitely.
+
+### Also included
+
+- Provision `OCTOPUS.md` as the in-repo agent and contributor guide — the issues and OpenSpec change protocols, canon/archive ownership, the gate model, and the roadmap lane — with an `AGENTS.md` reference.
+
 ## [v1.3.2] - 2026-07-15
 
 This release fixes the changelog generator's accuracy, adds a full-rebuild mode,
