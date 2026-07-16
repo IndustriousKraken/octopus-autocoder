@@ -7200,7 +7200,9 @@ The daemon SHALL ingest reported issues without giving public authors the abilit
 
 The candidate notification SHALL be posted in a way that a later promotion reply can be matched to it: the daemon SHALL capture the posted message's `thread_ts` AND `channel` AND persist them on the candidate's stored state. A candidate whose thread was not captured (a degraded post) is simply not matchable by a reply — graceful degradation, never an error. The notification SHALL instruct the maintainer to reply `@<bot> send it` (the mention form that the verb recognizes), retaining the statement that nothing is written OR queued until they do.
 
-Promotion SHALL be performed by a control-socket action reachable from the `send it` dispatcher. The action SHALL resolve the matched candidate AND write the issue unit in the form appropriate to its origin: a CURATED candidate (carrying no untrusted body) as the default single file `issues/<slug>.md` (a description plus an optional `## Tasks` checklist); a PUBLIC-ORIGIN candidate as the directory form `issues/<slug>/` (its `issue.md` AND `tasks.md`, plus the quarantined `report-body.md`) so the untrusted body stays a separate file from the maintainer-approved task. The action SHALL flip the candidate's status to promoted; writing the unit IS the queue (the issues-lane walker picks up any ready issue unit). The action SHALL be idempotent: an already-promoted candidate writes nothing further AND reports that it is already promoted.
+Promotion SHALL be performed by a control-socket action reachable from the `send it` dispatcher. The action SHALL resolve the matched candidate AND write the issue unit in the form appropriate to its origin: a CURATED candidate (carrying no untrusted body) as the default single file `issues/<slug>.md` (a description plus an optional `## Tasks` checklist); a PUBLIC-ORIGIN candidate as the directory form `issues/<slug>/` (its `issue.md` AND `tasks.md`, plus the quarantined `report-body.md`) so the untrusted body stays a separate file from the maintainer-approved task. The action SHALL flip the candidate's status to promoted. The action SHALL be idempotent: an already-promoted candidate writes nothing further AND reports that it is already promoted.
+
+**The promoted candidate record is the durable queue entry; the workspace unit is its materialization.** The candidate's stored state (which already carries the full drafted `issue_md`, `tasks_md`, AND `report_body`) SHALL be the source of truth for a promoted-but-not-yet-completed issue. The workspace unit is a materialized copy: because it sits as loose files in a mutable working tree, any workspace-cleaning path (dirty-tree recovery, workspace wipe, re-clone, another feature's failure cleanup) can destroy it, and that destruction SHALL NOT lose the queued issue. Each polling iteration, BEFORE issues-lane enumeration, the daemon SHALL reconcile: for every stored candidate of the repository with status promoted whose unit is absent from `issues/` (in either form) AND absent from `issues/archive/` (no entry whose name ends with the slug, in either form), the daemon SHALL re-materialize the unit from the record — identical content, identical form — logging a WARN naming the slug and that the previously-materialized unit had disappeared. A unit found in `issues/archive/` is complete and SHALL NOT be re-materialized. Deleting the candidate record file is the operator's tombstone: a promoted issue whose record is removed is never re-materialized. Reconciliation applies to pre-existing promoted records on first run after upgrade, so units destroyed before this requirement existed are healed without re-ingestion.
 
 #### Scenario: A triaged report posts a candidate and queues nothing
 - **WHEN** a reported issue is triaged
@@ -7240,6 +7242,27 @@ Promotion SHALL be performed by a control-socket action reachable from the `send
 - **WHEN** the promotion control-socket action runs for a candidate that is already promoted
 - **THEN** no further filesystem write is performed
 - **AND** the action reports that the candidate is already promoted
+
+#### Scenario: A destroyed unit is re-materialized on the next iteration
+- **WHEN** a promoted candidate's workspace unit is destroyed before the issues lane works it (e.g. a dirty-tree recovery, workspace wipe, or another feature's failure cleanup removed the untracked files)
+- **THEN** the next polling iteration's reconciliation re-writes the unit from the candidate record — identical content, identical form
+- **AND** a WARN names the slug and the disappearance
+- **AND** the issues lane selects and works it normally
+
+#### Scenario: An archived issue is not resurrected
+- **WHEN** a promoted candidate's fix has completed AND its unit moved to `issues/archive/`
+- **THEN** reconciliation does NOT re-materialize the unit
+- **AND** no WARN fires for it
+
+#### Scenario: Deleting the candidate record retires the issue
+- **WHEN** an operator deletes a promoted candidate's record file from the candidate store
+- **AND** the workspace unit is (or later becomes) absent
+- **THEN** reconciliation never re-materializes that issue
+
+#### Scenario: Pre-existing destroyed promotions are healed on upgrade
+- **WHEN** the daemon starts with this behavior for the first time AND the candidate store holds promoted records whose units are absent from both `issues/` and `issues/archive/`
+- **THEN** the first iteration per repository re-materializes those units
+- **AND** each re-materialization logs the WARN, so the operator can audit what had been silently lost
 
 ### Requirement: Triage routing classifies each report
 Triage SHALL classify each report AND route it accordingly: a **Bug** (code has drifted from a specification that is itself correct) becomes an issues-lane candidate; a **Behavior change** (the report wants new or changed behavior) is routed to the changes lane as a proposal, NOT an issue; a **Question, invalid report, or duplicate** is declined or deduped with no work queued.
