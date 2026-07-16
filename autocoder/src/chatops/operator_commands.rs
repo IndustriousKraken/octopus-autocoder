@@ -1766,6 +1766,52 @@ pub struct RepoStatusResponse {
     #[serde(default)]
     pub pending_priorities: std::collections::BTreeMap<String, u32>,
     pub last_iteration: Option<LastIteration>,
+    /// Issues-lane state (issues-lane-exclusions-are-observable): ready
+    /// units, locked units (with lock age), AND parked units (with marked-at
+    /// + last-reason detail), sourced from `issues::enumerate` — the SAME
+    /// path the walker consults, so the reply cannot diverge from selection.
+    /// `None` when the issues lane is DISABLED for the daemon (the formatter
+    /// omits the section entirely); `Some` (even when empty) renders the
+    /// section, collapsing to a one-liner when no units exist.
+    /// `#[serde(default)]` keeps older daemons wire-compatible with newer
+    /// chatops formatters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issues_lane: Option<IssuesLaneStatus>,
+}
+
+/// The issues-lane section of a `repo_status` reply. Present only when the
+/// lane is enabled; empty vectors render as the `issues: 0 ready` one-liner.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IssuesLaneStatus {
+    /// Ready issue slugs in selection order (alphabetical).
+    pub ready: Vec<String>,
+    /// Locked issue units with their `.in-progress` lock age.
+    pub locked: Vec<IssuesLockedEntry>,
+    /// Parked issue units with their park marker's marked-at + last reason.
+    pub parked: Vec<IssuesParkedEntry>,
+}
+
+/// A locked issue unit surfaced in the status reply: its slug AND the age of
+/// its `.in-progress` lock.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssuesLockedEntry {
+    pub slug: String,
+    pub age: chrono::Duration,
+}
+
+/// A parked issue unit surfaced in the status reply: its slug, the park
+/// marker's marked-at time, AND its last-reason detail. `unavailable` is set
+/// when the marker was unreadable at status time — the entry still renders
+/// (as parked, detail unavailable) so a corrupt marker degrades the entry,
+/// never the reply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssuesParkedEntry {
+    pub slug: String,
+    pub marked_at: DateTime<Utc>,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default)]
+    pub unavailable: bool,
 }
 
 /// One-line summary of the latest commit on a branch (sourced from
@@ -2115,10 +2161,67 @@ pub fn format_status_reply(resp: &RepoStatusResponse) -> String {
         }
     }
 
+    // Issues-lane section (issues-lane-exclusions-are-observable): mirrors
+    // the changes-lane queue/marker sections. Omitted entirely when the lane
+    // is disabled (`issues_lane` is None); a one-liner when enabled-but-empty;
+    // full lists otherwise. Slugs are slack-escaped belt-and-braces even
+    // though the lane restricts them to `[a-z0-9-]`.
+    if let Some(il) = &resp.issues_lane {
+        out.push_str(&format_issues_lane_section(il));
+    }
+
     // Strip trailing newline so chatops backends post a single message
     // without an empty terminal line.
     while out.ends_with('\n') {
         out.pop();
+    }
+    out
+}
+
+/// Render the issues-lane status section. An entirely empty enabled lane
+/// collapses to a `issues: 0 ready` one-liner; otherwise it lists ready
+/// units, locked units (with lock age), AND parked units (with marked-at +
+/// detail), each labeled like the changes-lane marker lines. A parked
+/// entry whose marker was unreadable renders its detail as `unavailable`.
+fn format_issues_lane_section(il: &IssuesLaneStatus) -> String {
+    if il.ready.is_empty() && il.locked.is_empty() && il.parked.is_empty() {
+        return "\nissues: 0 ready\n".to_string();
+    }
+    let mut out = String::from("\nissues lane:\n");
+    if !il.ready.is_empty() {
+        out.push_str(&format!(
+            "  ready: {}\n",
+            il.ready
+                .iter()
+                .map(|s| slack_escape(s))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    for l in &il.locked {
+        out.push_str(&format!(
+            "  • {} (.in-progress — locked {} ago)\n",
+            slack_escape(&l.slug),
+            human_age_duration(l.age)
+        ));
+    }
+    for p in &il.parked {
+        let age = human_age_since(p.marked_at);
+        let slug = slack_escape(&p.slug);
+        if p.unavailable {
+            out.push_str(&format!(
+                "  • {slug} (.perma-stuck.json — detail unavailable)\n"
+            ));
+        } else if p.detail.is_empty() {
+            out.push_str(&format!(
+                "  • {slug} (.perma-stuck.json — parked {age} ago)\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "  • {slug} (.perma-stuck.json — {}, parked {age} ago)\n",
+                p.detail
+            ));
+        }
     }
     out
 }
@@ -3288,13 +3391,24 @@ impl OperatorCommandDispatcher {
                         .and_then(|v| v.as_str())
                         .unwrap_or(&change)
                         .to_string();
+                    // `clear-perma-stuck` covers both lanes; when the marker
+                    // cleared was on an issue unit the handler labels the
+                    // reply so the operator knows which lane was touched.
+                    // Changes-lane replies stay byte-identical (lane absent
+                    // or "changes" → no suffix).
+                    let lane_suffix =
+                        if resp.get("lane").and_then(|v| v.as_str()) == Some("issues") {
+                            " (issues lane)"
+                        } else {
+                            ""
+                        };
                     if removed_ignore {
                         format!(
-                            "✓ Cleared .perma-stuck.json AND .ignore-for-queue.json for {reply_change}."
+                            "✓ Cleared .perma-stuck.json AND .ignore-for-queue.json for {reply_change}{lane_suffix}."
                         )
                     } else {
                         format!(
-                            "✓ cleared .perma-stuck.json for {reply_change} on {}",
+                            "✓ cleared .perma-stuck.json for {reply_change}{lane_suffix} on {}",
                             short_repo_label(&repo.url)
                         )
                     }
@@ -6915,6 +7029,91 @@ mod tests {
         );
         assert!(out.contains("latest PR: (none)"), "{out}");
         assert!(out.contains("currently: idle"), "{out}");
+    }
+
+    // ---- Issues-lane status section
+    // (issues-lane-exclusions-are-observable §2) ----
+
+    #[test]
+    fn format_status_issues_lane_shows_parked_locked_and_ready() {
+        let resp = RepoStatusResponse {
+            url: "git@github.com:o/r.git".into(),
+            issues_lane: Some(IssuesLaneStatus {
+                // Deliberately unsorted input; the builder sorts, but the
+                // formatter renders in the order given — production populates
+                // it alphabetically from `enumerate`.
+                ready: vec!["alpha".into(), "beta".into()],
+                locked: vec![IssuesLockedEntry {
+                    slug: "worked".into(),
+                    age: chrono::Duration::minutes(3),
+                }],
+                parked: vec![IssuesParkedEntry {
+                    slug: "stuck".into(),
+                    marked_at: Utc::now() - chrono::Duration::hours(2),
+                    detail: "agent gave up".into(),
+                    unavailable: false,
+                }],
+            }),
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(out.contains("issues lane:"), "{out}");
+        assert!(out.contains("ready: alpha, beta"), "alphabetical ready order: {out}");
+        assert!(
+            out.contains("worked (.in-progress — locked 3m ago)"),
+            "locked issue shows lock age: {out}"
+        );
+        assert!(
+            out.contains("stuck (.perma-stuck.json — agent gave up, parked 2h ago)"),
+            "parked issue shows reason + marked-at: {out}"
+        );
+    }
+
+    #[test]
+    fn format_status_issues_lane_empty_is_one_liner() {
+        let resp = RepoStatusResponse {
+            url: "git@github.com:o/r.git".into(),
+            issues_lane: Some(IssuesLaneStatus::default()),
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(out.contains("issues: 0 ready"), "empty enabled lane one-liner: {out}");
+        assert!(!out.contains("issues lane:"), "no full section when empty: {out}");
+    }
+
+    #[test]
+    fn format_status_issues_lane_disabled_is_omitted() {
+        let resp = RepoStatusResponse {
+            url: "git@github.com:o/r.git".into(),
+            issues_lane: None,
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(!out.contains("issues:"), "disabled lane omits the one-liner: {out}");
+        assert!(!out.contains("issues lane"), "disabled lane omits the section: {out}");
+    }
+
+    #[test]
+    fn format_status_issues_lane_unreadable_marker_degrades() {
+        let resp = RepoStatusResponse {
+            url: "git@github.com:o/r.git".into(),
+            issues_lane: Some(IssuesLaneStatus {
+                ready: vec![],
+                locked: vec![],
+                parked: vec![IssuesParkedEntry {
+                    slug: "corrupt".into(),
+                    marked_at: Utc::now(),
+                    detail: String::new(),
+                    unavailable: true,
+                }],
+            }),
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(
+            out.contains("corrupt (.perma-stuck.json — detail unavailable)"),
+            "unreadable marker degrades the entry, not the reply: {out}"
+        );
     }
 
     #[test]

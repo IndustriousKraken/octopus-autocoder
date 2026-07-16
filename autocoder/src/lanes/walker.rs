@@ -58,8 +58,9 @@ pub(crate) async fn walk_issues(
     prompt_path: Option<&Path>,
     max_units: u32,
     perma_stuck_threshold: u32,
+    stuck_threshold_secs: u64,
 ) -> Result<Vec<String>> {
-    let ready = issues::list_ready(workspace)?;
+    let ready = select_ready_units(workspace, repo, chatops_ctx, stuck_threshold_secs).await?;
     let mut archived: Vec<String> = Vec::new();
     for slug in ready {
         if archived.len() as u32 >= max_units {
@@ -99,6 +100,72 @@ pub(crate) async fn walk_issues(
         }
     }
     Ok(archived)
+}
+
+/// Enumerate the issues lane for this pass and produce the ready set the
+/// walker works, making every exclusion OBSERVABLE
+/// (issues-lane-exclusions-are-observable §1):
+///   - each excluded unit is logged at INFO with its reason — `locked`
+///     (with lock age) or `parked` (with marked-at) — so the exclusion is
+///     visible in the journal every pass, not only at park time;
+///   - a STALE `.in-progress` lock (age past the busy-marker threshold — a
+///     crash/kill leftover) is removed, WARNed, AND announced to chatops,
+///     then its unit is treated as ready on this same pass (bounded time
+///     lost instead of the process's remaining lifetime).
+/// Park markers are NEVER auto-removed — parking is operator-owned; only its
+/// per-pass visibility is new. The returned list is sorted (selection order).
+async fn select_ready_units(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    stuck_threshold_secs: u64,
+) -> Result<Vec<String>> {
+    let enumeration = issues::enumerate(workspace, stuck_threshold_secs)?;
+
+    // Log every FRESH exclusion at INFO, once per pass.
+    for locked in enumeration.locked.iter().filter(|l| !l.stale) {
+        tracing::info!(
+            url = %repo.url,
+            slug = %locked.slug,
+            reason = "locked",
+            age_secs = locked.age.as_secs(),
+            "issues lane: unit excluded from selection"
+        );
+    }
+    for parked in &enumeration.parked {
+        tracing::info!(
+            url = %repo.url,
+            slug = %parked.slug,
+            reason = "parked",
+            marked_at = %parked.marked_at,
+            "issues lane: unit excluded from selection"
+        );
+    }
+
+    // Recover stale locks: remove the file, WARN, AND post a chatops alert,
+    // then fold the recovered units into the ready set.
+    let recovered = issues::recover_stale_locks(workspace, &enumeration);
+    let mut ready = enumeration.ready;
+    for locked in &recovered {
+        let age = crate::busy_marker::format_age_human(locked.age.as_secs());
+        tracing::warn!(
+            url = %repo.url,
+            slug = %locked.slug,
+            age_secs = locked.age.as_secs(),
+            "issues lane: recovered stale `.in-progress` lock (crash/kill leftover); unit is selectable again"
+        );
+        shared::notify(
+            chatops_ctx,
+            &format!(
+                "♻️ `{}`: recovered a stale `.in-progress` lock on issue `{}` (age {age}); it will be picked up again",
+                repo.url, locked.slug
+            ),
+        )
+        .await;
+        ready.push(locked.slug.clone());
+    }
+    ready.sort();
+    Ok(ready)
 }
 
 fn step_label(step: &IssueStep) -> &'static str {
@@ -655,6 +722,87 @@ mod tests {
         );
     }
 
+    /// Age a unit's `.in-progress` lock `age_secs` into the past so the
+    /// stale-lock recovery branch fires (libc `utimensat`, as elsewhere in
+    /// the crate — the `filetime` crate is not a dependency).
+    fn age_lock(ws: &Path, slug: &str, age_secs: u64) {
+        let path = issues::issue_dir(ws, slug).join(crate::lanes::shared::LOCK_FILE);
+        let mtime = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(age_secs))
+            .unwrap();
+        let dur = mtime
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        let ts = libc::timespec {
+            tv_sec: dur.as_secs() as libc::time_t,
+            tv_nsec: i64::from(dur.subsec_nanos()),
+        };
+        let c = std::ffi::CString::new(path.as_os_str().to_string_lossy().as_bytes()).unwrap();
+        let times = [ts, ts];
+        let r = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(r, 0, "utimensat failed: {}", std::io::Error::last_os_error());
+    }
+
+    /// issues-lane-exclusions §1: a stale `.in-progress` lock is recovered by
+    /// the walker's ready-selection — removed, alerted, AND the unit returns
+    /// to the ready set on the same pass. A fresh lock stays excluded.
+    #[tokio::test]
+    async fn stale_lock_recovered_alerted_and_reselected() {
+        let (_td, ws) = workspace_with_issue("crashed");
+        let backend = Arc::new(NotificationRecordingBackend {
+            posts: Mutex::new(Vec::new()),
+        });
+        let ctx = notify_ctx(backend.clone(), "C1");
+
+        issues::lock(&ws, "crashed").unwrap();
+        age_lock(&ws, "crashed", 1200); // older than the 600s threshold
+
+        let ready = select_ready_units(&ws, &repo_cfg(), Some(&ctx), 600)
+            .await
+            .unwrap();
+        assert_eq!(ready, vec!["crashed".to_string()], "stale-locked unit returns to ready");
+        assert!(
+            !issues::issue_dir(&ws, "crashed")
+                .join(crate::lanes::shared::LOCK_FILE)
+                .exists(),
+            "stale lock removed"
+        );
+        let posts = backend.posts.lock().unwrap();
+        assert!(
+            posts
+                .iter()
+                .any(|(_, t)| t.contains("crashed") && t.contains("stale")),
+            "a stale-lock recovery alert naming the issue was posted: {posts:?}"
+        );
+    }
+
+    /// A FRESH lock is NOT recovered and NOT alerted — it excludes the unit
+    /// exactly as before (only stale locks recover).
+    #[tokio::test]
+    async fn fresh_lock_is_not_recovered() {
+        let (_td, ws) = workspace_with_issue("busy");
+        let backend = Arc::new(NotificationRecordingBackend {
+            posts: Mutex::new(Vec::new()),
+        });
+        let ctx = notify_ctx(backend.clone(), "C1");
+        issues::lock(&ws, "busy").unwrap();
+
+        let ready = select_ready_units(&ws, &repo_cfg(), Some(&ctx), 600)
+            .await
+            .unwrap();
+        assert!(ready.is_empty(), "a fresh lock stays excluded");
+        assert!(
+            issues::issue_dir(&ws, "busy")
+                .join(crate::lanes::shared::LOCK_FILE)
+                .exists(),
+            "fresh lock preserved"
+        );
+        assert!(
+            backend.posts.lock().unwrap().is_empty(),
+            "no recovery alert for a fresh lock"
+        );
+    }
+
     #[tokio::test]
     async fn walk_issues_inactive_returns_empty_when_no_issues() {
         let td = TempDir::new().unwrap();
@@ -664,7 +812,7 @@ mod tests {
             outcome: Mutex::new(Some(ExecutorOutcome::Completed { final_answer: None })),
             write_file: false,
         };
-        let got = walk_issues(&paths, td.path(), &repo_cfg(), &exec, None, None, 3, 2)
+        let got = walk_issues(&paths, td.path(), &repo_cfg(), &exec, None, None, 3, 2, 600)
             .await
             .unwrap();
         assert!(got.is_empty());

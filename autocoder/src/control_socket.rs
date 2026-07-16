@@ -9,7 +9,8 @@ use crate::alert_state::AlertState;
 use crate::busy_marker;
 use crate::chatops::ChatOpsBackend;
 use crate::chatops::operator_commands::{
-    LastIteration, MarkerEntry, RepoStatusResponse, ThrottledAlertEntry,
+    IssuesLaneStatus, IssuesLockedEntry, IssuesParkedEntry, LastIteration, MarkerEntry,
+    RepoStatusResponse, ThrottledAlertEntry,
 };
 use crate::git;
 use crate::github;

@@ -28,6 +28,14 @@ pub struct IssuesLaneContext {
     /// opt-in (`features.scout.include_issues`); `false` → only the curated
     /// (a009) path is active. Default `false`.
     pub ingest: bool,
+    /// The busy-marker stale threshold (`executor.busy_marker_stale_threshold_secs`)
+    /// the walker uses to recover a stale `.in-progress` lock — a crash/kill
+    /// leftover — instead of excluding its unit forever
+    /// (issues-lane-exclusions-are-observable §1). Carried here (bound at task
+    /// spawn from the same startup config as the busy-marker threshold itself)
+    /// so the deep lane path need not re-thread it. `0` disables staleness,
+    /// matching the busy-marker convention.
+    pub stale_threshold_secs: u64,
 }
 
 tokio::task_local! {
@@ -75,6 +83,7 @@ mod tests {
         let ctx = Arc::new(IssuesLaneContext {
             prompt_path: Some(PathBuf::from("prompts/custom-issue.md")),
             ingest: true,
+            stale_threshold_secs: 600,
         });
         let seen = scope(Some(ctx.clone()), async { current() }).await;
         let seen = seen.expect("scoped Some must read back as Some");
@@ -83,5 +92,6 @@ mod tests {
             Some(std::path::Path::new("prompts/custom-issue.md"))
         );
         assert!(seen.ingest, "scoped ingest flag must read back");
+        assert_eq!(seen.stale_threshold_secs, 600, "scoped threshold must read back");
     }
 }
