@@ -4,7 +4,19 @@
   <img src="octopus-autocoder.jpg" alt="Octopus Autocoder — an octopus at the keyboard" width="320">
 </p>
 
-**Octopus Autocoder** is an autonomous daemon that reads OpenSpec implementation proposals from one or more configured repositories, drives an AI coding agent (the Claude CLI by default) through each change in serial order, and opens monolithic Pull Requests for human review. It's "OpenSpec change at the top, working code in a PR at the bottom" wired into a single long-running process.
+**Octopus Autocoder is an AI coding pipeline where the spec is the boss.**
+
+You write down what your software should do. AI agents propose changes, implement them, and open pull requests — but every change is checked against your written rules before work starts and after it lands, and nothing merges without your sign-off. If a check can't run, the answer is no, not "oh well."
+
+The result: a year from now, "why does the code do this?" has a written answer — the spec that required it, the change that introduced it, and who approved it. Not an archaeology dig through old PRs.
+
+- **Run it on your own projects.** One config file, one daemon, one repo or a dozen, a Slack channel. Report a bug in chat; approve the fix; merge the PR.
+- **The rules are yours and they're enforced, not suggested.** Agents can't edit the spec they're being judged against, can't merge their own work, and can't pass a check by breaking it.
+- **When your team grows into "who approved this and why?" — the answer is already on file.** Every requirement, every change, every sign-off is a versioned document in your repo, from day one, with no process to retrofit.
+
+This repository is maintained by the tool itself: every requirement and every approved change, going back to the beginning, is in [`openspec/`](openspec/).
+
+Under the hood, it's an autonomous daemon that reads [OpenSpec](https://github.com/Fission-AI/OpenSpec) change proposals from one or more configured repositories, drives an AI coding agent (the Claude CLI by default) through each change in serial order, and opens monolithic Pull Requests for human review — "OpenSpec change at the top, working code in a PR at the bottom," wired into a single long-running process.
 
 ---
 
