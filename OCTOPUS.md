@@ -47,6 +47,33 @@ part being changed.
 Every change MUST pass `openspec validate --strict` before it is considered
 ready.
 
+## Roadmap items (ideas, not work)
+
+A **roadmap item** records a future-feature idea that is not yet an issue or a
+change: one file per idea at `roadmap/<slug>.md` (slug: letters, digits, `-`,
+`_`; max 64 chars), with YAML frontmatter followed by a free-text body:
+
+```markdown
+---
+title: One-line description of the idea
+status: proposed   # proposed | considering | planned | deferred
+added: 2026-07-16  # creation date, YYYY-MM-DD
+---
+
+Free-form notes — motivation, sketches, open questions. No required sections.
+```
+
+Roadmap items are **human- and agent-editable**: unlike the canonical specs,
+they are NOT autocoder-owned and carry NO gate enforcement. Lifecycle
+transitions (e.g. `proposed` → `considering` → `planned`, or anything →
+`deferred`) are made by editing the `status` field. Roadmap items are **never
+automatically implemented** — they are not queue input; the queue engine reads
+only `openspec/changes/` and `issues/`. Promoting an idea to real work means
+writing an issue or a change for it.
+
+Agents running a discuss or audit session should check `roadmap/` for relevant
+prior thinking before proposing something new.
+
 ## Canon and archive are autocoder-owned
 
 The canonical specifications under `openspec/specs/` and the archive under
