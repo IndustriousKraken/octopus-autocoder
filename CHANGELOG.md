@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.3.2] - 2026-07-15
+
+This release fixes the changelog generator's accuracy, adds a full-rebuild mode,
+and cleans up a stray agent-sandbox marker.
+
+### Highlights
+
+- **Accurate changelog extraction** — a `--to <tag>` run with no `--since` no longer resolves to an empty range and reports a real release as "no changes", and the extractor now harvests issues-lane corrections and out-of-lane commits, not just OpenSpec changes — so a release whose substance was bugfixes is no longer reported as empty.
+- **Full changelog rebuild** — regenerate every section from history under the current coverage rules, so changelogs written before these fixes can be repaired in one verb instead of by hand.
+- **No runaway changelog revisions** — a changelog PR's revision state survives the agent-branch prune, so a single `@<bot> revise` comment is no longer re-dispatched every polling iteration.
+
+### Added
+
+- Add a changelog rebuild mode that regenerates every section from history under the current, more complete coverage rules.
+
+### Fixed
+
+- Fix the extractor's degenerate `(vX .. vX]` empty range when `--to` names a tag and `--since` is unset, and broaden harvesting to include issues-lane corrections and out-of-lane commits so bugfix-only releases aren't reported as empty.
+- Stop a changelog PR's per-PR revision state from being pruned every polling iteration, so one `@<bot> revise` comment stops being re-dispatched indefinitely.
+- Sanitize, exclude, and clean the `ask_user` fallback marker so a verifier-gate or audit role no longer fabricates a phantom change directory, and the marker can't be committed or trip the dirty-workspace check.
+
+## [v1.3.1] - 2026-07-14
+
+This is primarily a security release: it closes the boundary between the
+sandboxed, prompt-injectable agent and the host — deployment credentials, the
+control socket, and canonical-RAG file reads — and gates the changelog revise
+trigger. It also replaces the one-shot `propose` verb with a conversational
+`discuss` loop and adds a lightweight roadmap lane.
+
+### Highlights
+
+- **Isolate the agent from the host's secrets** — a prompt-injected agent can no longer read the deployment's GitHub PAT, LLM API keys, or chatops bot token; the three paths that exposed them are closed.
+- **Authorize the control socket** — the socket that exposes the full operator-action and gate-verdict surface (and is bridged into every sandbox) now requires authorization instead of accepting any connection.
+- **Conversational `discuss`** — replaces one-shot `propose` with a back-and-forth chat loop that refines a request in-thread before it is queued.
+- **Roadmap lane** — a lightweight home for speculative or deferred feature ideas that don't warrant an issue or a full OpenSpec change.
+
+### Security
+
+- Prevent a sandboxed agent from reading deployment credentials (GitHub PAT, LLM API keys, chatops bot token) across the three paths that exposed them.
+- Require authorization on the daemon control socket, which previously exposed every operator action and gate-verdict submission with no authentication or per-connection identity.
+- Stop canonical-RAG spec indexing from following symlinks, so a committed `spec.md` symlink can no longer make the daemon read and hand back arbitrary host files (secrets, SSH keys, `/etc/passwd`).
+- Require authorization on `@<bot> revise` comments on bot-created `changelog-*` PRs, closing an external, unauthenticated path to the LLM executor.
+
+### Added
+
+- Add the `discuss` verb — a conversational proposal loop that supersedes the one-shot `propose`.
+- Add a roadmap construct for early or deferred ideas that are neither a code defect (issue) nor a specified behavior change.
+
+### Changed
+
+- Park a change on its spec-revision PR: once the revision PR is open it is the blocking signal, so the redundant `.needs-spec-revision.json` marker is cleared and the change waits on the PR.
+
+### Fixed
+
+- Report a clear, deterministic error when a renamed upstream repo's fork name no longer matches, instead of a misleading 60-second "fork not reachable" timeout with a non-existent `reload` remedy hint.
+- Refuse an `XDG_RUNTIME_DIR` the current user doesn't own, so `autocoder reload` after `su` without `-` fails legibly instead of with an opaque "Permission denied".
+
 ## [v1.3.0] - 2026-07-01
 
 This release completes the migration of every LLM step onto a provider-swappable,
