@@ -599,6 +599,9 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
                 // AND `features.scout.include_issues` true, the bot triages
                 // reported GitHub issues read-only AND posts candidates.
                 ingest: cfg.features.scout.include_issues,
+                // Reuse the busy-marker stale threshold for issues-lane
+                // stale-lock recovery — no new knob.
+                stale_threshold_secs: cfg.executor.busy_marker_stale_threshold_secs(),
             }))
         } else {
             None

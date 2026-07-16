@@ -212,8 +212,14 @@ impl AuthoringGateChecker for ScopedGateChecker {
             .await
             {
                 ContradictionCheckOutcome::Clean => {}
-                ContradictionCheckOutcome::Found(f) => {
-                    return GateCheckOutcome::Found(render_in_findings(&f));
+                ContradictionCheckOutcome::Found {
+                    contradictions,
+                    canon_editing_tasks,
+                } => {
+                    return GateCheckOutcome::Found(render_in_findings(
+                        &contradictions,
+                        &canon_editing_tasks,
+                    ));
                 }
                 ContradictionCheckOutcome::Errored { cause } => {
                     return GateCheckOutcome::CouldNotRun(format!("[verifier:in] {cause}"));
@@ -267,23 +273,42 @@ impl AuthoringGateChecker for ScopedGateChecker {
 }
 
 /// Render `[in]` (change-internal) findings into a retry-addendum narrative.
+/// Covers BOTH the gate's finding kinds: within-change contradictions AND tasks
+/// that direct a canonical-spec edit. At least one of the two is non-empty (the
+/// gate returns `Found` only then).
 fn render_in_findings(
     findings: &[crate::preflight::change_contradiction::ContradictionFinding],
+    canon_editing_tasks: &[String],
 ) -> String {
-    let body = findings
-        .iter()
-        .map(|f| {
-            format!(
-                "- `{}` vs `{}`: {}",
-                f.requirement_a, f.requirement_b, f.summary
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "The change passed `openspec validate --strict` but the [verifier:in] gate found \
-         requirement(s) within it that cannot all hold at once:\n{body}"
-    )
+    let mut sections: Vec<String> = Vec::new();
+    if !findings.is_empty() {
+        let body = findings
+            .iter()
+            .map(|f| {
+                format!(
+                    "- `{}` vs `{}`: {}",
+                    f.requirement_a, f.requirement_b, f.summary
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!(
+            "The change passed `openspec validate --strict` but the [verifier:in] gate found \
+             requirement(s) within it that cannot all hold at once:\n{body}"
+        ));
+    }
+    if !canon_editing_tasks.is_empty() {
+        let body = canon_editing_tasks
+            .iter()
+            .map(|t| format!("- {t}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!(
+            "The [verifier:in] gate found task(s) directing an edit to the canonical specs \
+             (implement code and tests only; the delta is folded by `openspec archive`):\n{body}"
+        ));
+    }
+    sections.join("\n\n")
 }
 
 /// Render `[canon]` (change-vs-canonical) findings into a retry-addendum

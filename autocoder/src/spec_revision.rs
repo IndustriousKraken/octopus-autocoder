@@ -34,17 +34,20 @@ pub struct GateErrorRecord {
 /// Outcome details captured at the moment the marker is written. Exactly one
 /// population is non-empty per write (the schema permits several):
 /// `unimplementable_tasks` (executor `SpecNeedsRevision`), `unarchivable_deltas`
-/// (pre-executor archivability check), `canon_editing_tasks` (a task directing a
-/// canon edit), OR `gate_error` (a verifier gate that could not run — a
+/// (pre-executor archivability check), `contradictions` (a contradiction gate
+/// finding), OR `gate_error` (a verifier gate that could not run — a
 /// fail-closed hold). `revision_suggestion` always carries the human-readable
 /// narrative.
 #[derive(Debug, Clone, Default)]
 pub struct SpecNeedsRevisionDetail {
     pub unimplementable_tasks: Vec<UnimplementableTask>,
     pub unarchivable_deltas: Vec<UnarchivableDelta>,
-    /// The text of each `tasks.md` task that directs a direct edit to the
-    /// canonical specs (the pre-executor canon-editing-tasks check). Populated
-    /// when that pre-flight flags the change; empty otherwise.
+    /// LEGACY: the text of each `tasks.md` task that directed an edit to the
+    /// canonical specs. The mechanical `tasks.md` scan that populated this was
+    /// removed once the `[in]` gate took over canon-editing-task detection; the
+    /// gate renders its findings into `revision_suggestion` instead. Retained so
+    /// markers written by an older daemon still deserialize; no current producer
+    /// populates it.
     pub canon_editing_tasks: Vec<String>,
     pub revision_suggestion: String,
     pub gate_error: Option<GateErrorRecord>,
@@ -178,9 +181,12 @@ pub struct SpecNeedsRevisionMarker {
     pub unimplementable_tasks: Vec<UnimplementableTask>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unarchivable_deltas: Vec<UnarchivableDeltaRecord>,
-    /// The text of each `tasks.md` task that directs a canon edit (the
-    /// canon-editing-tasks pre-flight). Omitted from JSON when empty so a marker
-    /// written without it (an older daemon, or another hold reason) still parses.
+    /// LEGACY: the text of each `tasks.md` task that directed a canon edit, once
+    /// written by the mechanical canon-editing-tasks pre-flight. That scan was
+    /// removed when the `[in]` gate took over the detection (it renders such
+    /// findings into `revision_suggestion`), so no current producer populates
+    /// this. Omitted from JSON when empty AND `#[serde(default)]`, so a marker
+    /// written by an older daemon (or written without it) still parses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub canon_editing_tasks: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

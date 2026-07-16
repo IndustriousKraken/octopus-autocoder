@@ -25,12 +25,19 @@ pub(crate) async fn handle_repo_status(parsed: &Value, state: &ControlState) -> 
     };
     let workspace_path = workspace::resolve_path(&state.paths, &repo);
     let github_cfg = state.github.load_full();
-    let stale_threshold = state
-        .last_config
-        .load_full()
-        .executor
-        .busy_marker_stale_threshold_secs();
-    match build_repo_status(&state.paths, &workspace_path, &repo, &github_cfg, stale_threshold).await {
+    let cfg = state.last_config.load_full();
+    let stale_threshold = cfg.executor.busy_marker_stale_threshold_secs();
+    let issues_enabled = cfg.features.issues.enabled;
+    match build_repo_status(
+        &state.paths,
+        &workspace_path,
+        &repo,
+        &github_cfg,
+        stale_threshold,
+        issues_enabled,
+    )
+    .await
+    {
         Ok(resp) => match serde_json::to_value(&resp) {
             Ok(body) => json!({"ok": true, "status": body}),
             Err(e) => json!({"ok": false, "error": format!("serializing status: {e}")}),
@@ -61,16 +68,23 @@ pub(crate) async fn handle_repo_status_all(state: &ControlState) -> Value {
             .collect()
     };
     let github_cfg = state.github.load_full();
-    let stale_threshold = state
-        .last_config
-        .load_full()
-        .executor
-        .busy_marker_stale_threshold_secs();
+    let cfg = state.last_config.load_full();
+    let stale_threshold = cfg.executor.busy_marker_stale_threshold_secs();
+    let issues_enabled = cfg.features.issues.enabled;
     let mut results = Vec::with_capacity(repos.len());
     for repo in repos {
         let workspace_path = workspace::resolve_path(&state.paths, &repo);
         let url = repo.url.clone();
-        let entry = match build_repo_status(&state.paths, &workspace_path, &repo, &github_cfg, stale_threshold).await {
+        let entry = match build_repo_status(
+            &state.paths,
+            &workspace_path,
+            &repo,
+            &github_cfg,
+            stale_threshold,
+            issues_enabled,
+        )
+        .await
+        {
             Ok(resp) => match serde_json::to_value(&resp) {
                 Ok(body) => json!({"url": url, "ok": true, "status": body}),
                 Err(e) => json!({
@@ -108,6 +122,7 @@ async fn build_repo_status(
     repo: &RepositoryConfig,
     github_cfg: &GithubConfig,
     stale_threshold_secs: u64,
+    issues_lane_enabled: bool,
 ) -> Result<RepoStatusResponse> {
     let mut resp = RepoStatusResponse {
         url: repo.url.clone(),
@@ -122,6 +137,17 @@ async fn build_repo_status(
     // (stage, pid, audit-type-on-match) feed the new `currently:` line
     // branches in `format_status_reply`.
     resp.currently_busy = busy_marker::current(paths, workspace_path, stale_threshold_secs);
+
+    // Issues-lane section (issues-lane-exclusions-are-observable): populated
+    // before the workspace-existence early-return so a fresh repo with the
+    // lane enabled still reports `issues: 0 ready` (enumerate handles a
+    // missing `issues/` gracefully). Omitted when the lane is disabled.
+    // Sourced from `issues::enumerate` — the SAME path the walker consults —
+    // so the reply cannot diverge from selection. A directory-read failure
+    // degrades to an empty section with a WARN, never breaking the reply.
+    if issues_lane_enabled {
+        resp.issues_lane = Some(build_issues_lane_status(workspace_path, stale_threshold_secs));
+    }
 
     // Workspace may not exist yet (e.g. a freshly added repo whose initial
     // clone hasn't run). Treat that as "everything empty for the
@@ -468,6 +494,45 @@ pub(crate) async fn fetch_spec_revision_park_at(
     None
 }
 
+/// Build the issues-lane status section from `issues::enumerate` (the same
+/// enumeration the walker consults). Locked units carry their lock age;
+/// parked units carry the marker's marked-at + last-reason detail (or the
+/// `unavailable` flag when the marker was unreadable). A directory-read
+/// failure degrades to an empty section with a WARN — never breaking the
+/// reply (issues-lane-exclusions-are-observable).
+fn build_issues_lane_status(workspace_path: &Path, stale_threshold_secs: u64) -> IssuesLaneStatus {
+    let enumeration = match crate::lanes::issues::enumerate(workspace_path, stale_threshold_secs) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(
+                "status: reading the issues lane failed; rendering it empty (reply intact): {e:#}"
+            );
+            return IssuesLaneStatus::default();
+        }
+    };
+    IssuesLaneStatus {
+        ready: enumeration.ready,
+        locked: enumeration
+            .locked
+            .into_iter()
+            .map(|l| IssuesLockedEntry {
+                slug: l.slug,
+                age: chrono::Duration::from_std(l.age).unwrap_or_else(|_| chrono::Duration::zero()),
+            })
+            .collect(),
+        parked: enumeration
+            .parked
+            .into_iter()
+            .map(|p| IssuesParkedEntry {
+                slug: p.slug,
+                marked_at: p.marked_at,
+                detail: p.detail,
+                unavailable: p.unreadable,
+            })
+            .collect(),
+    }
+}
+
 fn read_perma_marker(path: &Path) -> (DateTime<Utc>, String) {
     let raw = std::fs::read_to_string(path).unwrap_or_default();
     let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
@@ -514,40 +579,96 @@ fn truncate(s: &str, n: usize) -> String {
 /// and silently clear nothing).
 const CLEAR_WILDCARD: &str = "*";
 
+/// Which work lane a swept unit belongs to, so a cleared entry can be
+/// labeled in the reply (`clear-perma-stuck` covers BOTH lanes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepLane {
+    Changes,
+    Issues,
+}
+
+/// One unit whose marker the sweep enumerates/removes, tagged with its lane.
+#[derive(Debug, Clone)]
+struct SweptUnit {
+    slug: String,
+    lane: SweepLane,
+}
+
+impl SweptUnit {
+    /// Display form for the reply's `cleared` list. A changes-lane unit is
+    /// its bare slug (byte-identical to the pre-issues behavior); an
+    /// issues-lane unit is labeled `<slug> (issues)`.
+    fn display(&self) -> String {
+        match self.lane {
+            SweepLane::Changes => self.slug.clone(),
+            SweepLane::Issues => format!("{} (issues)", self.slug),
+        }
+    }
+}
+
 /// Which marker file a wildcard sweep removes.
 #[derive(Debug, Clone, Copy)]
 enum SweepMarkerKind {
     /// `.perma-stuck.json` (also removes any companion `.ignore-for-queue.json`).
+    /// Covers BOTH lanes: `openspec/changes/<change>/.perma-stuck.json` AND
+    /// the issues lane's `.perma-stuck.json` in either form.
     PermaStuck,
-    /// `.needs-spec-revision.json`.
+    /// `.needs-spec-revision.json`. Changes-lane-only — an issue carries no
+    /// spec delta, so no such marker can exist for it.
     Revision,
 }
 
 impl SweepMarkerKind {
-    /// Enumerate the changes in one workspace that carry this kind's marker.
-    /// Uses the same per-kind enumeration `queue::list_marker_excluded`
-    /// reports for status, so the sweep names exactly the changes status
-    /// surfaces.
-    fn list_marked(self, workspace: &Path) -> Result<Vec<String>> {
+    /// Enumerate the units in one workspace that carry this kind's marker.
+    /// The changes lane uses the same `queue::list_marker_excluded`
+    /// enumeration status reports; `PermaStuck` ALSO enumerates the issues
+    /// lane's park markers (both forms) so a repo carrying ONLY issue-lane
+    /// park markers is swept, not reported "nothing to clear".
+    fn list_marked(self, workspace: &Path) -> Result<Vec<SweptUnit>> {
         let (perma, revision) = queue::list_marker_excluded(workspace)?;
         Ok(match self {
-            SweepMarkerKind::PermaStuck => perma,
-            SweepMarkerKind::Revision => revision,
+            SweepMarkerKind::PermaStuck => {
+                let mut units: Vec<SweptUnit> = perma
+                    .into_iter()
+                    .map(|slug| SweptUnit {
+                        slug,
+                        lane: SweepLane::Changes,
+                    })
+                    .collect();
+                units.extend(crate::lanes::issues::list_perma_stuck(workspace).into_iter().map(
+                    |slug| SweptUnit {
+                        slug,
+                        lane: SweepLane::Issues,
+                    },
+                ));
+                units
+            }
+            SweepMarkerKind::Revision => revision
+                .into_iter()
+                .map(|slug| SweptUnit {
+                    slug,
+                    lane: SweepLane::Changes,
+                })
+                .collect(),
         })
     }
 
-    /// Remove this kind's marker from one change. For `PermaStuck`, this
-    /// also removes any companion `.ignore-for-queue.json` (matching the
-    /// exact-form behavior). Returns `true` when an accompanying
-    /// ignore-for-queue marker was also removed.
-    fn remove_from(self, workspace: &Path, change: &str) -> Result<bool> {
-        match self {
-            SweepMarkerKind::PermaStuck => {
-                queue::remove_perma_stuck_marker(workspace, change)?;
-                queue::remove_ignore_for_queue_marker_idempotent(workspace, change)
+    /// Remove this kind's marker from one unit. For a changes-lane
+    /// `PermaStuck`, this also removes any companion `.ignore-for-queue.json`
+    /// (matching the exact-form behavior; issue units carry none). Returns
+    /// `true` when an accompanying ignore-for-queue marker was also removed.
+    fn remove_from(self, workspace: &Path, unit: &SweptUnit) -> Result<bool> {
+        match (self, unit.lane) {
+            (SweepMarkerKind::PermaStuck, SweepLane::Changes) => {
+                queue::remove_perma_stuck_marker(workspace, &unit.slug)?;
+                queue::remove_ignore_for_queue_marker_idempotent(workspace, &unit.slug)
             }
-            SweepMarkerKind::Revision => {
-                queue::remove_revision_marker(workspace, change)?;
+            (SweepMarkerKind::PermaStuck, SweepLane::Issues) => {
+                crate::lanes::issues::remove_perma_stuck(workspace, &unit.slug)?;
+                Ok(false)
+            }
+            (SweepMarkerKind::Revision, _) => {
+                queue::remove_revision_marker(workspace, &unit.slug)?;
                 Ok(false)
             }
         }
@@ -593,13 +714,13 @@ fn sweep_marker_clear(url: &str, kind: SweepMarkerKind, state: &ControlState) ->
         let mut cleared: Vec<String> = Vec::new();
         let mut removed_ignore = false;
         let mut errors: Vec<String> = Vec::new();
-        for change in marked {
-            match kind.remove_from(&workspace_path, &change) {
+        for unit in marked {
+            match kind.remove_from(&workspace_path, &unit) {
                 Ok(also_ignore) => {
                     removed_ignore |= also_ignore;
-                    cleared.push(change);
+                    cleared.push(unit.display());
                 }
-                Err(e) => errors.push(format!("{change}: {e:#}")),
+                Err(e) => errors.push(format!("{}: {e:#}", unit.display())),
             }
         }
         cleared.sort();
@@ -649,6 +770,12 @@ pub(crate) fn handle_clear_perma_stuck(parsed: &Value, state: &ControlState) -> 
     // a passthrough; the operator-supplied prefix is replaced with the
     // canonical slug everywhere downstream (marker removal AND response
     // JSON), so chatops scrollback names the change that was cleared.
+    // Resolve the changes lane FIRST (unchanged exact-or-prefix behavior). A
+    // `NoMatch` falls back to the issues lane so a parked issue is clearable
+    // by the same verb its park alert names; a `MultiMatch` (ambiguity WITHIN
+    // the changes lane) surfaces as-is. A changes-lane match therefore always
+    // wins a rare cross-lane slug collision — the changes-lane behavior is
+    // byte-identical (issues-lane-exclusions-are-observable).
     let change = match queue::resolve_change_prefix(
         &workspace_path,
         &change,
@@ -661,6 +788,31 @@ pub(crate) fn handle_clear_perma_stuck(parsed: &Value, state: &ControlState) -> 
                 );
             }
             canonical
+        }
+        Err(e @ queue::ResolvePrefixError::NoMatch { .. }) => {
+            // No change matched — try the issues lane (exact-or-prefix over
+            // parked issue slugs, form-aware removal).
+            if let Some(slug) = crate::lanes::issues::resolve_perma_stuck_prefix(&workspace_path, &change) {
+                match crate::lanes::issues::remove_perma_stuck(&workspace_path, &slug) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "control_socket: clear_perma_stuck_marker cleared issue-lane park marker for '{slug}'"
+                        );
+                        return json!({
+                            "ok": true,
+                            "change": slug,
+                            "url": url,
+                            "lane": "issues",
+                            "removed_ignore_for_queue": false,
+                        });
+                    }
+                    Err(e) => return json!({"ok": false, "error": format!("{e:#}")}),
+                }
+            }
+            tracing::info!(
+                "control_socket: clear_perma_stuck_marker '{change}' did not resolve in either lane"
+            );
+            return json!({"ok": false, "error": e.to_operator_message(&change)});
         }
         Err(e) => {
             tracing::info!(
@@ -689,6 +841,7 @@ pub(crate) fn handle_clear_perma_stuck(parsed: &Value, state: &ControlState) -> 
         "ok": true,
         "change": change,
         "url": url,
+        "lane": "changes",
         "removed_ignore_for_queue": removed_ignore,
     })
 }

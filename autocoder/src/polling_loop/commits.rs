@@ -228,6 +228,10 @@ async fn run_issues_lane(
     let Some(ctx) = crate::lanes::gate::current() else {
         return Vec::new();
     };
+    // The stale-lock recovery threshold reuses the busy-marker value, carried
+    // on the lane context (bound at task spawn from the same startup config as
+    // the busy-marker threshold, so it is exactly as fresh).
+    let stuck_threshold_secs = ctx.stale_threshold_secs;
 
     // Hybrid PUBLIC ingestion (a010): when the scout issue-read opt-in is
     // on, triage reported GitHub issues read-only AND post candidates to
@@ -257,8 +261,14 @@ async fn run_issues_lane(
             );
         }
     }
-    let issues_ready = match crate::lanes::issues::list_ready(workspace) {
-        Ok(r) => r,
+    // Precedence gate: does the issues lane have a SELECTABLE unit this pass?
+    // `selectable()` counts genuinely-ready units PLUS stale-locked ones
+    // (which `walk_issues` recovers on this same pass), so a crash-leftover
+    // `.in-progress` lock does not read as "no ready issue" and starve the
+    // unit forever (issues-lane-exclusions-are-observable §1). The actual
+    // recovery + per-pass exclusion logging happens inside `walk_issues`.
+    let issues_ready = match crate::lanes::issues::enumerate(workspace, stuck_threshold_secs) {
+        Ok(e) => e.selectable(),
         Err(e) => {
             tracing::warn!(
                 url = %repo.url,
@@ -295,6 +305,7 @@ async fn run_issues_lane(
         ctx.prompt_path.as_deref(),
         max_units,
         perma_stuck_threshold,
+        stuck_threshold_secs,
     )
     .await
     {

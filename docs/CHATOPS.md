@@ -452,9 +452,9 @@ A small set of admin verbs handles the SSH-and-edit recovery actions from chat i
 
 | Verb | Syntax | What it does |
 | --- | --- | --- |
-| `status` | `@<bot> status <repo-substring>` | Posts a multi-line threaded reply with five always-present sections — branches, last commit on each branch, latest PR from the agent branch, currently-busy state (one of `idle`, `working on <change>`, `running audit <type>`, `<stage> in progress`, `stale marker from pid <pid>`, or the unclassified-fallback `busy (stage=<stage>)` — see [`currently:` line variants](#currently-line-variants) below), and the next-iteration estimate — followed by any active markers, currently-engaged 24h alert throttles, and the queue snapshot (compact one-liner when small, per-line when any list exceeds five entries). When called without `<repo-substring>`, returns a per-repo menu listing every watched repository. |
-| `clear-perma-stuck` | `@<bot> clear-perma-stuck <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.perma-stuck.json` (and any accompanying `.ignore-for-queue.json` — a18 full resolution). The next iteration will retry the change. |
-| `clear-revision` | `@<bot> clear-revision <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.needs-spec-revision.json`. Use after you've edited `tasks.md` to remove or revise the unimplementable tasks. |
+| `status` | `@<bot> status <repo-substring>` | Posts a multi-line threaded reply with five always-present sections — branches, last commit on each branch, latest PR from the agent branch, currently-busy state (one of `idle`, `working on <change>`, `running audit <type>`, `<stage> in progress`, `stale marker from pid <pid>`, or the unclassified-fallback `busy (stage=<stage>)` — see [`currently:` line variants](#currently-line-variants) below), and the next-iteration estimate — followed by any active markers, currently-engaged 24h alert throttles, the queue snapshot (compact one-liner when small, per-line when any list exceeds five entries), and — when the issues lane is enabled — an [issues-lane section](#status-issues-lane-section) (ready / locked / parked units). When called without `<repo-substring>`, returns a per-repo menu listing every watched repository. |
+| `clear-perma-stuck` | `@<bot> clear-perma-stuck <repo-substring> <change-slug>` | Covers BOTH work lanes. An exact/prefix slug resolves against the changes lane first, then falls back to a parked **issue** unit (either on-disk form) when no change matches; a changes-lane match wins a rare shared-slug collision. The wildcard form (`@<bot> clear-perma-stuck <repo> *`) sweeps change AND issue park markers, labeling each cleared unit by lane. For a change it deletes `openspec/changes/<change>/.perma-stuck.json` (and any accompanying `.ignore-for-queue.json` — a18 full resolution); for an issue it deletes `issues/<slug>/.perma-stuck.json` (in-directory) or `issues/<slug>.perma-stuck.json` (sibling), per the unit's form. The next iteration retries the unit. |
+| `clear-revision` | `@<bot> clear-revision <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.needs-spec-revision.json`. Changes-lane only — an issue carries no spec delta, so no such marker can exist for it. Use after you've edited `tasks.md` to remove or revise the unimplementable tasks. |
 | `ignore-and-continue` | `@<bot> ignore-and-continue <repo-substring> <change-slug>` | Stamps `openspec/changes/<change>/.ignore-for-queue.json` alongside an existing `.perma-stuck.json` OR `.needs-spec-revision.json`. The change stays excluded from `list_pending`; siblings resume processing on the next iteration. Refuses when the named change has no underlying blocking marker. Commits + pushes the marker on the daemon's agent branch. See [OPERATIONS.md → Queue-blocking policy](OPERATIONS.md#queue-blocking-policy) for the model. |
 | `clear-ignore` | `@<bot> clear-ignore <repo-substring> <change-slug>` | Removes `openspec/changes/<change>/.ignore-for-queue.json`. The queue resumes blocking on the underlying marker. Refuses when no ignore-marker exists. |
 | `defer` | `@<bot> defer <repo-substring> <slug>` | Sets a work unit aside out of both lanes without deleting or revising it. Auto-detects whether `<slug>` is a change or an issue (see below) and moves it to the deferred area via the agent-branch + PR flow. Single acknowledgement — no two-step confirmation. Reversible by `undefer`. |
@@ -642,8 +642,16 @@ Success replies are one line beginning with `✓`. Error replies are one line be
 
 ```
 ✓ cleared .perma-stuck.json for a06-foo on myrepo
+✓ cleared .perma-stuck.json for fix-setup-swallows-error (issues lane) on myrepo
 ✗ no perma-stuck marker for change a99-nonexistent on myrepo
 ✗ no repo matched 'gibberish'; configured: myrepo, widgets
+```
+
+A wildcard sweep (`clear-perma-stuck <repo> *`) enumerates both lanes and labels each cleared unit, so a repo whose only park marker is on an issue is reported cleared, never "nothing to clear":
+
+```
+✓ swept .perma-stuck.json — cleared 2 marker(s):
+  • myrepo: cleared a06-foo, fix-setup-swallows-error (issues)
 ```
 
 #### `ignore-and-continue` and `clear-ignore` example replies
@@ -676,6 +684,26 @@ active markers (excluded from list_pending):
   • a09-bar (.needs-spec-revision.json — marked 22m ago)
 ```
 
+<a name="status-issues-lane-section"></a>
+#### `status` issues-lane section
+
+When the issues lane is enabled (`features.issues.enabled`, the default), the reply gains an issues-lane section mirroring the changes-lane queue/marker sections, so an operator can see from chat WHY an issue is not being picked up — without SSHing into the server workspace where the `.in-progress` / `.perma-stuck.json` markers live (they are `.git/info/exclude`d and never reach an operator's clone). It sources the SAME enumeration the walker consults, so it cannot diverge from selection. It lists:
+
+- **ready** units by slug, in selection order (alphabetical — so the operator can predict which runs next);
+- **locked** units (an `.in-progress` lock is present) with the lock's age;
+- **parked** units (a `.perma-stuck.json` marker is present) with the marker's marked-at time and its last-reason detail.
+
+```
+issues lane:
+  ready: rate-limit-signup, signup-email-casing
+  • deploy-hook-retries (.in-progress — locked 4m ago)
+  • fix-setup-swallows-error (.perma-stuck.json — admin activation error swallowed, parked 3w ago)
+```
+
+When the lane is enabled but `issues/` holds no units in any state, the section collapses to a one-liner (`issues: 0 ready`). When the lane is **disabled** for the repository, the section is omitted entirely. A failure reading the issues directory or an individual marker file degrades that entry (rendered `detail unavailable`) with a WARN — it never breaks the rest of the reply.
+
+A stale `.in-progress` lock (age past `executor.busy_marker_stale_threshold_secs` — a daemon-crash/kill leftover) is recovered automatically on the next pass: the walker removes it, logs a WARN, and posts a `♻️` recovery notification naming the issue, after which the unit is selectable again. A park marker is never auto-removed — parking is operator-owned; clear it with `clear-perma-stuck` (which now reaches issue units).
+
 The `status` reply for a healthy repo looks like:
 
 ```
@@ -690,6 +718,8 @@ latest PR: #42 "a08-foo: add deployment hook"  open · head=agent-q · 11m ago
 
 currently: working on a09-bar (started 2m ago)
 queue: 1 pending (a10-baz), 0 waiting, 0 excluded
+
+issues: 0 ready
 ```
 
 #### `currently:` line variants

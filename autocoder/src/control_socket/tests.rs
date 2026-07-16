@@ -1448,6 +1448,203 @@ github:
         cancel.cancel();
     }
 
+    // -------------------------------------------------------------
+    // issues-lane-exclusions-are-observable §3: clear-perma-stuck covers
+    // BOTH lanes. clear-revision stays changes-only.
+    // -------------------------------------------------------------
+
+    /// A directory-form parked issue: `issues/<slug>/` with a
+    /// `.perma-stuck.json` inside.
+    fn make_issue_dir_parked(workspace: &Path, slug: &str) {
+        let dir = workspace.join("issues").join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("issue.md"), "## Report\nbug\n").unwrap();
+        std::fs::write(dir.join("tasks.md"), "- [ ] 1.1 fix\n").unwrap();
+        std::fs::write(
+            dir.join(".perma-stuck.json"),
+            format!(r#"{{"slug":"{slug}","consecutive_failures":1,"last_reason":"x","marked_stuck_at":"2026-01-01T00:00:00Z","operator_action":"x"}}"#),
+        )
+        .unwrap();
+    }
+
+    /// A single-file-form parked issue: `issues/<slug>.md` with a sibling
+    /// `issues/<slug>.perma-stuck.json`.
+    fn make_issue_file_parked(workspace: &Path, slug: &str) {
+        let issues = workspace.join("issues");
+        std::fs::create_dir_all(&issues).unwrap();
+        std::fs::write(issues.join(format!("{slug}.md")), "## Report\nbug\n").unwrap();
+        std::fs::write(
+            issues.join(format!("{slug}.perma-stuck.json")),
+            format!(r#"{{"slug":"{slug}","consecutive_failures":1,"last_reason":"x","marked_stuck_at":"2026-01-01T00:00:00Z","operator_action":"x"}}"#),
+        )
+        .unwrap();
+    }
+
+    /// A repo whose ONLY park marker is on an issue is swept — reported
+    /// cleared, labeled as issues-lane, NOT "nothing to clear" (the exact
+    /// production regression: `clear-perma-stuck <repo> *` used to enumerate
+    /// only `openspec/changes/`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_perma_stuck_wildcard_sweeps_issue_only_repo() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_issue_dir_parked(&workspace, "fix-setup-swallows-error");
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_perma_stuck_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "*",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        let cleared: Vec<String> = resp["results"][0]["cleared"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            cleared,
+            vec!["fix-setup-swallows-error (issues)".to_string()],
+            "issue swept AND labeled by lane"
+        );
+        assert!(
+            !workspace
+                .join("issues/fix-setup-swallows-error/.perma-stuck.json")
+                .exists()
+        );
+        cancel.cancel();
+    }
+
+    /// Both issue forms (in-directory AND single-file sibling) clear in one
+    /// sweep, alongside a changes-lane marker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_perma_stuck_wildcard_clears_both_issue_forms_and_changes() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a06-foo");
+        write_marker_file(&workspace, "a06-foo", ".perma-stuck.json");
+        make_issue_dir_parked(&workspace, "dir-issue");
+        make_issue_file_parked(&workspace, "file-issue");
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_perma_stuck_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "*",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        let cleared: Vec<String> = resp["results"][0]["cleared"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(cleared.contains(&"a06-foo".to_string()), "change bare-labeled: {cleared:?}");
+        assert!(cleared.contains(&"dir-issue (issues)".to_string()), "{cleared:?}");
+        assert!(cleared.contains(&"file-issue (issues)".to_string()), "{cleared:?}");
+        assert!(!workspace.join("issues/dir-issue/.perma-stuck.json").exists());
+        assert!(!workspace.join("issues/file-issue.perma-stuck.json").exists());
+        assert!(!workspace.join("openspec/changes/a06-foo/.perma-stuck.json").exists());
+        cancel.cancel();
+    }
+
+    /// An exact-target clear whose slug matches ONLY an issue (no change)
+    /// clears the issue's marker AND names the issues lane.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_perma_stuck_exact_target_reaches_issue_when_no_change() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_issue_dir_parked(&workspace, "fix-thing");
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_perma_stuck_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "fix-thing",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(resp["lane"].as_str(), Some("issues"), "reply names the lane: {resp}");
+        assert_eq!(resp["change"].as_str(), Some("fix-thing"));
+        assert!(!workspace.join("issues/fix-thing/.perma-stuck.json").exists());
+        cancel.cancel();
+    }
+
+    /// When both lanes carry a park marker under the SAME slug, an exact
+    /// target clears the CHANGE (changes-lane wins) and leaves the issue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_perma_stuck_exact_target_changes_lane_wins_shared_slug() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "shared");
+        write_marker_file(&workspace, "shared", ".perma-stuck.json");
+        make_issue_dir_parked(&workspace, "shared");
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_perma_stuck_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "shared",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(resp["lane"].as_str(), Some("changes"), "changes lane wins: {resp}");
+        assert!(
+            !workspace.join("openspec/changes/shared/.perma-stuck.json").exists(),
+            "change marker cleared"
+        );
+        assert!(
+            workspace.join("issues/shared/.perma-stuck.json").exists(),
+            "issue marker untouched — changes-lane match won"
+        );
+        cancel.cancel();
+    }
+
+    /// `clear-revision` NEVER enumerates issue units — an issue carries no
+    /// spec delta, so no `.needs-spec-revision.json` can exist for it. A
+    /// parked issue is untouched by a revision sweep.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_revision_wildcard_never_touches_issue_units() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a06-foo");
+        write_marker_file(&workspace, "a06-foo", ".needs-spec-revision.json");
+        make_issue_dir_parked(&workspace, "some-issue");
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_revision_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "*",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        let cleared: Vec<String> = resp["results"][0]["cleared"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(cleared, vec!["a06-foo".to_string()], "only the change is swept");
+        assert!(
+            cleared.iter().all(|c| !c.contains("(issues)")),
+            "no issue unit enumerated by clear-revision: {cleared:?}"
+        );
+        assert!(
+            workspace.join("issues/some-issue/.perma-stuck.json").exists(),
+            "the issue's park marker is untouched by a revision sweep"
+        );
+        cancel.cancel();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn clear_revision_fleet_wildcard_sweeps_every_repo() {
         let dir = TempDir::new().unwrap();
