@@ -18,5 +18,5 @@
 
 ## 4. Docs and verification
 
-- [ ] 4.1 Update `docs/CHATOPS.md`'s status-reply and clear-perma-stuck documentation (the project-documentation canon requires the status reply's sections and verb behaviors to be documented there).
+- [ ] 4.1 Update `docs/CHATOPS.md`'s status-reply and clear-perma-stuck documentation (per project-documentation requirements, CHATOPS.md is where the status reply's sections and verb behaviors are documented).
 - [ ] 4.2 Run the full `cargo test` suite; confirm changes-lane status rendering, existing marker-clear tests, and existing issues-lane tests are unchanged.
