@@ -18,12 +18,19 @@ For each contradiction, produce two distinct things:
 - `summary`: ONE line stating WHY the two requirements conflict — what honoring one prevents in the other.
 - `suggested_fix`: a concrete edit plan stating WHAT to change and HOW — which requirement(s) to ADD, MODIFY, RENAME, or REMOVE, with a short sketch of the resulting text. This is an actionable instruction the operator could apply, NOT a restatement of the conflict. For example: "MODIFY requirement 'X' so its cap reads 90s instead of 60s, matching requirement 'Y'" or "REMOVE the 'config.yaml' clause from requirement 'B' so it defers to requirement 'A''s env-var rule."
 
+Also read the change's `tasks.md` (its path is listed with the spec-delta files below) and report any task whose EDIT TARGET is the canonical specs (`openspec/specs/`). The implementer implements CODE and TESTS only — a change's spec delta is folded into the canonical specs by `openspec archive` automatically, so a task that directs the implementer to apply the delta to `openspec/specs/` would make the archive abort on a duplicate requirement. Judging whether a task DIRECTS such an edit is a matter of reading it, not keyword-matching:
+
+- REPORT (edit target IS the canonical specs): "Apply the ADDED Requirements block to openspec/specs/<cap>/spec.md", "Copy the MODIFIED requirement into canon", "Write the new requirement directly into the canonical spec".
+- Do NOT report (canon is only context, or the target is the change's OWN delta): "Update docs/CHATOPS.md's verb documentation (the project-documentation requirements say the verbs are documented there)" — the edit target is a doc, canon is merely cited; "Add a scenario to openspec/changes/<slug>/specs/<cap>/spec.md" — that is the change's own delta, the legitimate place to author it; "Ensure the code matches the contract in openspec/specs/<cap>/spec.md" — a read-only reference, no edit directed at canon.
+
+Report the exact task text (id + description) of each task you flag in `canon_editing_tasks`. When no task directs a canon edit, leave `canon_editing_tasks` empty (or omit it).
+
 Work through the change OUT LOUD as you go: name each spec file as you read it, say what it requires, and narrate how you compare it against the others. Thinking on the page is encouraged — it does not interfere with the result, and reasoning each comparison aloud helps you catch conflicts you would otherwise miss.
 
-Then — as YOUR FINAL ACTION, which you MUST take — call the `submit_contradictions` MCP tool exactly once, passing EVERY contradiction you found in a single array (an empty array if you found none):
+Then — as YOUR FINAL ACTION, which you MUST take — call the `submit_contradictions` MCP tool exactly once, passing EVERY contradiction you found (an empty array if you found none) AND every canon-editing task you found (omit or leave empty if none):
 
 ```json
-{ "contradictions": [{ "requirement_a": "...", "requirement_b": "...", "summary": "...", "suggested_fix": "..." }] }
+{ "contradictions": [{ "requirement_a": "...", "requirement_b": "...", "summary": "...", "suggested_fix": "..." }], "canon_editing_tasks": ["<offending task text>"] }
 ```
 
-Your narration is NOT the result but it is used for looging and debugging — the daemon reads the outcome ONLY from the `submit_contradictions` tool call. Do NOT end your turn without making that call, even when you found nothing (call it with an empty `contradictions` array).
+Your narration is NOT the result but it is used for looging and debugging — the daemon reads the outcome ONLY from the `submit_contradictions` tool call. Do NOT end your turn without making that call, even when you found nothing (call it with an empty `contradictions` array and no `canon_editing_tasks`).

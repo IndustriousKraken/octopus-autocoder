@@ -559,3 +559,80 @@ async fn contradiction_preflight_findings_write_marker_and_skip_executor() {
         "revision_suggestion must carry the narrative"
     );
 }
+
+/// canon-task-judgment-moves-to-in-gate 3.1: the `[in]` gate returns a
+/// canon-editing task (no contradictions) → a marker is written whose
+/// `revision_suggestion` names the offending task AND the folded-at-archive
+/// rationale, and the executor is NOT invoked. Asserts the plumbing, not the
+/// prompt wording.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn contradiction_preflight_canon_editing_task_writes_marker_and_skips_executor() {
+    let submission = serde_json::json!({
+        "contradictions": [],
+        "canon_editing_tasks": [
+            "1.1 Apply the ADDED Requirements block to openspec/specs/newcap/spec.md"
+        ]
+    });
+    let ctx = cc_test_ctx(Some(submission), None);
+    let (_dir, ws) = fixture_workspace_with_remote();
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    add_committed_change_with_spec(
+        &ws,
+        "canon-editor",
+        "newcap",
+        "## ADDED Requirements\n\n### Requirement: A\nThe system SHALL a.\n",
+    );
+
+    let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    struct Counter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Executor for Counter {
+        async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ExecutorOutcome::Completed { final_answer: None })
+        }
+        async fn resume(
+            &self,
+            _h: crate::executor::ResumeHandle,
+            _a: &str,
+        ) -> Result<ExecutorOutcome> {
+            unreachable!()
+        }
+    }
+    let executor = Counter(invocations.clone());
+    let fut = run_one_pass_with_threshold(&paths, &ws, &executor, u32::MAX);
+    let _ =
+        crate::preflight::change_contradiction::scope(Some(std::sync::Arc::new(ctx)), fut).await;
+    assert_eq!(
+        invocations.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "executor must NOT be invoked when a canon-editing task is found"
+    );
+
+    let marker_path = ws.join("openspec/changes/canon-editor/.needs-spec-revision.json");
+    assert!(marker_path.exists(), "marker must be written");
+    let raw = std::fs::read_to_string(&marker_path).unwrap();
+    // revision_suggestion names the offending task AND the folded-at-archive
+    // rationale (the implementer implements code and tests only).
+    assert!(
+        raw.contains("openspec/specs/newcap/spec.md"),
+        "revision_suggestion must name the offending task; got: {raw}"
+    );
+    assert!(
+        raw.contains("openspec archive"),
+        "revision_suggestion must state the delta is folded by openspec archive; got: {raw}"
+    );
+    assert!(
+        raw.contains("clear-revision"),
+        "revision_suggestion should name the clear-revision verb; got: {raw}"
+    );
+
+    let parsed: crate::spec_revision::SpecNeedsRevisionMarker = serde_json::from_str(&raw).unwrap();
+    // The canon-editing findings render into revision_suggestion; the marker's
+    // other structured populations stay empty for this case.
+    assert!(parsed.contradictions.is_empty());
+    assert!(parsed.canon_editing_tasks.is_empty());
+    assert!(parsed.unimplementable_tasks.is_empty());
+    assert!(parsed.unarchivable_deltas.is_empty());
+    assert!(parsed.gate_error.is_none());
+}

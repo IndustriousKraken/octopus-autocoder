@@ -224,13 +224,28 @@ struct RawContradiction {
 #[derive(Debug, Deserialize)]
 struct RawContradictionSubmission {
     contradictions: Vec<RawContradiction>,
+    /// Tasks whose EDIT TARGET is the canonical specs (`openspec/specs/`), per
+    /// the modified `[in]`-gate requirement. Optional AND defaulting to empty so
+    /// an older gate session that never sends it yields exactly today's
+    /// behavior. Each entry is the offending task's text.
+    #[serde(default)]
+    canon_editing_tasks: Vec<String>,
 }
 
 const PROMPT_DELIMITER: &str = "\n\n---\n\n";
 const RESPONSE_EXCERPT_MAX: usize = 200;
 
-/// Validate AND map a consumed `submit_contradictions` payload into
-/// [`ContradictionFinding`]s (a59). This is BOTH the daemon-side schema
+/// The mapped result of a `submit_contradictions` submission: the
+/// contradictions AND, additively, the tasks the agent judged to direct a
+/// canonical-spec edit (empty when none).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ContradictionSubmission {
+    pub contradictions: Vec<ContradictionFinding>,
+    pub canon_editing_tasks: Vec<String>,
+}
+
+/// Validate AND map a consumed `submit_contradictions` payload into a
+/// [`ContradictionSubmission`] (a59). This is BOTH the daemon-side schema
 /// validator (registered via [`register_contradiction_submission_schema`]
 /// with its `Ok` value discarded) AND the consume-time mapper — so a payload
 /// that records successfully is exactly one that maps, and the two can never
@@ -238,29 +253,34 @@ const RESPONSE_EXCERPT_MAX: usize = 200;
 /// reviewer's `payload_to_review_result`).
 ///
 /// Returns `Err(reason)` (a correction-suitable string) when the payload is
-/// missing the `contradictions` array, when it is not an array, OR when an
-/// entry is missing a required field. `record_submission` surfaces the
-/// reason to the agent as a correctable tool error.
+/// missing the `contradictions` array, when it is not an array, when an entry
+/// is missing a required field, OR when `canon_editing_tasks` is present but not
+/// an array of strings. `record_submission` surfaces the reason to the agent as
+/// a correctable tool error.
 pub(crate) fn payload_to_contradictions(
     payload: &serde_json::Value,
-) -> std::result::Result<Vec<ContradictionFinding>, String> {
+) -> std::result::Result<ContradictionSubmission, String> {
     let sub: RawContradictionSubmission =
         serde_json::from_value(payload.clone()).map_err(|e| {
             format!(
                 "submit_contradictions: payload does not match the expected shape \
-                 {{ contradictions: [{{ requirement_a, requirement_b, summary }}] }}: {e}"
+                 {{ contradictions: [{{ requirement_a, requirement_b, summary }}], \
+                 canon_editing_tasks: [\"<task text>\"] }}: {e}"
             )
         })?;
-    Ok(sub
-        .contradictions
-        .into_iter()
-        .map(|c| ContradictionFinding {
-            requirement_a: c.requirement_a,
-            requirement_b: c.requirement_b,
-            summary: c.summary,
-            suggested_fix: c.suggested_fix,
-        })
-        .collect())
+    Ok(ContradictionSubmission {
+        contradictions: sub
+            .contradictions
+            .into_iter()
+            .map(|c| ContradictionFinding {
+                requirement_a: c.requirement_a,
+                requirement_b: c.requirement_b,
+                summary: c.summary,
+                suggested_fix: c.suggested_fix,
+            })
+            .collect(),
+        canon_editing_tasks: sub.canon_editing_tasks,
+    })
 }
 
 /// Register the contradiction check's `submit_contradictions` payload schema
@@ -447,10 +467,18 @@ impl ContradictionSessionRunner for CannedContradictionRunner {
 /// `Errored` (it was not evaluated), blocks on `Found`, and proceeds on `Clean`.
 #[derive(Debug)]
 pub enum ContradictionCheckOutcome {
-    /// Ran successfully; no contradictions. Proceed.
+    /// Ran successfully; no contradictions AND no canon-editing tasks. Proceed.
     Clean,
-    /// Ran successfully; found contradictions. Block (needs revision).
-    Found(Vec<ContradictionFinding>),
+    /// Ran successfully; found at least one contradiction OR one task directing
+    /// a canonical-spec edit. Block (needs revision). Either vector may be empty
+    /// so long as the other is non-empty.
+    Found {
+        contradictions: Vec<ContradictionFinding>,
+        /// Tasks the gate judged to direct a canonical-spec edit (the semantic
+        /// successor of the removed mechanical `tasks.md` scan). Each entry is
+        /// the offending task's text.
+        canon_editing_tasks: Vec<String>,
+    },
     /// Could NOT run (CLI unavailable, session error, no submission, or a
     /// re-map failure). Hold the change — never treat as `Clean`.
     Errored { cause: String },
@@ -555,8 +583,15 @@ async fn run_agentic_contradiction_check_with_runner(
                 ContradictionCheckOutcome::Errored { cause }
             }
             Some(payload) => match payload_to_contradictions(&payload) {
-                Ok(findings) if findings.is_empty() => ContradictionCheckOutcome::Clean,
-                Ok(findings) => ContradictionCheckOutcome::Found(findings),
+                Ok(sub)
+                    if sub.contradictions.is_empty() && sub.canon_editing_tasks.is_empty() =>
+                {
+                    ContradictionCheckOutcome::Clean
+                }
+                Ok(sub) => ContradictionCheckOutcome::Found {
+                    contradictions: sub.contradictions,
+                    canon_editing_tasks: sub.canon_editing_tasks,
+                },
                 Err(e) => {
                     // The payload passed `record_submission`'s validator, so a
                     // re-map failure is an internal invariant violation — hold
@@ -582,6 +617,7 @@ fn build_contradiction_prompt(
     change_slug: &str,
 ) -> String {
     let paths = spec_delta_paths(workspace_root, change_slug);
+    let tasks_md = format!("openspec/changes/{change_slug}/tasks.md");
     let mut out = String::new();
     out.push_str(template.trim_end());
     out.push_str(PROMPT_DELIMITER);
@@ -600,12 +636,22 @@ fn build_contradiction_prompt(
             out.push_str(&format!("- {p}\n"));
         }
     }
+    out.push_str(&format!(
+        "\n# This change's tasks\n\nAlso read `{tasks_md}` with the `Read` tool and check whether \
+         any task directs an edit to the CANONICAL specs (`openspec/specs/`). The implementer \
+         implements code and tests only; a change's spec delta is folded into canon by \
+         `openspec archive`, so a task that pre-applies the delta to `openspec/specs/` would make \
+         the archive abort on a duplicate requirement. Report the task text of any such task in \
+         `canon_editing_tasks`.\n"
+    ));
     out.push_str(
         "\nNarrate your reasoning freely as you work, but your FINAL action MUST be a single \
-         `submit_contradictions` tool call carrying EVERY contradiction you found \
-         (`{ contradictions: [{ requirement_a, requirement_b, summary, suggested_fix }] }`; an \
-         empty array means \"no contradictions found\"). The daemon records the outcome ONLY \
-         from that tool call — do NOT end your turn without making it.\n",
+         `submit_contradictions` tool call carrying EVERY contradiction you found AND every \
+         canon-editing task \
+         (`{ contradictions: [{ requirement_a, requirement_b, summary, suggested_fix }], \
+         canon_editing_tasks: [\"<task text>\"] }`; both arrays empty means \"nothing found\"). \
+         The daemon records the outcome ONLY from that tool call — do NOT end your turn without \
+         making it.\n",
     );
     out
 }
@@ -776,7 +822,8 @@ mod tests {
     fn empty_contradictions_array_maps_to_empty_vec() {
         let payload = serde_json::json!({ "contradictions": [] });
         let out = payload_to_contradictions(&payload).expect("empty array deserializes");
-        assert!(out.is_empty());
+        assert!(out.contradictions.is_empty());
+        assert!(out.canon_editing_tasks.is_empty());
     }
 
     #[test]
@@ -787,10 +834,10 @@ mod tests {
             ]
         });
         let out = payload_to_contradictions(&payload).expect("deserializes");
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].requirement_a, "A");
-        assert_eq!(out[0].requirement_b, "B");
-        assert_eq!(out[0].summary, "A and B cannot both hold");
+        assert_eq!(out.contradictions.len(), 1);
+        assert_eq!(out.contradictions[0].requirement_a, "A");
+        assert_eq!(out.contradictions[0].requirement_b, "B");
+        assert_eq!(out.contradictions[0].summary, "A and B cannot both hold");
     }
 
     /// A payload carrying `suggested_fix` maps the field through to the finding,
@@ -808,9 +855,12 @@ mod tests {
             ]
         });
         let out = payload_to_contradictions(&payload).expect("deserializes");
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].summary, "why they conflict");
-        assert_eq!(out[0].suggested_fix, "MODIFY B to drop the conflicting clause");
+        assert_eq!(out.contradictions.len(), 1);
+        assert_eq!(out.contradictions[0].summary, "why they conflict");
+        assert_eq!(
+            out.contradictions[0].suggested_fix,
+            "MODIFY B to drop the conflicting clause"
+        );
     }
 
     /// Back-compat (task 5.3): a payload that OMITS `suggested_fix` still parses,
@@ -823,8 +873,52 @@ mod tests {
             ]
         });
         let out = payload_to_contradictions(&payload).expect("legacy payload still parses");
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].suggested_fix, "", "absent suggested_fix defaults to empty");
+        assert_eq!(out.contradictions.len(), 1);
+        assert_eq!(
+            out.contradictions[0].suggested_fix, "",
+            "absent suggested_fix defaults to empty"
+        );
+    }
+
+    /// The optional `canon_editing_tasks` array maps through when present.
+    #[test]
+    fn canon_editing_tasks_are_mapped_when_present() {
+        let payload = serde_json::json!({
+            "contradictions": [],
+            "canon_editing_tasks": [
+                "1.1 Apply the ADDED block to openspec/specs/cap/spec.md"
+            ]
+        });
+        let out = payload_to_contradictions(&payload).expect("deserializes");
+        assert!(out.contradictions.is_empty());
+        assert_eq!(out.canon_editing_tasks.len(), 1);
+        assert!(out.canon_editing_tasks[0].contains("openspec/specs/cap/spec.md"));
+    }
+
+    /// Back-compat: a payload that OMITS `canon_editing_tasks` parses with the
+    /// field defaulting to empty — an older gate session's payload is valid.
+    #[test]
+    fn missing_canon_editing_tasks_defaults_to_empty() {
+        let payload = serde_json::json!({
+            "contradictions": [
+                { "requirement_a": "A", "requirement_b": "B", "summary": "s" }
+            ]
+        });
+        let out = payload_to_contradictions(&payload).expect("legacy payload still parses");
+        assert!(out.canon_editing_tasks.is_empty());
+    }
+
+    /// A `canon_editing_tasks` value that is not an array of strings is a
+    /// correctable schema error (fail-closed until the agent resubmits).
+    #[test]
+    fn non_string_canon_editing_tasks_is_correctable_error() {
+        let payload = serde_json::json!({
+            "contradictions": [],
+            "canon_editing_tasks": [ { "not": "a string" } ]
+        });
+        let err = payload_to_contradictions(&payload)
+            .expect_err("non-string canon_editing_tasks must error");
+        assert!(err.contains("submit_contradictions"), "got: {err}");
     }
 
     #[test]
@@ -875,9 +969,42 @@ mod tests {
         let out =
             run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
         match out {
-            ContradictionCheckOutcome::Found(f) => {
+            ContradictionCheckOutcome::Found {
+                contradictions: f,
+                canon_editing_tasks,
+            } => {
                 assert_eq!(f.len(), 1);
                 assert_eq!(f[0].requirement_a, "A");
+                assert!(canon_editing_tasks.is_empty());
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    /// A submission carrying ONLY `canon_editing_tasks` (no contradictions) is
+    /// still a `Found` (block), carrying the offending task text.
+    #[tokio::test]
+    async fn canon_editing_task_only_submission_is_found() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let ctx = test_ctx();
+        let runner = CannedContradictionRunner {
+            submission: Some(serde_json::json!({
+                "contradictions": [],
+                "canon_editing_tasks": [
+                    "1.1 Apply the ADDED block to openspec/specs/cap/spec.md"
+                ]
+            })),
+        };
+        let out = run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
+        match out {
+            ContradictionCheckOutcome::Found {
+                contradictions,
+                canon_editing_tasks,
+            } => {
+                assert!(contradictions.is_empty());
+                assert_eq!(canon_editing_tasks.len(), 1);
+                assert!(canon_editing_tasks[0].contains("openspec/specs/cap/spec.md"));
             }
             other => panic!("expected Found, got {other:?}"),
         }
@@ -1091,7 +1218,7 @@ mod tests {
             ]
         }))]);
         let out = run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
-        assert!(matches!(out, ContradictionCheckOutcome::Found(_)));
+        assert!(matches!(out, ContradictionCheckOutcome::Found { .. }));
         assert_eq!(runner.call_count(), 1, "a submission on attempt 1 needs no retry");
     }
 
@@ -1133,9 +1260,18 @@ mod tests {
         assert!(prompt.starts_with("PROMPT_TEMPLATE"));
         assert!(prompt.contains("openspec/changes/c1/specs/alpha/spec.md"));
         assert!(prompt.contains("openspec/changes/c1/specs/beta/spec.md"));
+        // The gate also reads tasks.md to judge canon-directing tasks.
+        assert!(
+            prompt.contains("openspec/changes/c1/tasks.md"),
+            "prompt must point the agent at tasks.md"
+        );
         assert!(
             prompt.contains("submit_contradictions"),
             "prompt must instruct the agent to call submit_contradictions"
+        );
+        assert!(
+            prompt.contains("canon_editing_tasks"),
+            "prompt must name the canon_editing_tasks field"
         );
         // The agent reads files on demand — contents are NOT inlined.
         assert!(!prompt.contains("Requirement: A1"));

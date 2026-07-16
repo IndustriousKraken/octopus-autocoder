@@ -615,13 +615,15 @@ pub(crate) async fn maybe_post_unarchivable_deltas_alert(
     .await;
 }
 
-/// Sibling of [`maybe_post_unarchivable_deltas_alert`] for the canon-editing-
-/// tasks pre-flight path. Body framing names "tasks directing a canon edit" and
+/// Sibling of [`maybe_post_unarchivable_deltas_alert`] for canon-directing-task
+/// findings — now surfaced by the `[in]` gate when it reports canon-editing
+/// tasks with no contradictions (the mechanical pre-flight that used to produce
+/// them was removed). Body framing names "tasks directing a canon edit" and
 /// lists each offending task line. Throttle state, channel, and gating flag are
 /// identical to the existing pre-flight alerts so a single stream of
 /// `AlertCategory::SpecNeedsRevision` notifications covers all reject paths.
-/// Untracked (like the unarchivable-deltas alert): a mechanical reject, not a
-/// contradiction revision thread.
+/// Untracked (like the unarchivable-deltas alert): a `tasks.md` fix, not a
+/// `send it`-revisable contradiction revision thread.
 pub(crate) async fn maybe_post_canon_editing_tasks_alert(
     paths: &DaemonPaths,
     chatops_ctx: Option<&ChatOpsContext>,
@@ -648,7 +650,7 @@ pub(crate) async fn maybe_post_canon_editing_tasks_alert(
                 tasks_block.push_str(&format!("  - {task}\n"));
             }
             format!(
-                "⚠️ `{repo_url}`: spec needs revision — `{change}` has a task directing a canon edit (pre-flight)\n\nThe implementer implements code and tests only; a change's spec delta is folded into openspec/specs/ by `openspec archive` automatically. These task(s) instead apply it to canon, which would abort the archive on a duplicate requirement:\n{tasks_block}\nOperator action:\n  1. Remove the offending task(s) from openspec/changes/{change}/tasks.md.\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}",
+                "⚠️ `{repo_url}`: spec needs revision — `{change}` has a task directing a canon edit ([in] gate)\n\nThe implementer implements code and tests only; a change's spec delta is folded into openspec/specs/ by `openspec archive` automatically. These task(s) instead apply it to canon, which would abort the archive on a duplicate requirement:\n{tasks_block}\nOperator action:\n  1. Remove the offending task(s) from openspec/changes/{change}/tasks.md.\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}",
                 repo_url = repo.url,
                 change = change,
                 tasks_block = tasks_block,

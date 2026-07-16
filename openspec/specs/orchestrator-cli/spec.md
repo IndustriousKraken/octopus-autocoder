@@ -4602,13 +4602,13 @@ Removal of the underlying blocking marker (e.g. via `@<bot> clear-perma-stuck`) 
 - **AND** the change re-enters `list_pending` on the next iteration (per the existing clear-perma-stuck behavior)
 
 ### Requirement: Change-internal contradiction pre-flight check (opt-in)
-autocoder SHALL provide an opt-in pre-flight check that detects semantic contradictions among the requirements WITHIN a single OpenSpec change before the executor is invoked. The check runs a CLI-wrapped agentic session through the shared `agentic_run` primitive (a56) in a read-only sandbox that reads the change's spec-delta files on demand AND returns a structured listing of contradictions (requirements that cannot all hold simultaneously) via the `submit_contradictions` MCP tool. On non-empty findings, autocoder SHALL write `.needs-spec-revision.json` with `revision_suggestion` populated from the contradictions narrative, post the existing `AlertCategory::SpecNeedsRevision` chatops alert, AND halt the queue walk for this iteration. The executor SHALL NOT be invoked when contradictions are found.
+autocoder SHALL provide an opt-in pre-flight check that detects semantic contradictions among the requirements WITHIN a single OpenSpec change before the executor is invoked. The check runs a CLI-wrapped agentic session through the shared `agentic_run` primitive (a56) in a read-only sandbox that reads the change's spec-delta files AND its `tasks.md` on demand AND returns a structured listing of findings via the `submit_contradictions` MCP tool: contradictions (requirements that cannot all hold simultaneously) AND, optionally, canon-editing tasks — tasks whose EDIT TARGET is the canonical specs under `openspec/specs/`. The implementer implements code and tests only; a change's spec delta is folded into the canonical specs by `openspec archive`, so a task directing the implementer to apply the delta to `openspec/specs/` would make the archive abort on a duplicate requirement. Judging whether a task DIRECTS such an edit is semantic: a task that merely MENTIONS the canonical specs as context or justification (e.g. citing which requirement motivates a docs edit), or that references the change's OWN delta under `openspec/changes/<slug>/specs/`, is NOT a finding. On non-empty findings of either kind, autocoder SHALL write `.needs-spec-revision.json` with `revision_suggestion` populated from the findings narrative (canon-editing-task findings state that the implementer implements code and tests only and the delta is folded at archive), post the existing `AlertCategory::SpecNeedsRevision` chatops alert, AND halt the queue walk for this iteration. The executor SHALL NOT be invoked when findings are present.
 
 The check SHALL be gated by `executor.change_internal_contradiction_check` (`disabled` default, `enabled` opt-in). The model is configured via `executor.change_internal_contradiction_check_llm` (parallel to the `reviewer:` config block — provider, model, api_key source, optional api_base_url), which a56's CLI strategy translates into the wrapped CLI's model-selection mechanism. The `claude` strategy reaches only Anthropic-shaped endpoints; a model whose provider resolves to a CLI with no registered strategy makes the check FAIL CLOSED (per the fail-closed posture below) until that strategy is registered.  Enabling the check without configuring the model SHALL fail at daemon startup with a fail-fast validation error.
 
-The check SHALL FAIL CLOSED (gatekeepers-fail-closed standard): an agentic-session error (spawn, timeout, OR a resolved CLI strategy that is not registered), a schema-rejected submission the agent never corrects, a session that ends with no submission, OR any other could-not-run failure SHALL NOT be treated as "no contradictions found." It SHALL log a WARN AND hold the change in an explicit failed-to-run state: write `.needs-spec-revision.json` with a structured `gate_error` population (the gate label AND the cause) distinct from a findings-based revision, post a distinct "gate FAILED TO RUN — change held" chatops alert (under `AlertCategory::SpecNeedsRevision`), AND halt the queue walk. The change is held because it was NOT evaluated — NOT because a problem was found; an operator clears the marker (after fixing the gate) to retry. A schema-invalid `submit_contradictions` call mid-session is a correctable tool error the agent can retry (a56). A successful session that returns an empty array is a clean result AND proceeds to the executor.
+The check SHALL FAIL CLOSED (gatekeepers-fail-closed standard): an agentic-session error (spawn, timeout, OR a resolved CLI strategy that is not registered), a schema-rejected submission the agent never corrects, a session that ends with no submission, OR any other could-not-run failure SHALL NOT be treated as "no contradictions found." It SHALL log a WARN AND hold the change in an explicit failed-to-run state: write `.needs-spec-revision.json` with a structured `gate_error` population (the gate label AND the cause) distinct from a findings-based revision, post a distinct "gate FAILED TO RUN — change held" chatops alert (under `AlertCategory::SpecNeedsRevision`), AND halt the queue walk. The change is held because it was NOT evaluated — NOT because a problem was found; an operator clears the marker (after fixing the gate) to retry. A schema-invalid `submit_contradictions` call mid-session is a correctable tool error the agent can retry (a56). A successful session that returns empty findings is a clean result AND proceeds to the executor.
 
-The check runs AFTER `a17`'s mechanical archivability check AND BEFORE the executor. The two checks are layered: `a17` catches structural defects (header mismatches), `a19` catches semantic ones (self-contradictions). Most clean changes pass both with no LLM cost beyond the contradiction check's own.
+The check runs AFTER `a17`'s mechanical archivability check AND BEFORE the executor. The two checks are layered: `a17` catches structural defects (header mismatches); this check catches semantic ones — self-contradictions AND tasks that direct canon edits. Most clean changes pass both with no LLM cost beyond the contradiction check's own.
 
 #### Scenario: Default-disabled produces no contradiction-check session
 - **WHEN** `executor.change_internal_contradiction_check` is unset (default `disabled`)
@@ -4620,10 +4620,10 @@ The check runs AFTER `a17`'s mechanical archivability check AND BEFORE the execu
 - **WHEN** `executor.change_internal_contradiction_check: enabled` AND the model config is set
 - **AND** a change passes `a17`'s archivability check
 - **THEN** the pipeline runs an `agentic_run` session (a56) in a read-only sandbox (`Read`/`Glob`/`Grep`, `ORCH_MCP_ROLE = contradiction_check`, the `submit_contradictions` MCP tool) with the embedded `prompts/change-contradiction-check.md` prompt (OR the configured override)
-- **AND** the agent reads the change's spec-delta files on demand AND returns contradictions by calling `submit_contradictions` with `{ contradictions: [{ requirement_a, requirement_b, summary }] }`
+- **AND** the agent reads the change's spec-delta files AND `tasks.md` on demand AND returns findings by calling `submit_contradictions` with `{ contradictions: [{ requirement_a, requirement_b, summary }], canon_editing_tasks: ["<task text>"] }` (the second field optional and empty when there are none)
 
-#### Scenario: Empty contradictions submission proceeds to executor
-- **WHEN** the agent calls `submit_contradictions` with an empty `contradictions` array
+#### Scenario: Empty findings submission proceeds to executor
+- **WHEN** the agent calls `submit_contradictions` with an empty `contradictions` array AND no canon-editing-task findings
 - **THEN** the pipeline proceeds to the executor
 - **AND** no marker is written
 - **AND** no chatops alert fires
@@ -4634,6 +4634,17 @@ The check runs AFTER `a17`'s mechanical archivability check AND BEFORE the execu
 - **AND** the marker's `unarchivable_deltas`, `unimplementable_tasks`, AND `gate_error` populations are empty (this case is semantic findings, not structural AND not a gate error)
 - **AND** the chatops alert under `AlertCategory::SpecNeedsRevision` fires (subject to the 24h throttle)
 - **AND** the executor is NOT invoked for this change OR any subsequent change in this iteration
+
+#### Scenario: A task directing a canon edit is reported and holds the change
+- **WHEN** the change's `tasks.md` contains a task such as `Apply the ADDED Requirements block from specs/<cap>/spec.md to openspec/specs/<cap>/spec.md`
+- **THEN** the agent reports it in `canon_editing_tasks`
+- **AND** the pipeline writes `.needs-spec-revision.json` whose `revision_suggestion` names the offending task AND states that the implementer implements code and tests only (the delta is folded by `openspec archive`)
+- **AND** the alert fires AND the executor is NOT invoked
+
+#### Scenario: Task prose that mentions canon without directing an edit is not a finding
+- **WHEN** a task directs an edit to a non-canon target while citing the canonical specs as context or justification (e.g. `Update docs/CHATOPS.md's verb documentation (the project-documentation requirements say the verbs are documented there)`), OR references the change's own delta under `openspec/changes/<slug>/specs/`
+- **THEN** the agent does NOT report it as a canon-editing task
+- **AND** the change proceeds normally to the executor (absent other findings)
 
 #### Scenario: Session failure holds the change (fail closed)
 - **WHEN** the agentic session fails (spawn error, timeout, OR the resolved CLI strategy is not registered — e.g. a non-`claude` command whose strategy has not been added)
@@ -8845,34 +8856,6 @@ This cap is independent of the auto-revision cap (`executor.max_auto_revisions_p
 - **WHEN** a human cap is configured AND the auto-revision cap (`executor.max_auto_revisions_per_pr`) is exhausted on a PR
 - **THEN** an authorized human `@<bot> revise` still proceeds while the human cap (`executor.max_revise_triggers_per_pr`) has headroom
 - **AND** exhausting the human cap does not change the auto-revision count
-
-### Requirement: Pre-flight rejects a change whose tasks direct edits to the canonical specs
-Before invoking the executor against any change, autocoder SHALL scan the change's `tasks.md` for any task that directs a direct edit to the canonical specs, AND reject the change for revision when one is found. This runs alongside the `Spec-delta archivability pre-flight check` — the same point in the pipeline, the same marker, the same halt semantics — but it inspects task CONTENT rather than delta headers. The rationale: the implementer implements code and tests only; a change's spec delta lives in its own `specs/<capability>/spec.md` and is folded into the canonical specs by `openspec archive`. A task that instead applies the delta to `openspec/specs/` makes the implementer pre-fold canon, after which `openspec archive` aborts on a duplicate requirement and the change goes perma-stuck — so the defect SHALL be caught before any executor or verifier-gate run is spent on it.
-
-The detection is mechanical AND precision-biased: a task is flagged when it pairs a mutation verb (apply, add, copy, write, edit, update, insert, append, paste, create, populate — case-insensitive) with a canonical-specs target (the path segment `openspec/specs/`, OR the words `canon` / `canonical spec`). A reference to the change's OWN delta — a path under `openspec/changes/<slug>/specs/`, or a `specs/<capability>/spec.md` qualified as belonging to this change — is NOT a canonical-specs target. A read-only mention of canon for context (no mutation verb) is NOT flagged.
-
-On a flagged task, autocoder SHALL write `.needs-spec-revision.json` whose `revision_suggestion` names the offending task(s) AND states that the implementer implements code and tests only — the spec delta is folded by `openspec archive`, so no task may apply it to `openspec/specs/`. It SHALL post the `AlertCategory::SpecNeedsRevision` chatops alert (subject to the existing 24h throttle) AND halt the queue walk for this iteration per the same-repo blocking policy. The executor SHALL NOT be invoked for this change, NOR SHALL the `[in]` / `[canon]` verifier gates run for it.
-
-#### Scenario: A task applying the delta to canon is flagged before the executor
-- **WHEN** a change's `tasks.md` contains a task such as `Apply the ADDED Requirements block from specs/<cap>/spec.md to openspec/specs/<cap>/spec.md`
-- **THEN** the pre-flight flags it (mutation verb `Apply` + canonical-specs target `openspec/specs/`)
-- **AND** autocoder writes `.needs-spec-revision.json` naming the offending task, posts the `SpecNeedsRevision` alert, AND halts
-- **AND** the executor is NOT invoked AND the `[in]` / `[canon]` gates do NOT run for this change
-
-#### Scenario: A read-only reference to canon is not flagged
-- **WHEN** a task references the canonical specs for context only (e.g. "ensure the change matches the existing `<cap>` contract") with no mutation verb directing a write to `openspec/specs/`
-- **THEN** the pre-flight does NOT flag it
-- **AND** the change proceeds normally to the executor
-
-#### Scenario: A reference to the change's own delta is not flagged
-- **WHEN** a task references the change's own delta — a path under `openspec/changes/<slug>/specs/`, or `specs/<cap>/spec.md` qualified as belonging to this change
-- **THEN** the pre-flight does NOT treat it as a canonical-specs target
-- **AND** the change proceeds normally
-
-#### Scenario: A clean change is unaffected
-- **WHEN** a change's `tasks.md` directs only code and test work
-- **THEN** the pre-flight finds nothing to flag
-- **AND** the change proceeds to the executor exactly as before
 
 ### Requirement: A successfully applied revision clears the change's needs-spec-revision marker
 When the revision dispatcher applies a revision to an open PR with the dirty-tree `Completed` outcome — a real change committed and force-pushed to the agent branch, per "Revision execution updates the agent branch and posts a reply comment" — the daemon SHALL clear that change's local `.needs-spec-revision.json` marker if it is present, AFTER the commit and `--force-with-lease` push succeed. This eliminates the operator toil of remembering `clear-revision` once a flagged spec has been revised: the open PR already parks the repository, so the marker's hold is redundant, and the marker is transient runtime state (gitignored, lost on re-clone) rather than the authoritative record — the gate or preflight that wrote it remains the source of truth.

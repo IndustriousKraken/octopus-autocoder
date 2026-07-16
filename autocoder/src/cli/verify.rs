@@ -502,8 +502,11 @@ async fn evaluate_gates(
 fn map_in(outcome: ContradictionCheckOutcome) -> GateResult {
     match outcome {
         ContradictionCheckOutcome::Clean => GateResult::Clean,
-        ContradictionCheckOutcome::Found(findings) => GateResult::Found(
-            findings
+        ContradictionCheckOutcome::Found {
+            contradictions,
+            canon_editing_tasks,
+        } => {
+            let mut items: Vec<String> = contradictions
                 .into_iter()
                 .map(|f| {
                     format!(
@@ -511,8 +514,14 @@ fn map_in(outcome: ContradictionCheckOutcome) -> GateResult {
                         f.requirement_a, f.requirement_b, f.summary
                     )
                 })
-                .collect(),
-        ),
+                .collect();
+            items.extend(
+                canon_editing_tasks
+                    .into_iter()
+                    .map(|t| format!("task directs a canon edit: {t}")),
+            );
+            GateResult::Found(items)
+        }
         ContradictionCheckOutcome::Errored { cause } => GateResult::CouldNotRun(cause),
     }
 }

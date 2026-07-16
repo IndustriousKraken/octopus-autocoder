@@ -671,17 +671,29 @@ impl ReGateRunner for GatesReGateRunner {
                 .await
             {
                 ContradictionCheckOutcome::Clean => {}
-                ContradictionCheckOutcome::Found(findings) => {
-                    summaries.push(format!(
-                        "[in] gate still finds {} change-internal contradiction(s): {}",
-                        findings.len(),
-                        findings
-                            .iter()
-                            .map(|f| f.summary.clone())
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    ));
-                    records.extend(findings.iter().map(ContradictionFindingRecord::from));
+                ContradictionCheckOutcome::Found {
+                    contradictions: findings,
+                    canon_editing_tasks,
+                } => {
+                    if !findings.is_empty() {
+                        summaries.push(format!(
+                            "[in] gate still finds {} change-internal contradiction(s): {}",
+                            findings.len(),
+                            findings
+                                .iter()
+                                .map(|f| f.summary.clone())
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        ));
+                        records.extend(findings.iter().map(ContradictionFindingRecord::from));
+                    }
+                    if !canon_editing_tasks.is_empty() {
+                        summaries.push(format!(
+                            "[in] gate still finds {} task(s) directing a canon edit: {}",
+                            canon_editing_tasks.len(),
+                            canon_editing_tasks.join("; ")
+                        ));
+                    }
                 }
                 ContradictionCheckOutcome::Errored { cause } => {
                     return ReGateOutcome::CouldNotRun(format!("[in] gate could not run: {cause}"));

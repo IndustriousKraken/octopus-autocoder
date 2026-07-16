@@ -84,89 +84,6 @@ fn build_unarchivable_revision_suggestion(
     out
 }
 
-/// Run the canon-editing-tasks pre-flight against `change`. A sibling of
-/// [`handle_archivability_preflight`] — same point in the pipeline, same
-/// marker, same halt semantics — but it scans `tasks.md` CONTENT for a task
-/// that directs a direct edit to the canonical specs (`openspec/specs/`).
-///
-/// The implementer implements code and tests only; a change's spec delta is
-/// folded into canon by `openspec archive`. A task that instead applies the
-/// delta to `openspec/specs/` makes the implementer pre-fold canon, after which
-/// `openspec archive` aborts on a duplicate requirement and the change goes
-/// perma-stuck — so the defect is caught here, before any executor or
-/// verifier-gate run is spent on it.
-///
-/// On a clean result: returns `Ok(None)` and the caller proceeds. On a flag:
-/// writes the `.needs-spec-revision.json` marker with `canon_editing_tasks`
-/// populated, posts the `AlertCategory::SpecNeedsRevision` chatops alert
-/// (24h-throttled), and returns `Ok(Some(QueueStep::SpecRevisionMarked))` so the
-/// caller short-circuits without invoking the executor OR the `[in]`/`[canon]`
-/// verifier gates.
-pub(crate) async fn handle_canon_editing_tasks_preflight(
-    paths: &DaemonPaths,
-    workspace: &Path,
-    repo: &RepositoryConfig,
-    chatops_ctx: Option<&ChatOpsContext>,
-    change: &str,
-) -> Result<Option<QueueStep>> {
-    let offending =
-        crate::preflight::canon_editing_tasks::check_tasks_edit_canon(workspace, change);
-    if offending.is_empty() {
-        return Ok(None);
-    }
-    let suggestion = build_canon_editing_revision_suggestion(change, &offending);
-    tracing::warn!(
-        url = %repo.url,
-        change = %change,
-        offending = offending.len(),
-        "canon-editing-tasks pre-flight FAILED; skipping executor and writing marker"
-    );
-    let detail = SpecNeedsRevisionDetail {
-        unimplementable_tasks: Vec::new(),
-        unarchivable_deltas: Vec::new(),
-        canon_editing_tasks: offending.clone(),
-        revision_suggestion: suggestion.clone(),
-        gate_error: None,
-        contradictions: Vec::new(),
-    };
-    if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
-        tracing::warn!(
-            url = %repo.url,
-            change = %change,
-            "failed to write spec-needs-revision marker (canon-editing pre-flight): {e:#}"
-        );
-    }
-    maybe_post_canon_editing_tasks_alert(paths, chatops_ctx, repo, change, &offending, &suggestion)
-        .await;
-    Ok(Some(QueueStep::SpecRevisionMarked))
-}
-
-/// Compose the `revision_suggestion` written into the marker when the
-/// canon-editing-tasks pre-flight flags a change. Names each offending task AND
-/// states the rule: the implementer implements code and tests only; the spec
-/// delta is folded into canon by `openspec archive`, so no task may apply it to
-/// `openspec/specs/`.
-fn build_canon_editing_revision_suggestion(change: &str, offending: &[String]) -> String {
-    let mut out = format!(
-        "Pre-flight found {} task{} directing an edit to the canonical specs:\n",
-        offending.len(),
-        if offending.len() == 1 { "" } else { "s" }
-    );
-    for task in offending {
-        out.push_str(&format!("- {task}\n"));
-    }
-    out.push_str(&format!(
-        "\nThe implementer implements CODE and TESTS only. A change's spec delta\n\
-         lives in openspec/changes/{change}/specs/<capability>/spec.md and is folded\n\
-         into the canonical openspec/specs/ by `openspec archive` automatically — a\n\
-         task must NOT apply it to openspec/specs/ (doing so makes archive abort on a\n\
-         duplicate requirement). Remove the offending task(s) from\n\
-         openspec/changes/{change}/tasks.md, push, AND clear this marker via\n\
-         @<bot> clear-revision <repo> <change> (or delete the marker file).\n"
-    ));
-    out
-}
-
 /// Run the change-internal contradiction pre-flight — the `[in]` gate — against
 /// `change`, returning the gate's [`GateVerdict`] (verifier-gates-fail-closed
 /// §5). The verdict is what the default-deny ledger records:
@@ -221,20 +138,40 @@ pub(crate) async fn handle_contradiction_preflight(
             .await?;
             return Ok(GateVerdict::FailedToRun);
         }
-        ContradictionCheckOutcome::Found(findings) => findings,
+        ContradictionCheckOutcome::Found {
+            contradictions,
+            canon_editing_tasks,
+        } => (contradictions, canon_editing_tasks),
     };
-    let suggestion = build_contradiction_revision_suggestion(&findings);
+    let (findings, canon_editing_tasks) = findings;
+    // The two finding kinds each render their own section into the marker's
+    // `revision_suggestion`; either may be empty (the gate returns `Found` when
+    // at least one is non-empty).
+    let mut suggestion = String::new();
+    if !findings.is_empty() {
+        suggestion.push_str(&build_contradiction_revision_suggestion(&findings));
+    }
+    if !canon_editing_tasks.is_empty() {
+        if !suggestion.is_empty() {
+            suggestion.push('\n');
+        }
+        suggestion.push_str(&build_canon_editing_tasks_revision_suggestion(&canon_editing_tasks));
+    }
     // a61: this is the `[in]` verifier gate; its diagnostics carry the label.
     let label = crate::verifier_gate::VerifierGate::In.label();
     tracing::warn!(
         url = %repo.url,
         change = %change,
         findings = findings.len(),
+        canon_editing_tasks = canon_editing_tasks.len(),
         "{label} change-contradiction pre-flight FAILED; skipping executor and writing marker"
     );
     let detail = SpecNeedsRevisionDetail {
         unimplementable_tasks: Vec::new(),
         unarchivable_deltas: Vec::new(),
+        // The canon-editing-task findings render into `revision_suggestion`
+        // (the marker's structured `canon_editing_tasks` population lost its
+        // producer when the mechanical scan was removed).
         canon_editing_tasks: Vec::new(),
         revision_suggestion: suggestion.clone(),
         gate_error: None,
@@ -253,17 +190,59 @@ pub(crate) async fn handle_contradiction_preflight(
             "{label} failed to write spec-needs-revision marker (contradiction pre-flight): {e:#}"
         );
     }
-    maybe_post_contradiction_findings_alert(
-        paths,
-        chatops_ctx,
-        repo,
-        change,
-        &findings,
-        &suggestion,
-        cc_ctx.attribution.as_deref(),
-    )
-    .await;
+    if !findings.is_empty() {
+        // Contradictions present: the tracked revision thread `send it` can act
+        // on (canon-editing tasks, if any, ride along in `revision_suggestion`).
+        maybe_post_contradiction_findings_alert(
+            paths,
+            chatops_ctx,
+            repo,
+            change,
+            &findings,
+            &suggestion,
+            cc_ctx.attribution.as_deref(),
+        )
+        .await;
+    } else {
+        // Canon-editing-task findings only: an untracked reject — a tasks.md
+        // fix, NOT a `send it`-revisable spec contradiction.
+        maybe_post_canon_editing_tasks_alert(
+            paths,
+            chatops_ctx,
+            repo,
+            change,
+            &canon_editing_tasks,
+            &suggestion,
+        )
+        .await;
+    }
     Ok(GateVerdict::Fail)
+}
+
+/// Compose the `revision_suggestion` section for canon-editing-task findings
+/// surfaced by the `[in]` gate (the semantic successor of the removed
+/// mechanical `tasks.md` scan). Names each offending task AND states the rule:
+/// the implementer implements code and tests only; a change's spec delta is
+/// folded into the canonical `openspec/specs/` by `openspec archive`, so no task
+/// may direct an edit to canon (doing so aborts the archive on a duplicate
+/// requirement).
+pub(crate) fn build_canon_editing_tasks_revision_suggestion(tasks: &[String]) -> String {
+    let n = tasks.len();
+    let mut out = format!(
+        "The [in] gate found {n} task(s) directing an edit to the canonical specs \
+         (openspec/specs/):\n\n"
+    );
+    for (i, task) in tasks.iter().enumerate() {
+        out.push_str(&format!("{idx}. {task}\n", idx = i + 1));
+    }
+    out.push_str(
+        "\nThe implementer implements CODE and TESTS only. A change's spec delta is folded into \
+         the canonical openspec/specs/ by `openspec archive` automatically — a task must NOT \
+         direct an edit to openspec/specs/ (doing so makes the archive abort on a duplicate \
+         requirement). Remove the offending task(s) from tasks.md, push the change, AND clear \
+         this marker via @<bot> clear-revision <repo> <change> (or delete the marker file).\n",
+    );
+    out
 }
 
 /// Compose the auto-generated `revision_suggestion` text written into

@@ -1159,7 +1159,7 @@ fn submit_review_tool() -> serde_json::Value {
 fn submit_contradictions_tool() -> serde_json::Value {
     serde_json::json!({
         "name": "submit_contradictions",
-        "description": "Return the change-internal contradictions you found to the daemon as this check's result. Call exactly once when your analysis is complete, passing a `contradictions` array (an empty array means \"no contradictions found\"). Report EVERY distinct contradiction in this one call — do not stop after the first. Each entry names the two conflicting requirements, a one-line `summary` of why they cannot both hold, AND a `suggested_fix` — a concrete edit plan (which requirement(s) to add/modify/rename/remove, with a sketch of the resulting text) distinct from the summary. The daemon validates the payload; a schema violation comes back as a correctable tool error you can fix AND resubmit in the same session.",
+        "description": "Return the change-internal contradictions AND any canon-editing tasks you found to the daemon as this check's result. Call exactly once when your analysis is complete, passing a `contradictions` array (an empty array means \"no contradictions found\") AND, optionally, a `canon_editing_tasks` array. Report EVERY distinct contradiction in this one call — do not stop after the first. Each contradiction entry names the two conflicting requirements, a one-line `summary` of why they cannot both hold, AND a `suggested_fix` — a concrete edit plan (which requirement(s) to add/modify/rename/remove, with a sketch of the resulting text) distinct from the summary. `canon_editing_tasks` holds the text of any task in `tasks.md` whose EDIT TARGET is the canonical specs (`openspec/specs/`) — the implementer implements code and tests only, so such a task would make `openspec archive` abort on a duplicate requirement; a task that merely MENTIONS the canonical specs as context, or references the change's OWN delta under openspec/changes/<slug>/specs/, is NOT reported. The daemon validates the payload; a schema violation comes back as a correctable tool error you can fix AND resubmit in the same session.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1175,6 +1175,11 @@ fn submit_contradictions_tool() -> serde_json::Value {
                         },
                         "required": ["requirement_a", "requirement_b", "summary"]
                     }
+                },
+                "canon_editing_tasks": {
+                    "type": "array",
+                    "description": "Text of each task that directs an edit to the canonical specs (openspec/specs/). Optional; omit or leave empty when none.",
+                    "items": { "type": "string" }
                 }
             },
             "required": ["contradictions"]
