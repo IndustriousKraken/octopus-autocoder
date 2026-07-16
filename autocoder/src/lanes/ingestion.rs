@@ -804,10 +804,13 @@ fn render_single_file_body(issue_md: &str, tasks_md: &str) -> String {
     )
 }
 
-/// Promote a posted candidate, writing the form appropriate to its origin
-/// AND marking the state `Promoted`. Writing the unit IS the queue —
-/// [`crate::lanes::walker`] picks it up. This is the "send it" half of the
-/// audit send-it pattern.
+/// Write a candidate's issue unit to the workspace in the form appropriate
+/// to its origin, returning the written path. This is the unit-writing core
+/// shared by [`promote_candidate`] (the initial "send it") AND
+/// [`reconcile_promoted_units`] (re-materialization after a workspace-
+/// cleaning path destroyed the loose files), so a resurrected unit is
+/// byte-identical to the original promotion — same form decision, same file
+/// contents.
 ///
 /// A CURATED (maintainer-origin) candidate carries no untrusted body, so it
 /// is written as the default SINGLE FILE `issues/<slug>.md` (description +
@@ -815,6 +818,43 @@ fn render_single_file_body(issue_md: &str, tasks_md: &str) -> String {
 /// SHALL be written as the DIRECTORY form `issues/<slug>/` with the body
 /// quarantined in a separate `report-body.md` — never a single file —
 /// preserving the a010 quarantine boundary.
+///
+/// This does NOT decide whether writing is appropriate (the pre-existence
+/// check is promotion's concern) NOR flip the candidate's status; callers
+/// own that.
+fn write_issue_unit(workspace: &Path, state: &CandidateState) -> Result<PathBuf> {
+    if state.origin.is_public() {
+        // Public-origin: directory form with the quarantined body separate.
+        let dir = issues::issue_dir(workspace, &state.slug);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating issue dir {}", dir.display()))?;
+        std::fs::write(dir.join("issue.md"), &state.issue_md)
+            .with_context(|| format!("writing {}/issue.md", dir.display()))?;
+        std::fs::write(dir.join("tasks.md"), &state.tasks_md)
+            .with_context(|| format!("writing {}/tasks.md", dir.display()))?;
+        std::fs::write(dir.join(issues::REPORT_BODY_FILE), &state.report_body)
+            .with_context(|| format!("writing {}/{}", dir.display(), issues::REPORT_BODY_FILE))?;
+        Ok(dir)
+    } else {
+        // Curated: single-file form (description + `## Tasks`).
+        let file = issues::issue_file(workspace, &state.slug);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating issues dir {}", parent.display()))?;
+        }
+        let body = render_single_file_body(&state.issue_md, &state.tasks_md);
+        std::fs::write(&file, body).with_context(|| format!("writing {}", file.display()))?;
+        Ok(file)
+    }
+}
+
+/// Promote a posted candidate, writing the form appropriate to its origin
+/// AND marking the state `Promoted`. Writing the unit IS the queue —
+/// [`crate::lanes::walker`] picks it up. This is the "send it" half of the
+/// audit send-it pattern.
+///
+/// The unit itself is written by [`write_issue_unit`], shared with
+/// reconciliation so a resurrected unit is byte-identical to this promotion.
 ///
 /// Reached from the chatops "send it" promotion control-socket handler
 /// ([`crate::control_socket`]'s `promote_issue_candidate` action).
@@ -832,35 +872,81 @@ pub fn promote_candidate(
         ));
     }
 
-    let written = if state.origin.is_public() {
-        // Public-origin: directory form with the quarantined body separate.
-        let dir = issues::issue_dir(workspace, &state.slug);
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("creating issue dir {}", dir.display()))?;
-        std::fs::write(dir.join("issue.md"), &state.issue_md)
-            .with_context(|| format!("writing {}/issue.md", dir.display()))?;
-        std::fs::write(dir.join("tasks.md"), &state.tasks_md)
-            .with_context(|| format!("writing {}/tasks.md", dir.display()))?;
-        std::fs::write(dir.join(issues::REPORT_BODY_FILE), &state.report_body)
-            .with_context(|| format!("writing {}/{}", dir.display(), issues::REPORT_BODY_FILE))?;
-        dir
-    } else {
-        // Curated: single-file form (description + `## Tasks`).
-        let file = issues::issue_file(workspace, &state.slug);
-        if let Some(parent) = file.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating issues dir {}", parent.display()))?;
-        }
-        let body = render_single_file_body(&state.issue_md, &state.tasks_md);
-        std::fs::write(&file, body)
-            .with_context(|| format!("writing {}", file.display()))?;
-        file
-    };
+    let written = write_issue_unit(workspace, state)?;
 
     let mut promoted = state.clone();
     promoted.status = CandidateStatus::Promoted;
     write_candidate(state_root, &promoted)?;
     Ok(written)
+}
+
+/// Reconcile promoted candidates against the workspace: the promoted record
+/// is the durable queue entry, the workspace unit only its materialization.
+/// Any workspace-cleaning path (dirty-tree recovery, workspace wipe,
+/// re-clone, another feature's failure cleanup) can destroy the loose
+/// untracked unit before the issues lane picks it up; this re-writes it from
+/// the record so a destroyed unit costs one iteration, not the issue.
+///
+/// For every stored candidate of `repo_url` with status `Promoted` whose
+/// slug is absent from `issues/` (in either form) AND from `issues/archive/`
+/// (an archived entry means the fix already landed — never resurrect), the
+/// unit is re-materialized via [`write_issue_unit`] (byte-identical to the
+/// original promotion) with a WARN naming the slug. Deleting the candidate
+/// record file is the operator's tombstone: no record → no resurrection.
+///
+/// Best-effort AND side-effect only — a per-record failure is logged AND
+/// skipped; the surrounding pass is never aborted. Runs once per polling
+/// iteration BEFORE issues-lane enumeration.
+pub fn reconcile_promoted_units(workspace: &Path, state_root: &Path, repo_url: &str) {
+    let dir = candidates_dir(state_root);
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        // No candidate store yet → nothing promoted, nothing to reconcile.
+        Err(_) => return,
+    };
+    // One workspace scan up front: existing open (either form) AND archived
+    // slugs. A promoted slug present in either is not re-materialized.
+    let (open, archived) = existing_issue_slugs(workspace);
+    for entry in rd.flatten() {
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        // Only `<id>.json` candidate records parse as `CandidateState`; the
+        // sibling `<id>.disposition.json` markers do not, so they are skipped
+        // by the parse guard (mirrors `find_candidate_by_thread`).
+        let state = match std::fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|raw| serde_json::from_str::<CandidateState>(&raw).ok())
+        {
+            Some(s) => s,
+            None => continue,
+        };
+        if state.status != CandidateStatus::Promoted || state.repo_url != repo_url {
+            continue;
+        }
+        // Present (in-flight or freshly promoted) OR archived (fix landed) →
+        // leave it be.
+        if open.iter().any(|s| *s == state.slug) || archived.iter().any(|s| *s == state.slug) {
+            continue;
+        }
+        match write_issue_unit(workspace, &state) {
+            Ok(_) => tracing::warn!(
+                repo_url = %repo_url,
+                slug = %state.slug,
+                "issue reconciliation: promoted unit `{}` had disappeared from the workspace \
+                 (something cleaned it between promotion and pickup); re-materialized from the \
+                 candidate record",
+                state.slug
+            ),
+            Err(e) => tracing::warn!(
+                repo_url = %repo_url,
+                slug = %state.slug,
+                "issue reconciliation: re-materializing promoted unit `{}` failed; \
+                 will retry next iteration: {e:#}",
+                state.slug
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2036,5 +2122,177 @@ mod tests {
         std::fs::write(disposition_path(&paths.state, &corrupt), "not json").unwrap();
         assert!(already_dispositioned(&paths.state, &corrupt));
         assert!(read_disposition(&paths.state, &corrupt).is_err());
+    }
+
+    // ----- reconciliation: promoted units survive workspace cleaning -----
+
+    /// Write a `Promoted` candidate record (no workspace unit) with a distinct
+    /// id, returning the stored state. Distinct ids matter: the record file is
+    /// keyed by id, so same-id records would overwrite one another.
+    fn promoted_record(state_root: &Path, id: &str, slug: &str, origin: IssueOrigin) -> CandidateState {
+        let mut s = candidate_state(slug, origin);
+        s.id = id.to_string();
+        s.status = CandidateStatus::Promoted;
+        write_candidate(state_root, &s).unwrap();
+        s
+    }
+
+    /// 3.1: a promoted record whose unit is absent from BOTH `issues/` and
+    /// `issues/archive/` is re-materialized byte-identically, in its original
+    /// form — the curated single-file variant AND the public-origin directory
+    /// variant (including the quarantined `report-body.md`).
+    #[test]
+    fn reconcile_rematerializes_missing_units_byte_identical() {
+        let td = TempDir::new().unwrap();
+        let ws = td.path();
+        let (_sd, paths) = crate::testing::test_daemon_paths();
+
+        let mut curated = candidate_state("fix-curated", IssueOrigin::Maintainer);
+        curated.id = "o-r-curated".to_string();
+        let mut public = candidate_state("fix-public", IssueOrigin::Public);
+        public.id = "o-r-public".to_string();
+
+        // Promote both (writes the unit + flips status), capturing originals.
+        let curated_path = promote_candidate(ws, &paths.state, &curated).unwrap();
+        let public_dir = promote_candidate(ws, &paths.state, &public).unwrap();
+        let curated_bytes = std::fs::read(&curated_path).unwrap();
+        let public_issue = std::fs::read(public_dir.join("issue.md")).unwrap();
+        let public_tasks = std::fs::read(public_dir.join("tasks.md")).unwrap();
+        let public_body = std::fs::read(public_dir.join(issues::REPORT_BODY_FILE)).unwrap();
+
+        // Simulate a workspace-cleaning path removing the untracked units.
+        std::fs::remove_file(&curated_path).unwrap();
+        std::fs::remove_dir_all(&public_dir).unwrap();
+        assert!(issues::resolve_form(ws, "fix-curated").is_none());
+        assert!(issues::resolve_form(ws, "fix-public").is_none());
+
+        reconcile_promoted_units(ws, &paths.state, &curated.repo_url);
+
+        // Curated → single file, byte-identical.
+        assert_eq!(
+            issues::resolve_form(ws, "fix-curated"),
+            Some(issues::IssueForm::SingleFile)
+        );
+        assert_eq!(std::fs::read(&curated_path).unwrap(), curated_bytes);
+        // Public → directory with the quarantined body, all byte-identical.
+        assert_eq!(
+            issues::resolve_form(ws, "fix-public"),
+            Some(issues::IssueForm::Directory)
+        );
+        assert_eq!(std::fs::read(public_dir.join("issue.md")).unwrap(), public_issue);
+        assert_eq!(std::fs::read(public_dir.join("tasks.md")).unwrap(), public_tasks);
+        assert_eq!(
+            std::fs::read(public_dir.join(issues::REPORT_BODY_FILE)).unwrap(),
+            public_body
+        );
+    }
+
+    /// 3.2: a record whose unit is present in `issues/` is left untouched; a
+    /// record whose slug matches an `issues/archive/<date>-<slug>` (or `.md`)
+    /// entry is not re-materialized; a record for a DIFFERENT repo is skipped.
+    #[test]
+    fn reconcile_skips_present_archived_and_other_repo() {
+        let td = TempDir::new().unwrap();
+        let ws = td.path();
+        let (_sd, paths) = crate::testing::test_daemon_paths();
+        let repo_url = "https://github.com/o/r".to_string();
+
+        // Present in issues/ → NOT overwritten. Seed a sentinel on disk that
+        // differs from the record; reconcile must leave the sentinel intact.
+        let present = promoted_record(&paths.state, "o-r-present", "present-unit", IssueOrigin::Maintainer);
+        assert_eq!(present.repo_url, repo_url);
+        std::fs::create_dir_all(issues::issues_dir(ws)).unwrap();
+        std::fs::write(issues::issue_file(ws, "present-unit"), "SENTINEL not overwritten").unwrap();
+
+        // Archived directory form → not re-materialized.
+        promoted_record(&paths.state, "o-r-arch-dir", "archived-dir", IssueOrigin::Public);
+        std::fs::create_dir_all(issues::archive_root(ws).join("2026-06-06-archived-dir")).unwrap();
+        // Archived single-file (`.md`) form → not re-materialized.
+        promoted_record(&paths.state, "o-r-arch-md", "archived-md", IssueOrigin::Maintainer);
+        std::fs::write(
+            issues::archive_root(ws).join("2026-06-06-archived-md.md"),
+            "archived body\n",
+        )
+        .unwrap();
+
+        // A promoted record for a DIFFERENT repo → not materialized here.
+        let mut other = candidate_state("other-repo-unit", IssueOrigin::Maintainer);
+        other.id = "x-y-other".to_string();
+        other.repo_url = "https://github.com/x/y".to_string();
+        other.status = CandidateStatus::Promoted;
+        write_candidate(&paths.state, &other).unwrap();
+
+        reconcile_promoted_units(ws, &paths.state, &repo_url);
+
+        assert_eq!(
+            std::fs::read_to_string(issues::issue_file(ws, "present-unit")).unwrap(),
+            "SENTINEL not overwritten"
+        );
+        assert!(issues::resolve_form(ws, "archived-dir").is_none());
+        assert!(issues::resolve_form(ws, "archived-md").is_none());
+        assert!(issues::resolve_form(ws, "other-repo-unit").is_none());
+    }
+
+    /// 3.3: deleting the candidate record file is the operator's tombstone —
+    /// a promoted issue whose record is gone is never re-materialized.
+    #[test]
+    fn reconcile_respects_deleted_record_tombstone() {
+        let td = TempDir::new().unwrap();
+        let ws = td.path();
+        let (_sd, paths) = crate::testing::test_daemon_paths();
+
+        let mut state = candidate_state("retired", IssueOrigin::Maintainer);
+        state.id = "o-r-retired".to_string();
+        let path = promote_candidate(ws, &paths.state, &state).unwrap();
+
+        // Operator retires the issue: remove BOTH the unit AND the record.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(candidate_path(&paths.state, &state.id)).unwrap();
+
+        reconcile_promoted_units(ws, &paths.state, &state.repo_url);
+        assert!(issues::resolve_form(ws, "retired").is_none());
+    }
+
+    /// 3.4 (regression for the observed failure shape): promote, simulate a
+    /// `git clean`-style deletion of the untracked unit, reconcile, and assert
+    /// the unit is back AND `list_ready` includes it again.
+    #[tokio::test]
+    async fn promoted_unit_survives_git_clean_style_deletion() {
+        let td = TempDir::new().unwrap();
+        let ws = td.path();
+        let (_sd, paths) = crate::testing::test_daemon_paths();
+        // Drive the real path: triage → post → promote a public candidate.
+        let r = report(5, "Drop newline", "raw reporter body {{x}}", Some("NONE"));
+        let v = bug_verdict("drop-newline");
+        act_on_verdict(ws, &paths.state, None, &repo_cfg().url, &r, &v, &maintainers()).await;
+        let id = candidate_id(&repo_cfg().url, 5);
+        let state = read_candidate(&paths.state, &id).unwrap().unwrap();
+        let dir = promote_candidate(ws, &paths.state, &state).unwrap();
+        assert_eq!(issues::list_ready(ws).unwrap(), vec!["drop-newline".to_string()]);
+
+        // `git clean` removes the untracked unit before the lane works it.
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(issues::list_ready(ws).unwrap().is_empty(), "unit gone after clean");
+
+        // The next iteration's reconciliation heals it; the lane sees it.
+        reconcile_promoted_units(ws, &paths.state, &repo_cfg().url);
+        assert!(dir.is_dir(), "unit re-materialized");
+        assert_eq!(issues::list_ready(ws).unwrap(), vec!["drop-newline".to_string()]);
+    }
+
+    /// A still-`Posted` (unpromoted) record is never materialized — only
+    /// `Promoted` records are the durable queue entry.
+    #[test]
+    fn reconcile_ignores_posted_records() {
+        let td = TempDir::new().unwrap();
+        let ws = td.path();
+        let (_sd, paths) = crate::testing::test_daemon_paths();
+        // A Posted (not Promoted) record on disk.
+        let posted = candidate_state("still-posted", IssueOrigin::Public);
+        write_candidate(&paths.state, &posted).unwrap();
+        assert_eq!(posted.status, CandidateStatus::Posted);
+
+        reconcile_promoted_units(ws, &paths.state, &posted.repo_url);
+        assert!(issues::resolve_form(ws, "still-posted").is_none());
     }
 }

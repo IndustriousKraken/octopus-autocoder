@@ -228,6 +228,15 @@ async fn run_issues_lane(
     let Some(ctx) = crate::lanes::gate::current() else {
         return Vec::new();
     };
+    // Reconcile promoted-but-vanished units BEFORE enumeration
+    // (promoted-issues-survive-workspace-cleaning): a promoted candidate's
+    // stored record is the durable queue entry; the workspace unit is a
+    // materialized copy any workspace-cleaning path can destroy in the window
+    // before the lane picks it up. Re-write any missing unit from its record
+    // so a destroyed unit costs one iteration, not the issue. Gated with the
+    // lane itself (this site is unreachable when `features.issues` is off);
+    // best-effort and side-effect only — never aborts the pass.
+    crate::lanes::ingestion::reconcile_promoted_units(workspace, &paths.state, &repo.url);
     // The stale-lock recovery threshold reuses the busy-marker value, carried
     // on the lane context (bound at task spawn from the same startup config as
     // the busy-marker threshold, so it is exactly as fresh).
