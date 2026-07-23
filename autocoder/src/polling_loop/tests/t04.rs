@@ -313,14 +313,14 @@ async fn iteration_error_continues() {
         octopus_guide: None,
         sandbox: None,
     };
-    let github = GithubConfig {
-        token_env: "DOES_NOT_EXIST".into(),
-        token: None,
-        owner_tokens: None,
-        fork_owner: None,
-        recreate_fork_on_reinit: false,
-        command_authorization: Default::default(),
-    };
+    // Inline token + an empty open-PR gate so the fail-closed pre-check
+    // returns `None` (proceed) each iteration, letting the executor run.
+    // Serialize on the process-wide api-base override for the loop's lifetime.
+    let github = open_pr_gate_ok_github();
+    let _hook = test_hooks::lock();
+    let mut gate_server = mockito::Server::new_async().await;
+    let _gate_mock = mock_open_pr_gate_empty(&mut gate_server).await;
+    test_hooks::set_github_api_base(Some(gate_server.url()));
     let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
     let github_holder: GithubHolder = Arc::new(arc_swap::ArcSwap::from_pointee(github));
@@ -395,6 +395,7 @@ async fn iteration_error_continues() {
     let _ = tokio::time::timeout(Duration::from_secs(2), handle)
         .await
         .expect("loop should exit within 2s of cancel");
+    test_hooks::set_github_api_base(None);
 
     let count = executor.count.load(std::sync::atomic::Ordering::SeqCst);
     assert!(

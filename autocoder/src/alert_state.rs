@@ -53,6 +53,15 @@ pub enum AlertCategory {
     /// can resolve the structural condition (typically: remove the
     /// active dir or revert the prior merge).
     ArchiveCollision,
+    /// The fail-closed open-PR gate could not deliver an answer (transport
+    /// error, non-2xx, unparseable repo URL, or token-resolution failure)
+    /// on three consecutive iterations for a repository. Each failing pass
+    /// is skipped (never proceeds on an unconfirmed query) and logs a WARN;
+    /// on the third consecutive skip a throttled alert fires under this
+    /// category so a repo silently idling behind a broken query is
+    /// operator-visible. The in-memory consecutive-failure counter resets on
+    /// any successful query.
+    OpenPrGateFailure,
 }
 
 impl AlertCategory {
@@ -67,6 +76,7 @@ impl AlertCategory {
             Self::AuditWritePolicyViolation => "audit attempted disallowed write",
             Self::SpecNeedsRevision => "spec needs revision",
             Self::ArchiveCollision => "archive collision",
+            Self::OpenPrGateFailure => "open-PR gate query keeps failing",
         }
     }
 }

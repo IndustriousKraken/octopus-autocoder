@@ -571,6 +571,7 @@ pub(crate) async fn run_iteration_work(
     audit_registry: &AuditRegistry,
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,
+    open_pr_gate_failures: &mut u32,
 ) {
     if want_rebuild {
         if let Err(error) = execute_rebuild_iteration(
@@ -606,6 +607,7 @@ pub(crate) async fn run_iteration_work(
         audits_cfg,
         audit_settings,
         queued_audit_types,
+        open_pr_gate_failures,
     )
     .await
     {

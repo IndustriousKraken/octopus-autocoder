@@ -50,21 +50,19 @@ async fn failure_alert_cleared_on_subsequent_success() {
         failure_alerts_enabled: true,
         pr_opened_enabled: true,
     };
-    let github = GithubConfig {
-        token_env: "X".into(),
-        token: None,
-        owner_tokens: None,
-        fork_owner: None,
-        recreate_fork_on_reinit: false,
-        command_authorization: Default::default(),
-    };
+    let github = open_pr_gate_ok_github();
     let stuck_secs = 2400u64;
+
+    // Fail-closed open-PR gate: answer the pre-check with an empty list (served
+    // by the same mockito server as chatops) so iteration 1 proceeds to push.
+    let _gate_mock = mock_open_pr_gate_empty(&mut server).await;
 
     // Serialize on the github-api-base test hook: `execute_one_pass` reads the
     // process-wide override via its open-PR pre-check, so this test must not run
     // while another test has the override installed (else the pre-check request
     // would land on that test's mockito server). See `test_hooks::lock`.
     let _hook = test_hooks::lock();
+    test_hooks::set_github_api_base(Some(server.url()));
 
     // Iteration 1: push fails → alert #1 fires AND state is saved.
     let _ = execute_one_pass(
@@ -84,6 +82,7 @@ async fn failure_alert_cleared_on_subsequent_success() {
         None,
         &std::collections::HashMap::new(),
         &std::sync::Mutex::new(Vec::new()),
+        &mut 0u32,
     )
     .await;
     let basename = ws.file_name().unwrap().to_string_lossy().into_owned();
@@ -118,6 +117,7 @@ async fn failure_alert_cleared_on_subsequent_success() {
     )
     .await;
 
+    test_hooks::set_github_api_base(None);
     alert_mock.assert_async().await;
 }
 

@@ -171,6 +171,7 @@ async fn audit_only_pr_suppressed_mixed_audit_and_iteration_wip() {
         None,
         &std::collections::HashMap::new(),
         &queued,
+        &mut 0u32,
     )
     .await;
     test_hooks::set_github_api_base(None);

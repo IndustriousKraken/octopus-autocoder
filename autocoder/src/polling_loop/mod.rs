@@ -435,6 +435,13 @@ pub async fn run_with_hooks(
         changelog_requests: pending_changelog_requests.clone(),
     };
 
+    // Per-repo count of CONSECUTIVE open-PR-gate query failures
+    // (open-pr-gate-fails-closed §2). In-memory in this polling task's state —
+    // a restart resetting it merely delays the sustained-failure alert, which
+    // is not worth a state file. Reset on any successful query; the third
+    // consecutive failure raises the throttled operator alert.
+    let mut open_pr_gate_failures: u32 = 0;
+
     loop {
         if cancel.is_cancelled() {
             break;
@@ -547,6 +554,7 @@ pub async fn run_with_hooks(
                 audit_registry.as_ref(),
                 audits_cfg.as_deref(),
                 audit_settings.as_ref(),
+                &mut open_pr_gate_failures,
             ),
         )
         .await;

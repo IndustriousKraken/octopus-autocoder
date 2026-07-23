@@ -378,12 +378,37 @@ fn record_original_review_head_sha(
     }
 }
 
-/// Return `true` if any open PR exists on GitHub for the configured agent
-/// branch, in which case the caller should skip this iteration. On any
-/// failure to perform the check (parse, token, transport, non-2xx) this
-/// logs a WARN and returns `false` so a transient GitHub problem does not
-/// block normal iterations — the cost of a redundant Claude run is lower
-/// than the cost of an entire repo grinding to a halt on a flaky API.
+/// After this many consecutive query-failure (`Unknown`) skips for a
+/// repository, the daemon raises the throttled operator alert. Three
+/// consecutive failures (~30+ minutes at default cadence) separates a
+/// transient blip from a sustained outage without new configuration.
+pub(crate) const OPEN_PR_GATE_FAILURE_ALERT_THRESHOLD: u32 = 3;
+
+/// Three-way outcome of the open-PR gate query. The gate fails CLOSED:
+/// `Open` and `Unknown` both skip the iteration; only a confirmed empty list
+/// (`None`) proceeds. Collapsing `Unknown` into either boolean is the fail-open
+/// bug this change removes (open-pr-gate-fails-closed).
+#[derive(Debug, Clone)]
+pub(crate) enum OpenPrGateOutcome {
+    /// One or more open PRs exist for the agent branch → skip the iteration.
+    Open,
+    /// The query confirmed no open PR exists → proceed with the iteration.
+    None,
+    /// The query could not deliver an answer (unparseable repo URL,
+    /// token-resolution failure, transport error, or non-2xx). Skip the
+    /// iteration exactly as if an open PR existed, because "cannot confirm no
+    /// open PR" risks precisely the harms the gate exists to prevent. Carries
+    /// a short cause description for the sustained-failure operator alert; the
+    /// per-arm WARN is logged where the failure is detected.
+    Unknown(String),
+}
+
+/// Query GitHub for an open PR on the configured agent branch and classify the
+/// result three-way. On any failure to perform the check (parse, token,
+/// transport, non-2xx) this logs a WARN and returns [`OpenPrGateOutcome::Unknown`]
+/// so the caller fails CLOSED — a redundant Claude run, a force-push over a
+/// reviewer's in-flight PR, and the 422 "PR already exists" loop are all worse
+/// than parking one polling pass on an unconfirmed answer.
 ///
 /// `api_base` is `github::DEFAULT_API_BASE` in production; tests pass a
 /// mockito server URL instead.
@@ -392,15 +417,15 @@ pub(crate) async fn open_pr_exists_for_agent_branch_at(
     api_base: &str,
     repo: &RepositoryConfig,
     github_cfg: &GithubConfig,
-) -> bool {
+) -> OpenPrGateOutcome {
     let (upstream_owner, upstream_repo) = match github::parse_repo_url(&repo.url) {
         Ok(pair) => pair,
         Err(e) => {
             tracing::warn!(
                 url = %repo.url,
-                "open-PR check skipped: cannot parse repo URL: {e:#}"
+                "open-PR check could not run: cannot parse repo URL: {e:#}; skipping iteration (fail closed)"
             );
-            return false;
+            return OpenPrGateOutcome::Unknown(format!("cannot parse repo URL: {e:#}"));
         }
     };
     // In fork-PR mode, the head qualifier is `<fork_owner>:<branch>`; in
@@ -414,9 +439,9 @@ pub(crate) async fn open_pr_exists_for_agent_branch_at(
         Err(e) => {
             tracing::warn!(
                 url = %repo.url,
-                "open-PR check skipped: token resolution failed: {e:#}"
+                "open-PR check could not run: token resolution failed: {e:#}; skipping iteration (fail closed)"
             );
-            return false;
+            return OpenPrGateOutcome::Unknown(format!("token resolution failed: {e:#}"));
         }
     };
 
@@ -443,15 +468,15 @@ pub(crate) async fn open_pr_exists_for_agent_branch_at(
                 prs = ?numbers,
                 "open PR exists for agent branch; skipping iteration"
             );
-            true
+            OpenPrGateOutcome::Open
         }
-        Ok(_) => false,
+        Ok(_) => OpenPrGateOutcome::None,
         Err(e) => {
             tracing::warn!(
                 url = %repo.url,
-                "open-PR check failed: {e:#}; proceeding with iteration"
+                "open-PR check failed: {e:#}; skipping iteration (fail closed)"
             );
-            false
+            OpenPrGateOutcome::Unknown(format!("{e:#}"))
         }
     }
 }
@@ -460,7 +485,7 @@ pub(crate) async fn open_pr_exists_for_agent_branch(
     paths: &DaemonPaths,
     repo: &RepositoryConfig,
     github_cfg: &GithubConfig,
-) -> bool {
+) -> OpenPrGateOutcome {
     #[cfg(test)]
     {
         if let Some(api_base) = test_hooks::github_api_base() {
@@ -468,6 +493,62 @@ pub(crate) async fn open_pr_exists_for_agent_branch(
         }
     }
     open_pr_exists_for_agent_branch_at(paths, github::DEFAULT_API_BASE, repo, github_cfg).await
+}
+
+/// Run the open-PR gate for one pass AND drive the per-repo consecutive-failure
+/// counter (open-pr-gate-fails-closed §2). Returns `true` only on a confirmed
+/// empty list (proceed); `false` on `Open` OR `Unknown` (skip, fail closed).
+///
+/// The `consecutive_failures` counter is the polling task's in-memory per-repo
+/// state (a restart resetting it merely delays the alert): any successful query
+/// (`Open` or `None`) resets it to `0`; each `Unknown` increments it, and the
+/// third consecutive `Unknown` posts the throttled operator alert naming the
+/// gate, the repository, AND the most recent error via the existing
+/// `handle_predictable_failure` throttle machinery. Subsequent consecutive
+/// failures do not re-alert until the 24h throttle window elapses (or a
+/// successful full pass clears the alert state).
+pub(crate) async fn open_pr_gate_decision(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    consecutive_failures: &mut u32,
+) -> bool {
+    match open_pr_exists_for_agent_branch(paths, repo, github_cfg).await {
+        // A successful query (either answer) resets the failure streak.
+        OpenPrGateOutcome::Open => {
+            *consecutive_failures = 0;
+            false
+        }
+        OpenPrGateOutcome::None => {
+            *consecutive_failures = 0;
+            true
+        }
+        OpenPrGateOutcome::Unknown(cause) => {
+            *consecutive_failures = consecutive_failures.saturating_add(1);
+            if *consecutive_failures >= OPEN_PR_GATE_FAILURE_ALERT_THRESHOLD {
+                // Sustained failure: raise the throttled operator alert so a
+                // repo silently idling behind a broken query is visible. The
+                // 24h per-(repo, category) throttle inside
+                // `handle_predictable_failure` suppresses re-alerts within the
+                // window; a successful full pass clears the alert state.
+                handle_predictable_failure(
+                    paths,
+                    workspace,
+                    &repo.url,
+                    chatops_ctx,
+                    chatops_ctx
+                        .map(|c| c.failure_alerts_enabled)
+                        .unwrap_or(false),
+                    AlertCategory::OpenPrGateFailure,
+                    &anyhow!("{cause}"),
+                )
+                .await;
+            }
+            false
+        }
+    }
 }
 
 /// Open the audit-triage / chat-triage spec PR. Mirrors the shape of
