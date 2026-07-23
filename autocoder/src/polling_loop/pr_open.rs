@@ -386,14 +386,14 @@ pub(crate) const OPEN_PR_GATE_FAILURE_ALERT_THRESHOLD: u32 = 3;
 
 /// Three-way outcome of the open-PR gate query. The gate fails CLOSED:
 /// `Open` and `Unknown` both skip the iteration; only a confirmed empty list
-/// (`None`) proceeds. Collapsing `Unknown` into either boolean is the fail-open
+/// (`NoPr`) proceeds. Collapsing `Unknown` into either boolean is the fail-open
 /// bug this change removes (open-pr-gate-fails-closed).
 #[derive(Debug, Clone)]
 pub(crate) enum OpenPrGateOutcome {
     /// One or more open PRs exist for the agent branch → skip the iteration.
     Open,
     /// The query confirmed no open PR exists → proceed with the iteration.
-    None,
+    NoPr,
     /// The query could not deliver an answer (unparseable repo URL,
     /// token-resolution failure, transport error, or non-2xx). Skip the
     /// iteration exactly as if an open PR existed, because "cannot confirm no
@@ -470,13 +470,13 @@ pub(crate) async fn open_pr_exists_for_agent_branch_at(
             );
             OpenPrGateOutcome::Open
         }
-        Ok(_) => OpenPrGateOutcome::None,
+        Ok(_) => OpenPrGateOutcome::NoPr,
         Err(e) => {
             tracing::warn!(
                 url = %repo.url,
                 "open-PR check failed: {e:#}; skipping iteration (fail closed)"
             );
-            OpenPrGateOutcome::Unknown(format!("{e:#}"))
+            OpenPrGateOutcome::Unknown(format!("open-PR query failed: {e:#}"))
         }
     }
 }
@@ -501,7 +501,7 @@ pub(crate) async fn open_pr_exists_for_agent_branch(
 ///
 /// The `consecutive_failures` counter is the polling task's in-memory per-repo
 /// state (a restart resetting it merely delays the alert): any successful query
-/// (`Open` or `None`) resets it to `0`; each `Unknown` increments it, and the
+/// (`Open` or `NoPr`) resets it to `0`; each `Unknown` increments it, and the
 /// third consecutive `Unknown` posts the throttled operator alert naming the
 /// gate, the repository, AND the most recent error via the existing
 /// `handle_predictable_failure` throttle machinery. Subsequent consecutive
@@ -521,7 +521,7 @@ pub(crate) async fn open_pr_gate_decision(
             *consecutive_failures = 0;
             false
         }
-        OpenPrGateOutcome::None => {
+        OpenPrGateOutcome::NoPr => {
             *consecutive_failures = 0;
             true
         }

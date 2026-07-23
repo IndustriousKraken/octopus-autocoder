@@ -272,8 +272,8 @@ async fn open_pr_check_returns_false_when_no_pr() {
     )
     .await;
     assert!(
-        matches!(result, OpenPrGateOutcome::None),
-        "empty list should report no PR (None → proceed), got {result:?}"
+        matches!(result, OpenPrGateOutcome::NoPr),
+        "empty list should report no PR (NoPr → proceed), got {result:?}"
     );
     mock.assert_async().await;
 }
@@ -327,8 +327,8 @@ async fn open_pr_check_uses_fork_owner_in_head_qualifier() {
     let result =
         open_pr_exists_for_agent_branch_at(&paths, &server.url(), &open_pr_test_repo(), &gh).await;
     assert!(
-        matches!(result, OpenPrGateOutcome::None),
-        "empty list should report no PR (None), got {result:?}"
+        matches!(result, OpenPrGateOutcome::NoPr),
+        "empty list should report no PR (NoPr), got {result:?}"
     );
     mock.assert_async().await;
 }
