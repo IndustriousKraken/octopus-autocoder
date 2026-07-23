@@ -141,3 +141,16 @@ A fork-setup failure for one repository SHALL NEVER prevent the daemon from star
 - **THEN** the daemon still starts AND stays up serving chatops, having
   emitted one chatops alert per failed repository
 - **AND** it does NOT exit non-zero
+
+### Requirement: Per-repository asynchronous polling loop — fork-pending exception
+
+Canonical requirement: "autocoder SHALL implement the per-repository polling task referenced in `orchestrator-architecture/specs/orchestrator-cli/spec.md` as a sleep-then-iterate cycle that runs the architecture's single-pass workflow on every iteration."
+
+A polling task in the fork-pending state SHALL run only the fork-setup re-attempt on each iteration, skipping the full single-pass workflow, until fork setup succeeds. The fork-setup re-attempt on each iteration SHALL re-run the full fork-setup sequence: probe the fork URL via `git ls-remote`, create via POST if missing, identity check, reachability poll. On a successful attempt the task SHALL log INFO and proceed as a normal polling task from that iteration on.
+
+#### Scenario: Normal iteration when fork-pending
+- **WHEN** a polling task is in the fork-pending state
+- **THEN** its iteration runs only the fork-setup re-attempt (probe → create-if-missing → identity check → reachability) — no workspace init, no stale-lock cleanup, no dirty-workspace refusal, no branch recreation, no queue walk, no push, no PR creation
+- **AND** on success, the task logs an INFO recovery notice and proceeds as a normal polling task from the next step onward
+- **AND** on transient failure, it logs a WARN and sleeps until the next iteration
+- **AND** on permanent failure (e.g. the upstream was renamed while pending), the task exits the polling set with a chatops alert naming the remedy hint, matching permanent-classified behavior for startup fork setup

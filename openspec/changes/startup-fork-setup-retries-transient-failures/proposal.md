@@ -18,6 +18,7 @@ A fork-setup failure at startup skips the repository for the process lifetime, w
 ### Modified Capabilities
 
 - `orchestrator-cli`: the "Startup verification of fork existence" requirement branches its failure handling on the existing transient/permanent classification instead of treating every failure as process-lifetime.
+- `orchestrator-cli`: the "Per-repository asynchronous polling loop" requirement gains a fork-pending exception — a polling task in the fork-pending state runs only the fork-setup re-attempt each iteration, skipping the full single-pass workflow, until forks are ready.
 
 ## Impact
 
