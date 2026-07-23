@@ -4984,7 +4984,7 @@ The embedding pipeline SHALL:
 - Build an `EmbedClient` from the provider config — an Ollama adapter calling `<base_url>/api/embed` for Ollama, OR an OpenAI-compatible adapter calling `<base_url>/embeddings` with `Authorization: Bearer <api_key>` for the openai_compatible path.
 - Glob `<workspace>/openspec/specs/<cap>/spec.md` files, chunk each per `chunk_strategy`, embed each chunk via the client, AND store `(chunk, embedding, source_path, capability, requirement_title)` tuples in an in-memory `CanonicalRagStore`.
 - Maintain a per-workspace store registry keyed by sanitized workspace basename. Multiple managed repos each have their own store; the stores are independent.
-- Persist NOTHING to disk. Daemon restart re-embeds from scratch on workspace-init.
+- Persist no STORE state to disk: the vector store AND its registry are in-memory only and rebuilt on workspace-init. The sole on-disk artifact is the embedding-vector cache defined by the "RAG re-embed cadence" requirement (`<cache_dir>/rag-embeddings/`), which caches provider responses so a rebuild avoids re-calling the provider for unchanged chunks — CACHE-category data, safe to delete at any time; its absence merely restores full-provider-cost rebuilds.
 
 Failure modes are fail-open: embedding-provider errors (network, auth, rate-limit) at init log WARN AND omit the workspace's store from the registry. Subsequent queries against the absent store return empty Vec with a structured error hint. The daemon does NOT gate iteration progress on RAG availability; the implementer's non-RAG fallback behavior remains correct.
 
@@ -5056,6 +5056,8 @@ The RAG pipeline SHALL re-embed canonical specs at two events ONLY:
 
 Detection of "archive touched canonical": after the archive commit lands, run `git diff --name-only HEAD~N HEAD -- openspec/specs/` where N is the number of newly-archived commits in this iteration. Each unique `<cap>` directory present in the diff is a capability whose store entries SHALL be rebuilt.
 
+**Disk-backed embedding cache.** Both embed events SHALL consult a per-workspace disk cache before calling the embedding provider: vectors keyed by a content hash over (provider, model, chunk text), stored at `<cache_dir>/rag-embeddings/<workspace-basename>.json` and written atomically (tempfile + rename). A chunk whose key is present loads its vector from the cache with NO provider call; a miss embeds via the provider and writes through. Each cache write SHALL retain only the keys present in the just-built corpus, so entries for deleted or edited chunks do not accumulate. The key's provider+model components mean a provider or model change misses the whole cache and re-embeds naturally — no explicit invalidation machinery. The cache is CACHE-category data: deleting the file (or the directory) is always safe and merely restores the pre-cache full-embed cost on the next event. An unreadable or corrupt cache file SHALL log a WARN, be treated as empty (full embed via the provider), and be overwritten by the subsequent write-through — cache trouble never fails a rebuild that the provider could serve.
+
 Re-embed failures are fail-open: a failed rebuild leaves the existing embeds in place AND logs a WARN. The store may be temporarily stale; the next archive that touches the same capability OR a daemon restart will refresh it.
 
 #### Scenario: Cold start embeds the full corpus
@@ -5091,11 +5093,28 @@ Re-embed failures are fail-open: a failed rebuild leaves the existing embeds in 
 - **AND** a WARN log records the failure naming the capabilities AND the error
 - **AND** queries continue to return chunks from the pre-rebuild embeds (stale-but-usable)
 
-#### Scenario: Daemon restart re-embeds from scratch
-- **WHEN** the daemon is stopped AND restarted later
-- **THEN** the in-memory store is empty at startup (no on-disk persistence)
-- **AND** workspace-init re-runs the full embedding pipeline for every configured workspace
-- **AND** the cost is `O(N capabilities × M chunks × embed-call-latency)` — typically sub-second on GPU, ~30 seconds on CPU for a typical corpus
+#### Scenario: Daemon restart rebuilds the store from the cache
+- **WHEN** the daemon is stopped AND restarted later AND the canonical corpus is unchanged since the cache was last written
+- **THEN** the in-memory store is empty at startup AND workspace-init rebuilds it
+- **AND** every chunk's vector loads from the disk cache with ZERO embedding-provider calls
+- **AND** the log records the rebuild naming the cache-hit count
+
+#### Scenario: An edited chunk misses the cache and is re-embedded
+- **WHEN** a canonical spec chunk's text changed since the cache was written (via archive-fold or rebuild)
+- **THEN** the changed chunk's key misses AND that chunk is embedded via the provider
+- **AND** unchanged chunks still load from the cache
+- **AND** the write-through after the build contains the new chunk's vector and drops the superseded key
+
+#### Scenario: A provider or model change invalidates the cache naturally
+- **WHEN** `canonical_rag`'s embedding provider or model differs from the one the cache was written with
+- **THEN** every lookup misses (the key includes provider and model) AND the corpus is fully re-embedded via the provider
+- **AND** the subsequent write-through replaces the cache under the new keys
+
+#### Scenario: A corrupt cache degrades to a full embed, never a failure
+- **WHEN** the cache file exists but cannot be read or parsed
+- **THEN** the rebuild logs a WARN naming the file AND proceeds exactly as a cold start (full provider embed)
+- **AND** the write-through afterwards replaces the corrupt file
+- **AND** deleting the cache file or directory by hand is always safe
 
 ### Requirement: Install-wizard graduated RAG-configuration flow
 `autocoder install` (interactive mode) SHALL prompt the operator about RAG configuration AND walk them through a graduated set of options designed to find a working RAG setup for their environment without requiring API keys when avoidable. The flow:
