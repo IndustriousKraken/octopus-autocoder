@@ -242,7 +242,10 @@ async fn open_pr_check_returns_true_when_pr_exists() {
         &open_pr_test_github(&server.url()),
     )
     .await;
-    assert!(result, "should report PR exists");
+    assert!(
+        matches!(result, OpenPrGateOutcome::Open),
+        "should report PR exists (Open), got {result:?}"
+    );
     mock.assert_async().await;
 }
 
@@ -268,12 +271,15 @@ async fn open_pr_check_returns_false_when_no_pr() {
         &open_pr_test_github(&server.url()),
     )
     .await;
-    assert!(!result, "should report no PR");
+    assert!(
+        matches!(result, OpenPrGateOutcome::NoPr),
+        "empty list should report no PR (NoPr → proceed), got {result:?}"
+    );
     mock.assert_async().await;
 }
 
 #[tokio::test]
-async fn open_pr_check_returns_false_on_query_error() {
+async fn open_pr_check_returns_unknown_on_query_error() {
     let mut server = mockito::Server::new_async().await;
     let _mock = server
         .mock("GET", mockito::Matcher::Any)
@@ -282,8 +288,9 @@ async fn open_pr_check_returns_false_on_query_error() {
         .create_async()
         .await;
 
-    // Best-effort fallback: a 500 from GitHub should not block the
-    // iteration — log WARN and proceed as if no PR exists.
+    // Fail closed (open-pr-gate-fails-closed): a 500 from GitHub is an
+    // UNCONFIRMED answer, so the gate returns `Unknown` and the caller skips
+    // the iteration rather than risking a duplicate agentic run.
     let (_td_paths, paths) = crate::testing::test_daemon_paths();
     let result = open_pr_exists_for_agent_branch_at(
         &paths,
@@ -292,7 +299,10 @@ async fn open_pr_check_returns_false_on_query_error() {
         &open_pr_test_github(&server.url()),
     )
     .await;
-    assert!(!result, "transport/HTTP errors must degrade to 'no PR'");
+    assert!(
+        matches!(result, OpenPrGateOutcome::Unknown(_)),
+        "transport/HTTP errors must fail closed (Unknown → skip), got {result:?}"
+    );
 }
 
 #[tokio::test]
@@ -316,7 +326,10 @@ async fn open_pr_check_uses_fork_owner_in_head_qualifier() {
     let (_td_paths, paths) = crate::testing::test_daemon_paths();
     let result =
         open_pr_exists_for_agent_branch_at(&paths, &server.url(), &open_pr_test_repo(), &gh).await;
-    assert!(!result);
+    assert!(
+        matches!(result, OpenPrGateOutcome::NoPr),
+        "empty list should report no PR (NoPr), got {result:?}"
+    );
     mock.assert_async().await;
 }
 
@@ -471,6 +484,11 @@ async fn failure_alert_posted_then_suppressed_within_24h() {
         .create_async()
         .await;
 
+    // Fail-closed open-PR gate: answer the pre-check with an empty list so the
+    // iteration proceeds to the push step under test. Served by the same
+    // mockito server as chatops.
+    let _gate_mock = mock_open_pr_gate_empty(&mut server).await;
+
     let executor = CompletingExecutorWithDiff {
         artifact_name: "PUSH_ART.txt".into(),
         artifact_text: "x".into(),
@@ -482,20 +500,14 @@ async fn failure_alert_posted_then_suppressed_within_24h() {
         failure_alerts_enabled: true,
         pr_opened_enabled: true,
     };
-    let github = GithubConfig {
-        token_env: "X".into(),
-        token: None,
-        owner_tokens: None,
-        fork_owner: None,
-        recreate_fork_on_reinit: false,
-        command_authorization: Default::default(),
-    };
+    let github = open_pr_gate_ok_github();
 
     // Serialize on the github-api-base test hook: `execute_one_pass` reads the
     // process-wide override via its open-PR pre-check, so this test must not run
     // while another test has the override installed (else the pre-check request
     // would land on that test's mockito server). See `test_hooks::lock`.
     let _hook = test_hooks::lock();
+    test_hooks::set_github_api_base(Some(server.url()));
 
     // Iteration 1: pass through commits succeeds, push fails → alert
     // is posted and `.alert-state.json` is written.
@@ -517,6 +529,7 @@ async fn failure_alert_posted_then_suppressed_within_24h() {
         None,
         &std::collections::HashMap::new(),
         &std::sync::Mutex::new(Vec::new()),
+        &mut 0u32,
     )
     .await;
     let basename = ws.file_name().unwrap().to_string_lossy().into_owned();
@@ -541,6 +554,7 @@ async fn failure_alert_posted_then_suppressed_within_24h() {
     )
     .await;
 
+    test_hooks::set_github_api_base(None);
     alert_mock.assert_async().await;
 }
 
@@ -557,15 +571,12 @@ async fn push_failure_writes_marker_and_preserves_work() {
         artifact_name: "PB_ART.txt".into(),
         artifact_text: "x".into(),
     };
-    let github = GithubConfig {
-        token_env: "X".into(),
-        token: None,
-        owner_tokens: None,
-        fork_owner: None,
-        recreate_fork_on_reinit: false,
-        command_authorization: Default::default(),
-    };
+    let github = open_pr_gate_ok_github();
     let _hook = test_hooks::lock();
+    // Fail-closed open-PR gate: proceed past the pre-check to the push step.
+    let mut server = mockito::Server::new_async().await;
+    let _gate_mock = mock_open_pr_gate_empty(&mut server).await;
+    test_hooks::set_github_api_base(Some(server.url()));
 
     // Push fails (broken remote) AFTER the change is committed + archived.
     let res = execute_one_pass(
@@ -585,8 +596,10 @@ async fn push_failure_writes_marker_and_preserves_work() {
         None,
         &std::collections::HashMap::new(),
         &std::sync::Mutex::new(Vec::new()),
+        &mut 0u32,
     )
     .await;
+    test_hooks::set_github_api_base(None);
     assert!(res.is_err(), "broken-remote push must fail the iteration");
 
     let marker = crate::push_block::read(&paths, &ws)
@@ -631,15 +644,13 @@ async fn push_block_resume_skips_executor() {
     let (_dir, ws) = fixture_workspace_with_broken_remote("pushblock-resume");
     let (_td_paths, paths) = crate::testing::test_daemon_paths();
     add_committed_change(&ws, "needs-push", "push-block fixture");
-    let github = GithubConfig {
-        token_env: "X".into(),
-        token: None,
-        owner_tokens: None,
-        fork_owner: None,
-        recreate_fork_on_reinit: false,
-        command_authorization: Default::default(),
-    };
+    let github = open_pr_gate_ok_github();
     let _hook = test_hooks::lock();
+    // Fail-closed open-PR gate: iter 1 proceeds past the pre-check to push.
+    // (Iter 2 resumes the push-block hold BEFORE the gate, so it never queries.)
+    let mut server = mockito::Server::new_async().await;
+    let _gate_mock = mock_open_pr_gate_empty(&mut server).await;
+    test_hooks::set_github_api_base(Some(server.url()));
 
     // Iteration 1: complete the change, push fails → marker written.
     let exec1 = CompletingExecutorWithDiff {
@@ -651,6 +662,7 @@ async fn push_block_resume_skips_executor() {
         2400u64, u32::MAX, u32::MAX, 0, Some(10),
         &crate::audits::AuditRegistry::default(), None,
         &std::collections::HashMap::new(), &std::sync::Mutex::new(Vec::new()),
+        &mut 0u32,
     )
     .await;
     assert!(r1.is_err());
@@ -664,8 +676,10 @@ async fn push_block_resume_skips_executor() {
         2400u64, u32::MAX, u32::MAX, 0, Some(10),
         &crate::audits::AuditRegistry::default(), None,
         &std::collections::HashMap::new(), &std::sync::Mutex::new(Vec::new()),
+        &mut 0u32,
     )
     .await;
+    test_hooks::set_github_api_base(None);
     assert!(r2.is_err(), "push still fails on the resume retry");
     assert!(
         crate::push_block::exists(&paths, &ws),
@@ -703,23 +717,23 @@ async fn stale_push_block_marker_is_cleared_and_pass_proceeds() {
         artifact_name: "PB_ART.txt".into(),
         artifact_text: "x".into(),
     };
-    let github = GithubConfig {
-        token_env: "X".into(),
-        token: None,
-        owner_tokens: None,
-        fork_owner: None,
-        recreate_fork_on_reinit: false,
-        command_authorization: Default::default(),
-    };
+    let github = open_pr_gate_ok_github();
     let _hook = test_hooks::lock();
+    // Fail-closed open-PR gate: the stale marker is cleared, then the normal
+    // flow proceeds past the pre-check to push (which fails on the broken remote).
+    let mut server = mockito::Server::new_async().await;
+    let _gate_mock = mock_open_pr_gate_empty(&mut server).await;
+    test_hooks::set_github_api_base(Some(server.url()));
 
     let res = execute_one_pass(
         &paths, &ws, &fixture_repo(&ws), &executor, &github, None, None,
         2400u64, u32::MAX, u32::MAX, 0, Some(10),
         &crate::audits::AuditRegistry::default(), None,
         &std::collections::HashMap::new(), &std::sync::Mutex::new(Vec::new()),
+        &mut 0u32,
     )
     .await;
+    test_hooks::set_github_api_base(None);
     assert!(res.is_err(), "broken-remote push still fails the iteration");
 
     // The stale marker was cleared and the normal flow ran (recreate + executor),

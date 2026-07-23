@@ -391,6 +391,7 @@ async fn audit_only_iteration_pushes_and_opens_pr() {
         None,
         &std::collections::HashMap::new(),
         &queued,
+        &mut 0u32,
     )
     .await;
 
@@ -541,6 +542,7 @@ async fn audit_only_pr_suppressed_when_iteration_pending_marker_present() {
         None,
         &std::collections::HashMap::new(),
         &queued,
+        &mut 0u32,
     )
     .await;
     test_hooks::set_github_api_base(None);

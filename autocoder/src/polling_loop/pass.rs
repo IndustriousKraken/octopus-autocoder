@@ -21,6 +21,12 @@ pub async fn execute_one_pass(
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,
     queued_audit_types: &std::sync::Mutex<Vec<QueuedAudit>>,
+    // Polling task's in-memory per-repo count of CONSECUTIVE open-PR-gate
+    // query failures (open-pr-gate-fails-closed §2). Threaded from the loop so
+    // it survives across passes; reset on any successful query, incremented on
+    // each `Unknown`, and the third consecutive failure raises the throttled
+    // alert.
+    open_pr_gate_failures: &mut u32,
 ) -> Result<()> {
     // Acquire the per-repo busy marker. Held across the entire pass
     // (executor → review → push → PR); released by Drop on every return.
@@ -112,7 +118,22 @@ pub async fn execute_one_pass(
     // exists on the agent branch. If yes, this iteration would burn
     // tokens re-implementing, force-update the PR's commits under any
     // reviewer mid-review, and 422 at PR creation. Skip entirely.
-    if open_pr_exists_for_agent_branch(paths, repo, github_cfg).await {
+    //
+    // The gate FAILS CLOSED (open-pr-gate-fails-closed): an unconfirmed answer
+    // (parse / token / transport / non-2xx) skips the pass too — "cannot
+    // confirm no open PR" risks exactly the harms this gate prevents. Only a
+    // confirmed empty list proceeds. The revision dispatcher above already ran,
+    // so revisions keep reaching open PRs even during a query-failure pass.
+    if !open_pr_gate_decision(
+        paths,
+        workspace,
+        repo,
+        github_cfg,
+        chatops_ctx,
+        open_pr_gate_failures,
+    )
+    .await
+    {
         return Ok(());
     }
     let (processed, processed_issues, includes_self_heal) = run_pass_through_commits(

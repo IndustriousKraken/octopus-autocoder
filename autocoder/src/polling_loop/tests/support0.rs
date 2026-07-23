@@ -368,6 +368,38 @@ pub(crate) fn open_pr_test_repo() -> RepositoryConfig {
     }
 }
 
+/// A `GithubConfig` whose token resolves (inline) so the fail-closed open-PR
+/// gate reaches the query instead of skipping on a token-resolution failure.
+/// Pair with [`mock_open_pr_gate_empty`] + the api-base override so an
+/// `execute_one_pass` test proceeds past the gate to the behavior it exercises.
+pub(crate) fn open_pr_gate_ok_github() -> GithubConfig {
+    GithubConfig {
+        token_env: "X".into(),
+        token: Some(crate::config::SecretSource::Inline {
+            value: "inline-test-token".into(),
+        }),
+        owner_tokens: None,
+        fork_owner: None,
+        recreate_fork_on_reinit: false,
+        command_authorization: Default::default(),
+    }
+}
+
+/// Install a mockito mock answering the fixture repo's open-PR gate query with
+/// an empty list (200 `[]`), so the fail-closed gate returns `None` (proceed).
+/// The returned `Mock` must be kept alive for the test's duration (mockito
+/// removes a mock when its handle drops). The caller installs the api-base
+/// override (`test_hooks::set_github_api_base(Some(server.url()))`) itself.
+pub(crate) async fn mock_open_pr_gate_empty(server: &mut mockito::Server) -> mockito::Mock {
+    server
+        .mock("GET", mockito::Matcher::Regex("/pulls".to_string()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("[]")
+        .create_async()
+        .await
+}
+
 pub(crate) fn open_pr_test_github(server_url: &str) -> GithubConfig {
     // Resolve_token reads from token_env (or inline). Use a fixture
     // env var unique to this test set so parallel tests don't clobber.
