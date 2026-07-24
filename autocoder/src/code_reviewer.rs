@@ -305,6 +305,19 @@ pub struct CodeReviewer {
     /// per-session log. The reviewer block does not carry the daemon paths, so
     /// they are threaded in alongside the agentic-session timeout.
     paths: Option<std::sync::Arc<crate::paths::DaemonPaths>>,
+    /// Raw configured reviewer prompt-override paths (nested
+    /// `reviewer.code_review.prompt_path`, legacy `reviewer.prompt_template_path`),
+    /// carried so the AGENTIC path can resolve + READ them at REVIEW time — nested
+    /// wins, legacy falls back, the same selection the oneshot `from_config`
+    /// loader uses. The oneshot path reads its file ONCE at construction into
+    /// `template`; the agentic path re-reads per review so calibration edits apply
+    /// without a reload, prepending the file's content as an operator guidance
+    /// preamble AND failing the review loudly when the configured file is
+    /// unreadable or empty (agentic-reviewer-honors-prompt-override). Both `None`
+    /// for the test-only [`CodeReviewer::new`] path AND whenever no override is
+    /// configured.
+    prompt_override_nested: Option<std::path::PathBuf>,
+    prompt_override_legacy: Option<std::path::PathBuf>,
 }
 
 impl CodeReviewer {
@@ -336,6 +349,58 @@ impl CodeReviewer {
                 crate::config::default_agentic_session_timeout(),
             ),
             paths: None,
+            prompt_override_nested: None,
+            prompt_override_legacy: None,
+        }
+    }
+
+    /// Builder-style setter for the raw reviewer prompt-override paths (nested,
+    /// legacy) the AGENTIC path re-reads per review
+    /// (agentic-reviewer-honors-prompt-override). `from_config` sets these from
+    /// `reviewer.code_review.prompt_path` AND `reviewer.prompt_template_path`;
+    /// the test-only `new` path leaves them `None`. The oneshot path is
+    /// unaffected — it already resolved its template into `self.template`.
+    pub fn with_prompt_override_paths(
+        mut self,
+        nested: Option<std::path::PathBuf>,
+        legacy: Option<std::path::PathBuf>,
+    ) -> Self {
+        self.prompt_override_nested = nested;
+        self.prompt_override_legacy = legacy;
+        self
+    }
+
+    /// Resolve the operator prompt-override preamble for the AGENTIC path
+    /// (agentic-reviewer-honors-prompt-override). Nested key wins, legacy falls
+    /// back — the same path SELECTION the oneshot loader uses — but read at
+    /// REVIEW time (so calibration edits apply on the next review with no
+    /// reload) AND fail-loud, NOT fall-through: a configured path that is
+    /// unreadable or empty returns `Err(reason)` naming the file and cause, so
+    /// the caller discards the review + fires the reviewer-failure alert rather
+    /// than silently reverting to the embedded guidance (the exact silent no-op
+    /// this change fixes). `Ok(None)` means no override is configured — the
+    /// prompt renders exactly as before.
+    pub(crate) fn resolve_operator_preamble(
+        &self,
+    ) -> std::result::Result<Option<String>, String> {
+        let path = match self
+            .prompt_override_nested
+            .as_deref()
+            .or(self.prompt_override_legacy.as_deref())
+        {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        match std::fs::read_to_string(path) {
+            Ok(body) if !body.trim().is_empty() => Ok(Some(body)),
+            Ok(_) => Err(format!(
+                "reviewer prompt override `{}` is empty",
+                path.display()
+            )),
+            Err(e) => Err(format!(
+                "reviewer prompt override `{}` could not be read: {e}",
+                path.display()
+            )),
         }
     }
 
@@ -542,6 +607,13 @@ impl CodeReviewer {
             // resolved `optional` inside the resolver: keyless → EMPTY (opencode
             // keyless path), configured → the resolved key passed to the CLI.
             .with_resolved_model(Some(llm::resolve_reviewer_model(cfg)?))
+            // Carry the raw override paths so the agentic path re-reads them per
+            // review (agentic-reviewer-honors-prompt-override). Same nested→legacy
+            // selection the oneshot `PromptLoader::load` above used for `template`.
+            .with_prompt_override_paths(
+                cfg.code_review.as_ref().and_then(|b| b.prompt_path.clone()),
+                cfg.prompt_template_path.clone(),
+            )
             .with_attribution(Some(crate::attribution::AttributionSurface::attribution(cfg))))
     }
 
@@ -1430,6 +1502,16 @@ async fn run_on_demand_review_with_runner(
     archived_changes: Vec<ChangeBrief>,
     runner: &dyn ReviewSessionRunner,
 ) -> Result<OnDemandReviewOutcome> {
+    // Resolve the operator prompt-override preamble ONCE for the whole review
+    // (agentic-reviewer-honors-prompt-override): an on-demand review is an
+    // agentic session too, so it honors the override AND fails loud on a
+    // configured-but-broken file (discard, never a silent embedded-guidance
+    // fallback) before any chunk session spawns.
+    let operator_preamble = match reviewer.resolve_operator_preamble() {
+        Ok(p) => p.unwrap_or_default(),
+        Err(reason) => return Ok(OnDemandReviewOutcome::Discarded { reason }),
+    };
+
     let contexts =
         build_on_demand_contexts(surface, &archived_changes, ON_DEMAND_MAX_FILES_PER_SESSION);
     let chunked = contexts.len() > 1;
@@ -1451,7 +1533,9 @@ async fn run_on_demand_review_with_runner(
         // chunk label keeps multi-session artifacts from colliding.
         let slug = sanitize_session_slug(label);
         let artifact_rel = review_diff_artifact_rel(&slug);
-        let prompt = render_agentic_review_prompt(ctx, "", &artifact_rel);
+        // On-demand review carries no cross-change preamble; the operator
+        // preamble (if configured) still leads the prompt.
+        let prompt = render_agentic_review_prompt(ctx, &operator_preamble, "", &artifact_rel);
         let session = runner.run_session(&slug, &prompt, &ctx.diff).await?;
         match session.submission {
             None => {

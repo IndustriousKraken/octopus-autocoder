@@ -201,14 +201,29 @@ fn render_review_submission_markdown(summary: &str, concerns: &[RawReviewConcern
 /// PLACE OF a diff — there is no unified diff for a target. Everything else
 /// (briefs, reads-on-demand, `submit_review`) is identical to the diff-based
 /// case, so the same `ReviewResult` shape is produced either way.
+///
+/// `operator_preamble` is the configured prompt-override content
+/// (agentic-reviewer-honors-prompt-override): when non-empty it leads the
+/// prompt, ahead of the `cross_change_preamble` AND every code-built section —
+/// all retained unchanged. Empty (no override configured) renders the prompt
+/// byte-identically to the pre-override behavior. The caller resolves it ONCE
+/// per review; the fail-loud posture for an unreadable/empty configured file
+/// lives in the caller, not here.
 pub fn render_agentic_review_prompt(
     ctx: &ReviewContext,
-    preamble: &str,
+    operator_preamble: &str,
+    cross_change_preamble: &str,
     diff_artifact_rel: &str,
 ) -> String {
     let mut out = String::new();
-    if !preamble.trim().is_empty() {
-        out.push_str(preamble.trim_end());
+    // Operator guidance preamble first — house rules / calibration lead the
+    // prompt, ahead of positional context AND the code-built mechanics.
+    if !operator_preamble.trim().is_empty() {
+        out.push_str(operator_preamble.trim_end());
+        out.push_str("\n\n");
+    }
+    if !cross_change_preamble.trim().is_empty() {
+        out.push_str(cross_change_preamble.trim_end());
         out.push_str("\n\n");
     }
     out.push_str(
@@ -628,6 +643,17 @@ pub(crate) async fn run_agentic_review_with_runner(
     // reach the reviewer and the verdict comes from an actual invocation.
     // The `bundled` flag then also routes synthesis below through the
     // bundled arm (no empty per-change synthesis).
+    // Resolve the operator prompt-override preamble ONCE per review
+    // (agentic-reviewer-honors-prompt-override). Fail-loud: a configured-but-
+    // unreadable/empty override discards the review (no verdict, never an
+    // implicit Approve) BEFORE any session is spawned; the caller posts the
+    // reviewer-failure alert naming the file + cause. No override → empty
+    // preamble → the prompt renders exactly as before.
+    let operator_preamble = match reviewer.resolve_operator_preamble() {
+        Ok(p) => p.unwrap_or_default(),
+        Err(reason) => return Ok(AgenticReviewOutcome::Discarded { reason }),
+    };
+
     let mut bundled = matches!(reviewer.mode(), crate::config::ReviewerMode::Bundled);
     let sessions: Vec<(Option<String>, ReviewContext, String)> = if bundled {
         vec![(None, ctx.clone(), String::new())]
@@ -648,7 +674,8 @@ pub(crate) async fn run_agentic_review_with_runner(
     for (slug, session_ctx, preamble) in &sessions {
         let session_slug = slug.as_deref().unwrap_or("");
         let artifact_rel = review_diff_artifact_rel(session_slug);
-        let prompt = render_agentic_review_prompt(session_ctx, preamble, &artifact_rel);
+        let prompt =
+            render_agentic_review_prompt(session_ctx, &operator_preamble, preamble, &artifact_rel);
         let session = runner
             .run_session(session_slug, &prompt, &session_ctx.diff)
             .await?;

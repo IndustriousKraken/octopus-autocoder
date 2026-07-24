@@ -299,7 +299,7 @@ See [Code Review](CODE-REVIEW.md). Absent block disables the reviewer step.
 | `api_key_env`              | no       | _absent_ | Name of the env var holding the provider API key. Used when `api_key` is unset. |
 | `api_key`                  | no       | _absent_ | Inline alternative to `api_key_env` (`{ value: "..." }`); when set, `api_key_env` is ignored. |
 | `api_base_url`             | no       | provider default | Override the base URL — useful for OpenRouter, Grok, local Ollama, etc. |
-| `prompt_template_path`     | no       | _embedded_ | Path to a file overriding the built-in reviewer prompt template. Must contain `{{change_context}}`, `{{changed_files}}`, and `{{diff}}` placeholders. |
+| `prompt_template_path`     | no       | _embedded_ | Path to a file overriding the built-in reviewer prompt. **Its role differs by `kind`** (see the `CodeReview` note under [Prompt overrides](#prompt-overrides)): the `oneshot` transport uses it as the FULL template (must contain `{{change_context}}`, `{{changed_files}}`, and `{{diff}}` placeholders); the `agentic` transport (the default) includes its content as an **operator guidance preamble** — write judgment guidance, not output-format mechanics. Modernized form: `reviewer.code_review.prompt_path`. |
 | `auto_revise`              | no       | `block` | **Tri-state** (`block` \| `actionable` \| `off`) gating reviewer-initiated revisions. `block` (default) fires only when the review's effective verdict is `Block` (security-critical findings escalate to `Block`, so they auto-fix; non-`Block` `Concerns` stay advisory). `actionable` fires on any actionable concern regardless of verdict. `off` disables it. When it fires, all of a review's concerns marked `should_request_revision: true` (with a non-empty `actionable_request`) are **aggregated into ONE** `<!-- reviewer-revision -->` PR comment (a numbered list) that the [PR-comment revision dispatcher](OPERATIONS.md#revising-an-open-pr-via-comment) picks up as a **single** revision run on the next iteration. That run is **automatic** and consumes exactly **one** slot of the per-PR `executor.max_auto_revisions_per_pr` cap regardless of concern count (human `@<bot> revise` requests do not count); `max_auto_revisions_per_pr: 0` disables it. Operator-customized reviewer templates must be updated to emit the structured `revision-requests` YAML block at the end of the response — see [Reviewer-initiated revisions on actionable concerns](CODE-REVIEW.md#reviewer-initiated-revisions-on-actionable-concerns) for the schema and the operator-template migration steps. The legacy boolean is mapped (`true` → `actionable`, `false` → `off`) and the legacy key `auto_revise_on_block` is accepted as a silent alias. **The default changed from off to `block`.** |
 | `prompt_budget_chars`      | no       | `2000000` | Maximum size (in chars) of the rendered reviewer prompt body — change context + changed files + diff combined. No hard ceiling; operator matches the value to their LLM provider's actual context window (Grok-4 / Claude Sonnet 4.6 fit `4000000`+; smaller-window providers may want a tighter cap). YAML integers do NOT accept underscore separators — write the value as a plain decimal. Hot-applicable via `autocoder reload`. See [Prompt budget](CODE-REVIEW.md#prompt-budget) for the full discussion. |
 | `mode`                     | no       | `bundled` | Reviewer dispatch mode. `bundled` (default) keeps the existing one-reviewer-call-per-PR behaviour. `per_change` dispatches one reviewer call per change in a multi-change PR, emits a separate `## Code Review: <slug>` section per change in the PR body, and scales LLM cost linearly with the change count. See [Per-change reviewer mode](CODE-REVIEW.md#per-change-reviewer-mode) for the full discussion. |
@@ -409,6 +409,32 @@ override at all before the uniform loader landed.
 | `BrownfieldSurvey`               | `prompts/brownfield-survey.md`             | `features.brownfield_survey.prompt_path`                     | —                                                          |
 | `Scout`                          | `prompts/scout.md`                         | `features.scout.prompt_path`                                 | —                                                          |
 | `ChangeContradictionCheck`       | `prompts/change-contradiction-check.md`    | `executor.change_internal_contradiction_check_prompt_path`   | —                                                          |
+
+**`CodeReview` — per-transport semantics.** The `CodeReview` override's
+ROLE depends on `reviewer.kind`:
+
+- **`oneshot`** — the file is the **full template**, used in place of the
+  embedded default. It must reference the `{{change_context}}`,
+  `{{changed_files}}`, and `{{diff}}` placeholders, and (for
+  `auto_revise`) emit the `revision-requests` YAML block. A missing/empty
+  file falls through to the embedded default per the one-shot WARN rule
+  above.
+- **`agentic`** (the default) — the file is included as an **operator
+  guidance preamble** at the top of the rendered session prompt, ahead of
+  the code-built sections (change briefs, changed-path list, diff-artifact
+  reference, `submit_review` contract), which are retained unchanged. Write
+  **judgment guidance** here — when a concern warrants
+  `should_request_revision: true`, review emphasis, house rules — NOT
+  output-format mechanics: the `oneshot` template's `revision-requests`
+  YAML block does NOT apply, because the agentic submission format is the
+  `submit_review` tool, which operator text cannot alter. The file is
+  **re-read per review**, so calibration edits take effect on the next
+  review with no reload. A configured file that is unreadable or empty at
+  review time **fails the review loudly** (the review is discarded — no
+  verdict, never an implicit Approve — and the reviewer-failure alert fires
+  naming the file); it does **NOT** fall through to the embedded guidance,
+  the one exception to the fall-through rule above. Operators reusing a
+  `oneshot` override for `agentic` should trim it to guidance-only content.
 
 **Naming convention going forward.** Any new embedded prompt added
 in a future change SHALL declare its override field using the
