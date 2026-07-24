@@ -280,6 +280,22 @@ impl DaemonPaths {
         self.cache.join("workspaces")
     }
 
+    /// `<cache>/rag-embeddings/` — per-workspace canonical-RAG embedding
+    /// vector cache. CACHE category: re-creatable, safe to delete at any
+    /// time (deleting it merely restores the pre-cache full-embed cost on
+    /// the next workspace-init / post-archive rebuild). One JSON file per
+    /// workspace basename.
+    pub fn rag_embeddings_dir(&self) -> PathBuf {
+        self.cache.join("rag-embeddings")
+    }
+
+    /// `<cache>/rag-embeddings/<workspace_basename>.json` — the embedding
+    /// vector cache file for the named workspace.
+    pub fn rag_embeddings_cache_path(&self, workspace_basename: &str) -> PathBuf {
+        self.rag_embeddings_dir()
+            .join(format!("{workspace_basename}.json"))
+    }
+
     /// `<state>/workspace-last-used/` — per-workspace last-used timestamp
     /// markers keyed by workspace basename. Maintained by the
     /// workspace-cache LRU eviction (a65) to order eviction candidates
@@ -1004,6 +1020,14 @@ mod tests {
         assert_eq!(
             p.workspaces_dir(),
             PathBuf::from("/srv/cache/workspaces")
+        );
+        assert_eq!(
+            p.rag_embeddings_dir(),
+            PathBuf::from("/srv/cache/rag-embeddings")
+        );
+        assert_eq!(
+            p.rag_embeddings_cache_path("github_com_owner_repo"),
+            PathBuf::from("/srv/cache/rag-embeddings/github_com_owner_repo.json")
         );
         assert_eq!(
             p.workspace_last_used_dir(),

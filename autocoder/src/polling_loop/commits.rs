@@ -511,7 +511,7 @@ async fn prepare_workspace_for_pass(
     // builds + registers the store on the first iteration of a given
     // workspace (a previously-registered store is left alone). Fail-open
     // — any error logs WARN and the store is omitted from the registry.
-    crate::rag::workspace_init_hook(workspace).await;
+    crate::rag::workspace_init_hook(paths, workspace).await;
 
     // In-repo agent guide provisioning (`octopus-md-agent-guide`). Runs HERE,
     // after the base sync recreated the agent branch, so the write lands ON
