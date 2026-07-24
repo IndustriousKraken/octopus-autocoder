@@ -8,8 +8,11 @@
 //! the chatops `🛑 perma-stuck` plus manual-skip escape hatches if a
 //! genuinely-permanent failure mis-classifies.
 //!
-//! Startup-time recovery is unchanged (still skip-for-lifetime regardless
-//! of classification); a future spec MAY extend classification there too.
+//! Startup fork-setup failures now reuse this same classification
+//! (`startup-fork-setup-retries-transient-failures`): a transient one spawns a
+//! fork-pending polling task that self-heals, a permanent one keeps the
+//! skip-for-lifetime posture. The startup WORKSPACE-init path still skips for
+//! the process lifetime regardless of class (a separable future change).
 
 use std::io;
 

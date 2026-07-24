@@ -356,6 +356,13 @@ pub struct RunHooks {
     /// race a cancel against the sleep wait on this to know the loop
     /// reached the sleep window.
     pub on_iteration_sleep: Option<Arc<tokio::sync::Notify>>,
+    /// Test-only override for the fork-setup primitives the fork-pending
+    /// loop driver uses (startup-fork-setup-retries-transient-failures).
+    /// Production leaves this `None` so the driver uses the real
+    /// `GitForkOps`; a loop-level test injects a scripted `ForkOps` to
+    /// exercise the Ready/RetryTransient/Permanent state transitions
+    /// (e.g. the `Permanent => break` arm) without network.
+    pub(crate) fork_ops: Option<Arc<dyn crate::cli::run::ForkOps>>,
 }
 
 /// Drops at the end of the iteration body — including the panic-unwind
@@ -474,13 +481,16 @@ pub async fn run_with_hooks(
                     .as_ref()
                     .as_ref()
                     .map(|slot| build_chatops_ctx(snapshot_ref, slot));
+                let git_ops = crate::cli::run::GitForkOps;
+                let ops: &dyn crate::cli::run::ForkOps =
+                    hooks.fork_ops.as_deref().unwrap_or(&git_ops);
                 let step = run_fork_pending_iteration(
                     &paths,
                     &workspace,
                     snapshot_ref,
                     &github_snap,
                     chatops_ctx.as_ref(),
-                    &crate::cli::run::GitForkOps,
+                    ops,
                     crate::cli::run::FORK_REACHABILITY_TIMEOUT,
                     crate::cli::run::FORK_REACHABILITY_POLL_INTERVAL,
                 )
