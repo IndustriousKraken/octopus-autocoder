@@ -211,6 +211,7 @@ async fn run_exits_during_startup_jitter() {
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(tokio::sync::Notify::new()),
             task_cancel,
+            false, // fork_pending: normal task
         )
         .await;
     });

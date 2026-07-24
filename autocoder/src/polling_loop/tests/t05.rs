@@ -106,6 +106,7 @@ async fn cancellation_during_sleep_exits() {
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(tokio::sync::Notify::new()),
             cancel_for_task,
+            false, // fork_pending: normal task
             hooks,
         )
         .await;

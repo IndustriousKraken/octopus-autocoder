@@ -25,6 +25,7 @@ use crate::control_socket::{
 use crate::executor::{Executor, claude_cli::ClaudeCliExecutor};
 use crate::github::parse_repo_url;
 use crate::github_credentials::resolve_token_with_source;
+use crate::recovery_classification::{RecoveryFailureClass, classify_recovery_failure};
 use crate::{alert_state_migration, git, migration, paths, polling_loop, workspace};
 use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
@@ -666,24 +667,50 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
 
     // Fork-PR mode: ensure each repository has a reachable fork BEFORE
     // spawning its polling task. Per `fork-setup-failure-degrades-gracefully`,
-    // a per-repo failure no longer aborts startup — the repository is skipped
-    // for the process lifetime (no polling task) AND a chatops alert is
-    // emitted. The chatops backend was initialized above, so the alert is
-    // deliverable. The daemon stays up serving every other repository AND
-    // chatops, even when every configured repository fails fork setup.
-    let fork_setup_failures = ensure_forks_exist(&cfg.github, &cfg.repositories).await;
-    let skip_fork_urls: std::collections::HashSet<String> = fork_setup_failures
+    // a per-repo failure no longer aborts startup; the chatops backend was
+    // initialized above so any alert is deliverable, and the daemon stays up
+    // serving every other repository AND chatops, even when every configured
+    // repository fails fork setup.
+    // Per `startup-fork-setup-retries-transient-failures`, a fork-setup
+    // failure branches on its transient/permanent class:
+    //   - PERMANENT (identity mismatch, underivable URL, unroutable PAT,
+    //     permanent-classified creation responses): skip for the process
+    //     lifetime + alert with the restart-or-reload remedy (today's exact
+    //     behavior).
+    //   - TRANSIENT (transport/DNS, transient-classified HTTP, the 60s
+    //     reachability timeout, and unrecognized errors): spawn the polling
+    //     task in a fork-pending state that re-attempts setup each iteration
+    //     and self-heals with no operator action. Its throttled alert is
+    //     emitted by the fork-pending iteration, not here.
+    let (permanent_fork_failures, transient_fork_urls): (
+        Vec<ForkSetupFailure>,
+        std::collections::HashSet<String>,
+    ) = {
+        let mut permanent: Vec<ForkSetupFailure> = Vec::new();
+        let mut transient: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for f in ensure_forks_exist(&cfg.github, &cfg.repositories).await {
+            match f.class {
+                RecoveryFailureClass::Permanent => permanent.push(f),
+                RecoveryFailureClass::Transient => {
+                    transient.insert(f.upstream_url.clone());
+                }
+            }
+        }
+        (permanent, transient)
+    };
+    let skip_fork_urls: std::collections::HashSet<String> = permanent_fork_failures
         .iter()
         .map(|f| f.upstream_url.clone())
         .collect();
-    if !fork_setup_failures.is_empty() {
+    if !permanent_fork_failures.is_empty() {
         tracing::warn!(
-            count = fork_setup_failures.len(),
-            "fork-PR mode: {} repository(ies) skipped for the process lifetime after \
-             fork setup failed; the daemon and other repositories keep running",
-            fork_setup_failures.len()
+            count = permanent_fork_failures.len(),
+            "fork-PR mode: {} repository(ies) skipped for the process lifetime after a \
+             permanent-classified fork setup failure; the daemon and other repositories \
+             keep running",
+            permanent_fork_failures.len()
         );
-        for f in &fork_setup_failures {
+        for f in &permanent_fork_failures {
             tracing::error!(
                 url = %f.upstream_url,
                 fork_url = f.fork_url.as_deref().unwrap_or(""),
@@ -692,7 +719,16 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
             );
         }
     }
-    alert_fork_setup_failures(chatops_initial.as_ref(), &fork_setup_failures).await;
+    if !transient_fork_urls.is_empty() {
+        tracing::warn!(
+            count = transient_fork_urls.len(),
+            "fork-PR mode: {} repository(ies) had a transient fork setup failure; their \
+             polling tasks spawn fork-pending and re-attempt setup each iteration until \
+             they self-heal",
+            transient_fork_urls.len()
+        );
+    }
+    alert_fork_setup_failures(chatops_initial.as_ref(), &permanent_fork_failures).await;
 
     // Hot-swappable holders. The control socket swaps into these on
     // `autocoder reload`; the polling loops read snapshots once per pass.
@@ -949,6 +985,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         global_cancel: cancel.clone(),
         task_map: task_map.clone(),
         task_map_changed: task_map_changed.clone(),
+        fork_pending_urls: transient_fork_urls,
     });
 
     // Startup orphan reconciliation for the durable on-demand audit-run
@@ -1334,6 +1371,14 @@ struct SpawnDeps {
     global_cancel: CancellationToken,
     task_map: RepoTaskMap,
     task_map_changed: Arc<tokio::sync::Notify>,
+    /// Upstream URLs whose startup fork setup failed TRANSIENTLY
+    /// (startup-fork-setup-retries-transient-failures). A spawn for one of
+    /// these URLs starts its polling task in the fork-pending state (it
+    /// re-attempts fork setup each iteration instead of doing normal work
+    /// until setup succeeds) AND skips the workspace startup check, which
+    /// cannot succeed before the fork remote exists. Fixed at startup; the
+    /// reload path spawns only URLs absent from the live task map.
+    fork_pending_urls: std::collections::HashSet<String>,
 }
 
 /// Build a `SpawnRepoFn` that runs the repo's startup check, then spawns
@@ -1352,10 +1397,17 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 return SpawnOutcome::AlreadyPresent;
             }
         }
+        // Fork-pending (startup-fork-setup-retries-transient-failures): a repo
+        // whose startup fork setup failed transiently spawns in the
+        // fork-pending state. Skip the workspace startup check — it inits the
+        // workspace, which cannot succeed before the fork remote exists; the
+        // fork-pending iterations re-attempt setup, and the first normal
+        // iteration (post-recovery) does the workspace init itself.
+        let fork_pending = deps.fork_pending_urls.contains(&url);
         // Startup check uses the live github config (post-reload it may
         // differ from what was on disk at process start).
         let github_snap = deps.github_holder.load_full();
-        if !repo_passes_startup_check(&deps.paths, &repo, &github_snap) {
+        if !fork_pending && !repo_passes_startup_check(&deps.paths, &repo, &github_snap) {
             return SpawnOutcome::StartupCheckFailed;
         }
         // Restore any durably-persisted on-demand audit-run queue for this
@@ -1511,6 +1563,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 iteration_cancel_for_task,
                 iteration_drained_for_task,
                 cancel_for_task,
+                fork_pending,
             );
             // Nest the verifier-gate scopes around the polling future: the three
             // pre-executor gates (a59 `[in]`, a62 `[canon]`, global-rules-gate
@@ -1832,8 +1885,10 @@ pub fn validate_github_token_routes(
 /// One repository whose startup fork setup failed. Carries enough to
 /// identify the repository in a chatops alert AND to log the precise cause.
 /// Per `fork-setup-failure-degrades-gracefully`, a failure here no longer
-/// aborts startup — the repository is skipped for the process lifetime and
-/// an alert is emitted instead.
+/// aborts startup. Per `startup-fork-setup-retries-transient-failures`, the
+/// caller branches on [`ForkSetupFailure::class`]: a PERMANENT failure keeps
+/// the process-lifetime skip-plus-alert; a TRANSIENT one spawns a
+/// fork-pending polling task that self-heals on the polling cadence.
 #[derive(Debug, Clone)]
 pub struct ForkSetupFailure {
     /// The configured upstream repository URL.
@@ -1844,6 +1899,13 @@ pub struct ForkSetupFailure {
     /// Human-readable cause (HTTP status + body snippet, reachability
     /// timeout, PAT-routing failure, unsupported URL scheme, …).
     pub cause: String,
+    /// Transient (retry on the polling cadence via a fork-pending task) vs.
+    /// permanent (skip for the process lifetime). Identity mismatch,
+    /// underivable URL, and unroutable PAT are pre-classified permanent at
+    /// their creation sites; the creation-POST failure is classified via the
+    /// shared [`classify_recovery_failure`]; the reachability timeout is
+    /// transient (GitHub populates forks asynchronously).
+    pub class: RecoveryFailureClass,
 }
 
 /// Fork-setup primitives the startup routine depends on, behind a trait so
@@ -1851,7 +1913,7 @@ pub struct ForkSetupFailure {
 /// network (or a 60-second wall-clock wait). The production impl is
 /// [`GitForkOps`].
 #[async_trait::async_trait]
-trait ForkOps: Send + Sync {
+pub(crate) trait ForkOps: Send + Sync {
     /// True when `git ls-remote <fork_url> HEAD` succeeds right now.
     fn fork_reachable(&self, fork_url: &str) -> bool;
     /// Issue the fork-creation POST; on 2xx returns the created/existing
@@ -1866,7 +1928,7 @@ trait ForkOps: Send + Sync {
 
 /// Production [`ForkOps`]: real `git ls-remote` probe + real GitHub
 /// fork-creation POST.
-struct GitForkOps;
+pub(crate) struct GitForkOps;
 
 #[async_trait::async_trait]
 impl ForkOps for GitForkOps {
@@ -1884,9 +1946,10 @@ impl ForkOps for GitForkOps {
 }
 
 /// Reachability budget for a freshly-created fork: poll for up to this long.
-const FORK_REACHABILITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const FORK_REACHABILITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Interval between reachability probes while waiting on a new fork.
-const FORK_REACHABILITY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const FORK_REACHABILITY_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(2);
 
 /// When fork-PR mode is active, ensure each configured repository has a
 /// reachable fork at the derived URL. Missing forks are created via the
@@ -1919,8 +1982,12 @@ pub async fn ensure_forks_exist(
 
 /// Inner driver for [`ensure_forks_exist`] with the fork primitives AND the
 /// reachability timings injected, so the per-repo skip/alert decision is
-/// unit-testable without network or a 60-second wall-clock wait.
-async fn ensure_forks_exist_with(
+/// unit-testable without network or a 60-second wall-clock wait. Also reused
+/// per-repo by a fork-pending polling task's re-attempt
+/// (`polling_loop::fork_pending`): pass a single-element `repos` slice and
+/// inspect the returned failure's [`ForkSetupFailure::class`] — an empty
+/// return means the fork is now set up.
+pub(crate) async fn ensure_forks_exist_with(
     github: &GithubConfig,
     repos: &[RepositoryConfig],
     ops: &dyn ForkOps,
@@ -1939,6 +2006,8 @@ async fn ensure_forks_exist_with(
                     upstream_url: repo.url.clone(),
                     fork_url: None,
                     cause: format!("cannot derive fork URL: {e:#}"),
+                    // Underivable fork URL is a deterministic config error.
+                    class: RecoveryFailureClass::Permanent,
                 });
                 continue;
             }
@@ -1955,6 +2024,8 @@ async fn ensure_forks_exist_with(
                     upstream_url: repo.url.clone(),
                     fork_url: Some(fork_url),
                     cause: format!("cannot parse upstream URL: {e:#}"),
+                    // Unparseable upstream URL is a deterministic config error.
+                    class: RecoveryFailureClass::Permanent,
                 });
                 continue;
             }
@@ -1966,6 +2037,9 @@ async fn ensure_forks_exist_with(
                     upstream_url: repo.url.clone(),
                     fork_url: Some(fork_url),
                     cause: format!("cannot resolve PAT for fork creation: {e:#}"),
+                    // No token route for this owner is a deterministic config
+                    // error (an unroutable PAT).
+                    class: RecoveryFailureClass::Permanent,
                 });
                 continue;
             }
@@ -1978,10 +2052,15 @@ async fn ensure_forks_exist_with(
             match ops.create_fork(&upstream_owner, &upstream_repo, &token).await {
                 Ok(identity) => identity,
                 Err(e) => {
+                    // The POST error (transport failure or non-2xx status) is
+                    // classified via the SAME classifier the mid-iteration
+                    // recovery path uses — no new rules; unknown → transient.
+                    let class = classify_recovery_failure(&e);
                     failures.push(ForkSetupFailure {
                         upstream_url: repo.url.clone(),
                         fork_url: Some(fork_url),
                         cause: format!("fork creation POST failed: {e:#}"),
+                        class,
                     });
                     continue;
                 }
@@ -2007,6 +2086,9 @@ async fn ensure_forks_exist_with(
                              `{expected_full_name}` was expected; rename the fork to match, \
                              then restart autocoder or run `autocoder reload` on the daemon host"
                         ),
+                        // An identity mismatch is a deterministic outcome (the
+                        // fork exists under a different name): permanent.
+                        class: RecoveryFailureClass::Permanent,
                     });
                     continue;
                 }
@@ -2042,6 +2124,10 @@ async fn ensure_forks_exist_with(
                     "fork creation succeeded but `{fork_url}` was not reachable within {}s",
                     reachability_timeout.as_secs()
                 ),
+                // Creation SUCCEEDED; only population lagged the budget. GitHub
+                // populates large forks asynchronously, so the next iteration's
+                // probe usually succeeds — transient.
+                class: RecoveryFailureClass::Transient,
             });
         }
     }
@@ -2108,12 +2194,14 @@ pub async fn alert_fork_setup_failures(
 /// `false` (with a logged error) if the workspace is dirty or cannot be
 /// initialized.
 ///
-/// TODO(a14): a future spec could extend mid-iteration's
-/// `classify_recovery_failure` to startup too, so a transient
-/// `Could not resolve host` at boot waits for the next iteration instead
-/// of skipping the repo for the daemon's lifetime. For now startup keeps
-/// its conservative skip-for-lifetime contract: any failure here removes
-/// the repo from the polling set until the operator restarts the daemon.
+/// TODO(a14): the fork-setup half of startup now classifies transient vs.
+/// permanent (`startup-fork-setup-retries-transient-failures`) and self-heals
+/// transient failures via a fork-pending polling task. The WORKSPACE half
+/// below (init + dirty check) still keeps the conservative skip-for-lifetime
+/// contract: a transient `Could not resolve host` during workspace init here
+/// removes the repo from the polling set until the operator restarts the
+/// daemon. Extending the same transient/permanent treatment to this half is a
+/// separable future change (its failure modes differ).
 pub fn repo_passes_startup_check(
     paths: &paths::DaemonPaths,
     repo: &RepositoryConfig,
@@ -2512,6 +2600,10 @@ mod tests {
         reachable: Mutex<std::collections::HashSet<String>>,
         /// Upstream `owner/repo` keys whose fork-creation POST returns non-2xx.
         create_fails_for: std::collections::HashSet<String>,
+        /// Optional per-key error message for a failed create POST, so a test
+        /// can script the exact error text the classifier sees. Keys absent
+        /// here fall back to the default `403 Forbidden` message.
+        create_error_for: std::collections::HashMap<String, String>,
         /// Upstream `owner/repo` → fork URL inserted into `reachable` on a
         /// successful create (models a fork that becomes reachable after POST).
         make_reachable_on_create: std::collections::HashMap<String, String>,
@@ -2542,7 +2634,12 @@ mod tests {
             let key = format!("{upstream_owner}/{upstream_repo}");
             self.created.lock().unwrap().push(key.clone());
             if self.create_fails_for.contains(&key) {
-                return Err(anyhow!("simulated non-2xx (403 Forbidden) for {key}"));
+                let msg = self
+                    .create_error_for
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| format!("simulated non-2xx (403 Forbidden) for {key}"));
+                return Err(anyhow!("{msg}"));
             }
             if let Some(fork) = self.make_reachable_on_create.get(&key) {
                 self.reachable.lock().unwrap().insert(fork.clone());
@@ -2635,6 +2732,7 @@ mod tests {
                     .collect(),
             ),
             create_fails_for: std::collections::HashSet::new(),
+            create_error_for: std::collections::HashMap::new(),
             make_reachable_on_create: std::collections::HashMap::new(),
             identity_on_create: std::collections::HashMap::new(),
             probes: Mutex::new(Vec::new()),
@@ -2666,6 +2764,7 @@ mod tests {
         let ops = FakeForkOps {
             reachable: Mutex::new(std::collections::HashSet::new()),
             create_fails_for: std::collections::HashSet::new(),
+            create_error_for: std::collections::HashMap::new(),
             make_reachable_on_create: make,
             identity_on_create: std::collections::HashMap::new(),
             probes: Mutex::new(Vec::new()),
@@ -2690,23 +2789,29 @@ mod tests {
         );
     }
 
-    /// 3.1: one repo's fork setup fails (creation POST non-2xx) AND another's
-    /// succeeds → only the failed repo is in the skip set, exactly one alert
-    /// fires for it, and the routine returns normally (no fatal error).
+    /// 3.1: one repo's fork setup fails PERMANENTLY (fork exists under a
+    /// different name) AND another's succeeds → only the failed repo is in the
+    /// permanent-skip set, exactly one alert fires for it, and the routine
+    /// returns normally (no fatal error).
     #[tokio::test]
     async fn fork_setup_one_fails_one_succeeds_skips_and_alerts_only_failed() {
         let github = fork_github("mu");
         let repos = vec![
             repo("git@github.com:orgA/a.git"), // already reachable → success
-            repo("git@github.com:orgB/b.git"), // create POST fails → failure
+            repo("git@github.com:orgB/b.git"), // fork under a different name → permanent
         ];
+        // orgB/b's create POST idempotently returns a fork under a DIFFERENT
+        // name (identity mismatch) → a PERMANENT failure that skips.
+        let mut ids = std::collections::HashMap::new();
+        ids.insert("orgB/b".to_string(), "mu/renamed-b".to_string());
         let ops = FakeForkOps {
             reachable: Mutex::new(
                 ["git@github.com:mu/a.git".to_string()].into_iter().collect(),
             ),
-            create_fails_for: ["orgB/b".to_string()].into_iter().collect(),
+            create_fails_for: std::collections::HashSet::new(),
+            create_error_for: std::collections::HashMap::new(),
             make_reachable_on_create: std::collections::HashMap::new(),
-            identity_on_create: std::collections::HashMap::new(),
+            identity_on_create: ids,
             probes: Mutex::new(Vec::new()),
             created: Mutex::new(Vec::new()),
         };
@@ -2720,18 +2825,27 @@ mod tests {
         .await;
         assert_eq!(failures.len(), 1, "only the failed repo is recorded");
         assert_eq!(failures[0].upstream_url, "git@github.com:orgB/b.git");
+        assert_eq!(
+            failures[0].class,
+            RecoveryFailureClass::Permanent,
+            "identity mismatch is a permanent (skip) failure"
+        );
 
-        // The skip set (built exactly as `execute` builds it) excludes the
-        // reachable repo and includes only the failed one.
-        let skip: std::collections::HashSet<String> =
-            failures.iter().map(|f| f.upstream_url.clone()).collect();
+        // The permanent-skip set (built exactly as `execute` builds it from the
+        // PERMANENT-classified failures) excludes the reachable repo and
+        // includes only the failed one.
+        let skip: std::collections::HashSet<String> = failures
+            .iter()
+            .filter(|f| f.class == RecoveryFailureClass::Permanent)
+            .map(|f| f.upstream_url.clone())
+            .collect();
         assert!(
             !skip.contains("git@github.com:orgA/a.git"),
             "reachable repo must NOT be skipped (its polling task spawns)"
         );
         assert!(
             skip.contains("git@github.com:orgB/b.git"),
-            "failed repo must be skipped for the process lifetime"
+            "permanently-failed repo must be skipped for the process lifetime"
         );
 
         // Exactly one chatops alert fires, naming the failed repo + a remedy.
@@ -2767,6 +2881,7 @@ mod tests {
             create_fails_for: ["orgA/a".to_string(), "orgB/b".to_string()]
                 .into_iter()
                 .collect(),
+            create_error_for: std::collections::HashMap::new(),
             make_reachable_on_create: std::collections::HashMap::new(),
             identity_on_create: std::collections::HashMap::new(),
             probes: Mutex::new(Vec::new()),
@@ -2802,6 +2917,7 @@ mod tests {
         let ops = FakeForkOps {
             reachable: Mutex::new(std::collections::HashSet::new()),
             create_fails_for: std::collections::HashSet::new(),
+            create_error_for: std::collections::HashMap::new(),
             // never becomes reachable after create
             make_reachable_on_create: std::collections::HashMap::new(),
             identity_on_create: std::collections::HashMap::new(),
@@ -2826,6 +2942,9 @@ mod tests {
             failures[0].fork_url.as_deref(),
             Some("git@github.com:mu/a.git")
         );
+        // The reachability timeout is TRANSIENT: creation succeeded, only
+        // population lagged, so the next iteration's probe usually succeeds.
+        assert_eq!(failures[0].class, RecoveryFailureClass::Transient);
     }
 
     /// 4.1: an identity mismatch (upstream renamed → GitHub idempotently
@@ -2848,6 +2967,7 @@ mod tests {
                 ["git@github.com:mu/b.git".to_string()].into_iter().collect(),
             ),
             create_fails_for: std::collections::HashSet::new(),
+            create_error_for: std::collections::HashMap::new(),
             make_reachable_on_create: std::collections::HashMap::new(),
             identity_on_create: ids,
             probes: Mutex::new(Vec::new()),
@@ -2866,6 +2986,8 @@ mod tests {
 
         assert_eq!(failures.len(), 1, "only the mismatched repo fails: {failures:?}");
         assert_eq!(failures[0].upstream_url, "git@github.com:orgA/a.git");
+        // The identity mismatch is PERMANENT (deterministic outcome): skip.
+        assert_eq!(failures[0].class, RecoveryFailureClass::Permanent);
         let cause = &failures[0].cause;
         assert!(cause.contains("mu/old-a"), "names the actual fork returned: {cause}");
         assert!(cause.contains("mu/a"), "names the expected fork: {cause}");
@@ -2926,6 +3048,7 @@ mod tests {
             let ops = FakeForkOps {
                 reachable: Mutex::new(std::collections::HashSet::new()),
                 create_fails_for: std::collections::HashSet::new(),
+                create_error_for: std::collections::HashMap::new(),
                 make_reachable_on_create: make,
                 identity_on_create: ids,
                 probes: Mutex::new(Vec::new()),
@@ -2956,12 +3079,129 @@ mod tests {
         }
     }
 
+    // ====================================================================
+    // startup-fork-setup-retries-transient-failures §3.1: classification
+    // ====================================================================
+
+    /// Build a single-repo `FakeForkOps` that always fails its create POST
+    /// with `err_msg` (probe never reachable), so the create-POST failure's
+    /// classification is asserted end-to-end through `ensure_forks_exist_with`.
+    fn ops_with_create_error(err_msg: &str) -> FakeForkOps {
+        FakeForkOps {
+            reachable: Mutex::new(std::collections::HashSet::new()),
+            create_fails_for: ["orgA/a".to_string()].into_iter().collect(),
+            create_error_for: [("orgA/a".to_string(), err_msg.to_string())]
+                .into_iter()
+                .collect(),
+            make_reachable_on_create: std::collections::HashMap::new(),
+            identity_on_create: std::collections::HashMap::new(),
+            probes: Mutex::new(Vec::new()),
+            created: Mutex::new(Vec::new()),
+        }
+    }
+
+    async fn class_of_create_error(err_msg: &str) -> RecoveryFailureClass {
+        let github = fork_github("mu");
+        let repos = vec![repo("git@github.com:orgA/a.git")];
+        let ops = ops_with_create_error(err_msg);
+        let failures = ensure_forks_exist_with(
+            &github,
+            &repos,
+            &ops,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(failures.len(), 1, "create-POST error must record one failure");
+        failures[0].class
+    }
+
+    /// A create-POST DNS/transport error, a 5xx, and an unrecognized error all
+    /// classify TRANSIENT — the classifier's transient patterns plus its
+    /// default-to-transient posture, delegated as-is (no new fork-specific
+    /// rules). Reachability-timeout transience is covered by
+    /// `fork_setup_created_but_unreachable_times_out_to_failure`.
+    #[tokio::test]
+    async fn fork_setup_create_post_dns_5xx_and_unknown_classify_transient() {
+        assert_eq!(
+            class_of_create_error("git fetch failed: Could not resolve host github.com").await,
+            RecoveryFailureClass::Transient,
+            "DNS/transport error → transient"
+        );
+        assert_eq!(
+            class_of_create_error("GitHub returned HTTP 503 Service Unavailable").await,
+            RecoveryFailureClass::Transient,
+            "5xx → transient"
+        );
+        assert_eq!(
+            class_of_create_error("some error shape we have never seen before").await,
+            RecoveryFailureClass::Transient,
+            "unrecognized pattern → transient (default-to-transient posture)"
+        );
+    }
+
+    /// Underivable fork URL (unsupported scheme) → PERMANENT.
+    #[tokio::test]
+    async fn fork_setup_underivable_url_classifies_permanent() {
+        let github = fork_github("machine-user");
+        let repos = vec![repo("ssh://git@github.com/upstream/repo.git")];
+        let failures = ensure_forks_exist(&github, &repos).await;
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].class, RecoveryFailureClass::Permanent);
+    }
+
+    /// Unroutable PAT (no token route for the upstream owner) → PERMANENT.
+    #[tokio::test]
+    async fn fork_setup_unroutable_pat_classifies_permanent() {
+        // fork_owner set, but NO resolvable token: inline token absent,
+        // owner_tokens absent, and token_env names a definitely-unset var.
+        let github = GithubConfig {
+            token_env: "AUTOCODER_FORK_UNROUTABLE_PAT_DEFINITELY_UNSET".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: Some("mu".into()),
+            recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
+        };
+        let repos = vec![repo("git@github.com:orgA/a.git")];
+        // Probe never reachable → reaches PAT resolution, which fails.
+        let ops = FakeForkOps {
+            reachable: Mutex::new(std::collections::HashSet::new()),
+            create_fails_for: std::collections::HashSet::new(),
+            create_error_for: std::collections::HashMap::new(),
+            make_reachable_on_create: std::collections::HashMap::new(),
+            identity_on_create: std::collections::HashMap::new(),
+            probes: Mutex::new(Vec::new()),
+            created: Mutex::new(Vec::new()),
+        };
+        let failures = ensure_forks_exist_with(
+            &github,
+            &repos,
+            &ops,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].cause.contains("resolve PAT"),
+            "cause names the PAT resolution failure: {}",
+            failures[0].cause
+        );
+        assert_eq!(failures[0].class, RecoveryFailureClass::Permanent);
+        assert!(
+            ops.created.lock().unwrap().is_empty(),
+            "no create POST is issued when the PAT cannot be resolved"
+        );
+    }
+
     #[test]
     fn fork_setup_failure_alert_message_names_repo_and_remedy() {
         let f = ForkSetupFailure {
             upstream_url: "git@github.com:up/repo.git".into(),
             fork_url: Some("git@github.com:mu/repo.git".into()),
             cause: "fork creation POST failed: 403".into(),
+            class: RecoveryFailureClass::Permanent,
         };
         let msg = fork_setup_failure_alert_message(&f);
         assert!(msg.contains("git@github.com:up/repo.git"), "names upstream: {msg}");
@@ -2984,6 +3224,7 @@ mod tests {
             upstream_url: "git@github.com:up/repo.git".into(),
             fork_url: None,
             cause: "cannot derive fork URL: unsupported scheme".into(),
+            class: RecoveryFailureClass::Permanent,
         };
         alert_fork_setup_failures(None, &[f]).await;
     }

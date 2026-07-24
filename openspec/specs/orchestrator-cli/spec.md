@@ -202,6 +202,8 @@ at startup before any polling task is spawned.
 ### Requirement: Per-repository asynchronous polling loop
 autocoder SHALL implement the per-repository polling task referenced in `orchestrator-architecture/specs/orchestrator-cli/spec.md` as a sleep-then-iterate cycle that runs the architecture's single-pass workflow on every iteration. Each polling task SHALL apply a startup jitter (a random sleep in `[0, startup_jitter_max_secs]`) before its first iteration, and an inter-iteration jitter (a random uniform offset in `[-jitter_pct%, +jitter_pct%]` of `poll_interval_sec`) on every subsequent sleep. Both jitter sleeps SHALL respect the task's cancellation token.
 
+EXCEPTION — fork-pending: a polling task spawned in the fork-pending state (per "Startup verification of fork existence") SHALL run only the fork-setup re-attempt on each iteration — probe the fork URL via `git ls-remote`, create via POST if missing, identity check, reachability poll — skipping the single-pass workflow entirely, until an attempt succeeds; from that iteration on it runs the normal cycle. The sleep, jitter, and cancellation semantics of this requirement apply identically to fork-pending iterations.
+
 #### Scenario: Spawn count matches config
 - **WHEN** the daemon starts with a config containing N repositories AND the workspace collision check passes
 - **THEN** exactly N polling tasks are spawned via `tokio::task::JoinSet`
@@ -222,12 +224,19 @@ autocoder SHALL implement the per-repository polling task referenced in `orchest
   (matching the pre-change behavior); no startup sleep occurs
 
 #### Scenario: Normal iteration
-- **WHEN** a polling task wakes (start of process or end of previous sleep)
+- **WHEN** a polling task NOT in the fork-pending state wakes (start of process or end of previous sleep)
 - **THEN** it runs the full single-pass workflow for its repository: workspace init → stale-lock cleanup → dirty-workspace refusal → branch recreation → queue walk → push and PR creation if any commits were produced
 - **AND** the task then sleeps for a jittered duration of
   `poll_interval_sec ± (poll_interval_sec * jitter_pct / 100)`
   before iterating again
 - **AND** no two iterations within the same task overlap
+
+#### Scenario: Fork-pending iteration runs only the fork-setup re-attempt
+- **WHEN** a polling task in the fork-pending state wakes
+- **THEN** its iteration runs only the fork-setup re-attempt (probe → create-if-missing → identity check → reachability) — no workspace init, no stale-lock cleanup, no dirty-workspace refusal, no branch recreation, no queue walk, no push, no PR creation
+- **AND** on success, the task logs an INFO recovery notice and proceeds as a normal polling task from the next iteration onward
+- **AND** on transient failure, it logs a WARN and sleeps until the next iteration
+- **AND** on permanent failure (e.g. the upstream was renamed while pending), the task exits the polling set with a chatops alert naming the remedy hint, matching permanent-classified behavior for startup fork setup
 
 #### Scenario: Inter-iteration jitter offset is uniformly distributed
 - **WHEN** `executor.inter_iteration_jitter_pct = 10` AND
@@ -368,9 +377,14 @@ implementation.
 - **AND** per-repository fork-owner overrides are NOT supported
 
 ### Requirement: Startup verification of fork existence
-When `github.fork_owner` is set, autocoder SHALL ensure each configured repository has a reachable fork at the derived URL before spawning that repository's polling task. Forks that are missing or unreachable SHALL be created automatically via `POST /repos/{upstream-owner}/{upstream-repo}/forks` using the PAT resolved for the upstream owner. On a 2xx creation response, autocoder SHALL parse the response body and compare the returned fork's identity (`full_name`) against the owner/name expected from the derived fork URL (case-insensitive). When the identities match — or the response body cannot be parsed for an identity — the daemon polls the fork URL via `git ls-remote` until it becomes reachable or until a 60-second timeout elapses. When the identities differ (the idempotent existing-fork case where the fork carries a different name — e.g. the upstream was renamed after forking, or fork creation collided with an existing repository name), autocoder SHALL record the failure immediately with a cause that names the actual fork returned, the expected fork, AND the remedy (rename the existing fork to the expected name), WITHOUT entering the reachability poll — the poll cannot succeed for a fork that exists under a different name.
+When `github.fork_owner` is set, autocoder SHALL ensure each configured repository has a reachable fork at the derived URL before that repository's polling task begins normal work. Forks that are missing or unreachable SHALL be created automatically via `POST /repos/{upstream-owner}/{upstream-repo}/forks` using the PAT resolved for the upstream owner. On a 2xx creation response, autocoder SHALL parse the response body and compare the returned fork's identity (`full_name`) against the owner/name expected from the derived fork URL (case-insensitive). When the identities match — or the response body cannot be parsed for an identity — the daemon polls the fork URL via `git ls-remote` until it becomes reachable or until a 60-second timeout elapses. When the identities differ (the idempotent existing-fork case where the fork carries a different name — e.g. the upstream was renamed after forking, or fork creation collided with an existing repository name), autocoder SHALL record the failure immediately with a cause that names the actual fork returned, the expected fork, AND the remedy (rename the existing fork to the expected name), WITHOUT entering the reachability poll — the poll cannot succeed for a fork that exists under a different name.
 
-A fork-setup failure for one repository — creation returns non-2xx, the creation response identifies a fork other than the expected one, OR the fork is not reachable within the timeout — SHALL NOT abort daemon startup. The daemon SHALL instead: record the failure (the upstream URL, the expected fork URL, AND the cause); **skip that repository** (no polling task is spawned for it) — the daemon never retries fork setup on its own, so absent operator action the skip lasts the remainder of the process lifetime, and the repository rejoins the polling set only when the operator remediates and either restarts the daemon or runs `autocoder reload` on the daemon host (reload's repository reconciliation spawns a polling task for any configured repository that lacks one) — the same per-repo skip behavior already used when a fork URL cannot be derived; emit a chatops alert through the standard outbound notification path that identifies the repository AND carries a brief remedy hint, where the remedy hint names the concrete recovery commands — restart the daemon or run `autocoder reload` on the daemon host (NOT a bare verb like `reload`); AND continue setting up AND serving every other repository. A fork-setup failure for one repository SHALL NEVER prevent the daemon from starting, from serving other repositories, OR from serving chatops. The daemon exits non-zero at startup only for non-per-repo fatal conditions (e.g. config-load failure) — NEVER for a per-repo fork-setup failure, even when every configured repository fails fork setup (it stays up so an operator can remediate AND recover the repository by fixing the fork, then restarting or reloading).
+A fork-setup failure SHALL be classified with the same transient/permanent classification the mid-iteration recovery path uses (per "Mid-iteration recovery failures classify transient vs. permanent; transient retries on next iteration", including its default-to-transient posture for unrecognized errors), and the handling SHALL branch on the class:
+
+- **PERMANENT** — the fork-identity mismatch, an underivable fork URL, an unroutable PAT, and permanent-classified creation responses: the daemon SHALL record the failure (the upstream URL, the expected fork URL, AND the cause); **skip that repository** (no polling task is spawned for it) — the daemon never retries a permanent-classified failure on its own, so absent operator action the skip lasts the remainder of the process lifetime, and the repository rejoins the polling set only when the operator remediates and either restarts the daemon or runs `autocoder reload` on the daemon host (reload's repository reconciliation spawns a polling task for any configured repository that lacks one); AND emit a chatops alert through the standard outbound notification path that identifies the repository AND carries a brief remedy hint, where the remedy hint names the concrete recovery commands — restart the daemon or run `autocoder reload` on the daemon host (NOT a bare verb like `reload`).
+- **TRANSIENT** — transport/DNS errors, transient-classified HTTP responses, AND the fork-created-but-not-reachable-within-60s timeout (GitHub populates forks asynchronously): the daemon SHALL spawn the repository's polling task in a **fork-pending** state instead of skipping it. A fork-pending task re-attempts the full fork setup at the start of each iteration AND does no other work for the repository until setup succeeds; each failed attempt logs a WARN naming the cause, AND a throttled chatops alert names the repository as fork-pending while attempts continue. On a successful attempt the task SHALL log an INFO recovery notice AND proceed as a normal polling task from that iteration on — no operator action required.
+
+A fork-setup failure for one repository SHALL NEVER prevent the daemon from starting, from serving other repositories, OR from serving chatops. The daemon exits non-zero at startup only for non-per-repo fatal conditions (e.g. config-load failure) — NEVER for a per-repo fork-setup failure, even when every configured repository fails fork setup (it stays up so transient failures can self-heal AND an operator can remediate permanent ones).
 
 #### Scenario: All forks already exist
 - **WHEN** autocoder starts with `github.fork_owner` set AND every
@@ -395,10 +409,10 @@ A fork-setup failure for one repository — creation returns non-2xx, the creati
 - **AND** the daemon emits one info-level log line per created fork
   of the form `created fork <fork-url> from upstream <upstream-url>`
 
-#### Scenario: Fork-creation POST fails
+#### Scenario: A permanent-classified creation failure skips for the process lifetime
 - **WHEN** autocoder attempts to create a missing fork AND the
   `POST /repos/{upstream-owner}/{upstream-repo}/forks` call returns a
-  non-2xx status code
+  permanent-classified non-2xx status (e.g. a 403 missing-scope or 404)
 - **THEN** that repository's failure is recorded with the upstream
   URL, the expected fork URL, and the HTTP status (plus a body snippet
   truncated to 200 chars)
@@ -409,27 +423,41 @@ A fork-setup failure for one repository — creation returns non-2xx, the creati
 - **AND** autocoder continues setting up the remaining repositories AND
   the daemon does NOT exit
 
-#### Scenario: Fork-creation succeeds but the fork is not yet reachable
+#### Scenario: A transient-classified failure spawns a fork-pending task that self-heals
+- **WHEN** a repository's fork setup fails with a transient-classified
+  cause (a transport/DNS error or a transient-classified HTTP status)
+- **THEN** the repository's polling task is spawned in the fork-pending
+  state (it is NOT skipped for the process lifetime)
+- **AND** each iteration re-attempts the full fork setup, logging a
+  WARN per failed attempt, AND a throttled chatops alert names the
+  repository as fork-pending
+- **AND** when an attempt succeeds, the task logs an INFO recovery
+  notice AND proceeds as a normal polling task with no operator action
+
+#### Scenario: The reachability timeout is transient, not a lifetime skip
 - **WHEN** the POST returns 2xx with a matching fork identity AND
   `git ls-remote <fork-url> HEAD` fails for 60 seconds of polling at
   2-second intervals
-- **THEN** that repository's failure is recorded as
-  "fork creation succeeded but the fork at `<fork-url>` was not
-  reachable within 60s"
-- **AND** that repository is skipped (no retry until an operator
-  restart or reload) AND a chatops alert identifying it is emitted
-- **AND** the daemon proceeds to serve the other repositories without
-  exiting
+- **THEN** the failure is classified transient (GitHub populates forks
+  asynchronously)
+- **AND** the repository's polling task spawns fork-pending AND the
+  next iteration's re-attempt probes the fork again, succeeding as
+  soon as the fork is populated
 
-#### Scenario: A fork already exists when creation is attempted
-- **WHEN** autocoder issues the fork-creation POST AND the upstream
-  has already been forked to the destination user under the expected
-  name
-- **THEN** the GitHub API returns 2xx with the existing fork's
-  metadata (idempotent behavior)
-- **AND** the returned fork identity matches the derived fork URL, so
-  autocoder treats this as success and proceeds with the reachability
-  probe normally
+#### Scenario: An unrecognized failure defaults to transient
+- **WHEN** a fork-setup failure's cause matches neither the documented
+  transient nor permanent patterns
+- **THEN** it is treated as transient (the classification's
+  default-to-transient posture), so an unfamiliar error retries
+  rather than permanently sidelining the repository
+- **AND** the per-attempt WARN makes the unfamiliar pattern visible in
+  the journal
+
+#### Scenario: A fork-pending repository does no other work until setup succeeds
+- **WHEN** a repository's polling task is in the fork-pending state
+- **THEN** its iterations perform ONLY the fork-setup re-attempt — no
+  branch init, no lane walks, no audits, no executor — until an
+  attempt succeeds
 
 #### Scenario: An existing fork carries a different name than expected
 - **WHEN** autocoder issues the fork-creation POST AND the 2xx
@@ -443,10 +471,20 @@ A fork-setup failure for one repository — creation returns non-2xx, the creati
   the fork to match, then restart or run `autocoder reload`")
 - **AND** no `git ls-remote` reachability polling is performed for
   that repository (no 60-second wait)
-- **AND** that repository is skipped (no retry until an operator
-  restart or reload) AND a chatops alert identifying it is emitted,
-  AND the daemon proceeds to serve the other repositories without
-  exiting
+- **AND** the failure is PERMANENT: the repository is skipped (no retry
+  until an operator restart or reload) AND a chatops alert identifying
+  it is emitted, AND the daemon proceeds to serve the other
+  repositories without exiting
+
+#### Scenario: A fork already exists when creation is attempted
+- **WHEN** autocoder issues the fork-creation POST AND the upstream
+  has already been forked to the destination user under the expected
+  name
+- **THEN** the GitHub API returns 2xx with the existing fork's
+  metadata (idempotent behavior)
+- **AND** the returned fork identity matches the derived fork URL, so
+  autocoder treats this as success and proceeds with the reachability
+  probe normally
 
 #### Scenario: Creation response body cannot be parsed for a fork identity
 - **WHEN** the fork-creation POST returns 2xx AND the response body
@@ -457,21 +495,22 @@ A fork-setup failure for one repository — creation returns non-2xx, the creati
   fails a fork setup that would otherwise succeed
 
 #### Scenario: Fork-setup alert names the concrete reload command
-- **WHEN** any fork-setup failure alert is emitted
+- **WHEN** a permanent-classified fork-setup failure alert is emitted
 - **THEN** its remedy hint instructs the operator to restart the
   daemon or run `autocoder reload` on the daemon host (the alert never
   refers to a bare `reload` verb)
 
 #### Scenario: One repository's fork failure does not take down the others
 - **WHEN** autocoder starts with multiple repositories AND one
-  repository's fork cannot be set up (creation fails, the returned
-  fork identity mismatches, OR the fork is not reachable within the
-  timeout) AND the other repositories' forks are reachable
+  repository's fork cannot be set up AND the other repositories' forks
+  are reachable
 - **THEN** the daemon spawns polling tasks for the reachable
   repositories AND enters normal polling
 - **AND** chatops is served (the daemon does not exit)
-- **AND** the failed repository is absent from the active polling set
-  until the operator remediates AND restarts or reloads
+- **AND** a permanent-classified failure leaves that repository absent
+  from the active polling set until the operator remediates AND
+  restarts or reloads, while a transient-classified failure leaves it
+  fork-pending and self-healing
 
 #### Scenario: Every repository's fork fails
 - **WHEN** every configured repository fails fork setup
