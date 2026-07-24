@@ -65,6 +65,7 @@ async fn cancellation_during_sleep_exits() {
     let iteration_sleep = Arc::new(tokio::sync::Notify::new());
     let hooks = RunHooks {
         on_iteration_sleep: Some(iteration_sleep.clone()),
+        fork_ops: None,
     };
     let paths_for_run = std::sync::Arc::new(crate::testing::test_daemon_paths().1);
     // Serialize on the github-api-base test hook: the spawned `run_with_hooks`
@@ -106,6 +107,7 @@ async fn cancellation_during_sleep_exits() {
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(tokio::sync::Notify::new()),
             cancel_for_task,
+            false, // fork_pending: normal task
             hooks,
         )
         .await;
@@ -125,6 +127,148 @@ async fn cancellation_during_sleep_exits() {
     // otherwise dominate.
     let res = tokio::time::timeout(Duration::from_secs(1), handle).await;
     assert!(res.is_ok(), "polling loop did not exit within 1s of cancel");
+}
+
+/// startup-fork-setup-retries-transient-failures: the loop-level fork-pending
+/// driver must EXIT the polling set when a re-attempt classifies Permanent.
+/// This covers the `if fork_pending { … }` wiring in `run_with_hooks` (the
+/// `ForkPendingStep::Permanent => break` arm) that the isolated
+/// `run_fork_pending_iteration` tests can't reach. A scripted `ForkOps` is
+/// injected via the `RunHooks::fork_ops` override; its create returns a
+/// mismatched fork identity (→ permanent, no reachability poll), so the task
+/// must return on its OWN with no cancellation — a wiring bug (Permanent not
+/// breaking) would sleep past the timeout, and `NeverRuns` would panic if the
+/// loop wrongly fell through to normal executor work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fork_pending_loop_breaks_on_permanent_reattempt() {
+    use crate::executor::ResumeHandle;
+    use async_trait::async_trait;
+
+    // Fork never reachable → the re-attempt issues a create POST; the create
+    // names a DIFFERENT fork than the derived `mu/a` → identity mismatch →
+    // PERMANENT. The mismatch records the failure before the 60s reachability
+    // poll, so the test is fast.
+    struct MismatchOnCreate;
+    #[async_trait]
+    impl crate::cli::run::ForkOps for MismatchOnCreate {
+        fn fork_reachable(&self, _fork_url: &str) -> bool {
+            false
+        }
+        async fn create_fork(
+            &self,
+            _upstream_owner: &str,
+            _upstream_repo: &str,
+            _token: &str,
+        ) -> Result<Option<String>> {
+            Ok(Some("mu/renamed".into()))
+        }
+    }
+
+    // Fork-pending never runs the executor; a call here means the loop wrongly
+    // left the fork-pending state.
+    struct NeverRuns;
+    #[async_trait]
+    impl Executor for NeverRuns {
+        async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+            unreachable!("fork-pending iterations never run the executor");
+        }
+        async fn resume(&self, _h: ResumeHandle, _a: &str) -> Result<ExecutorOutcome> {
+            unreachable!()
+        }
+    }
+
+    let repo = RepositoryConfig {
+        forge: None,
+        url: "git@github.com:orgA/a.git".into(),
+        local_path: None,
+        base_branch: "main".into(),
+        agent_branch: "agent-q".into(),
+        poll_interval_sec: 60,
+        chatops_channel_id: None,
+        max_changes_per_pr: None,
+        audits: None,
+        spec_storage: None,
+        upstream: None,
+        auto_submit_pr: true,
+        octopus_guide: None,
+        sandbox: None,
+    };
+    // fork_owner set + an inline PAT so fork-URL derivation AND PAT resolution
+    // both succeed and the driver reaches the create POST.
+    let github = GithubConfig {
+        token_env: "DOES_NOT_EXIST".into(),
+        token: Some(crate::config::SecretSource::Inline {
+            value: "inline-fork-pat".into(),
+        }),
+        owner_tokens: None,
+        fork_owner: Some("mu".into()),
+        recreate_fork_on_reinit: false,
+        command_authorization: Default::default(),
+    };
+
+    let cancel = CancellationToken::new();
+    let executor: Arc<dyn Executor> = Arc::new(NeverRuns);
+    let cancel_for_task = cancel.clone();
+    let github_holder: GithubHolder = Arc::new(arc_swap::ArcSwap::from_pointee(github));
+    let reviewer_holder: ReviewerHolder = Arc::new(arc_swap::ArcSwap::from_pointee(None));
+    let chatops_holder: ChatOpsHolder = Arc::new(arc_swap::ArcSwap::from_pointee(None));
+    let cache_holder: CacheHolder = Arc::new(arc_swap::ArcSwap::from_pointee(
+        crate::config::CacheConfig::default(),
+    ));
+    let repo_holder: Arc<ArcSwap<RepositoryConfig>> = Arc::new(ArcSwap::from_pointee(repo));
+    let hooks = RunHooks {
+        on_iteration_sleep: None,
+        fork_ops: Some(Arc::new(MismatchOnCreate)),
+    };
+    let paths_for_run = std::sync::Arc::new(crate::testing::test_daemon_paths().1);
+
+    let handle = tokio::spawn(async move {
+        run_with_hooks(
+            paths_for_run,
+            repo_holder,
+            executor,
+            github_holder,
+            reviewer_holder,
+            chatops_holder,
+            cache_holder,
+            2400,
+            u32::MAX,
+            Some(u32::MAX),
+            0,
+            Some(10),
+            0,
+            0,
+            std::sync::Arc::new(crate::audits::AuditRegistry::default()),
+            None,
+            std::sync::Arc::new(std::collections::HashMap::new()),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            crate::control_socket::RevisionRequestQueues::new(),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            cancel_for_task,
+            true, // fork_pending: start in the fork-pending state
+            hooks,
+        )
+        .await;
+    });
+
+    // The Permanent arm breaks on the FIRST iteration — no cancellation. The
+    // 5s cap is a guardrail; a correct loop returns almost immediately.
+    let res = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    assert!(
+        res.is_ok(),
+        "fork-pending loop must break by itself on a permanent re-attempt"
+    );
 }
 
 #[test]

@@ -365,6 +365,7 @@ async fn iteration_error_continues() {
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(tokio::sync::Notify::new()),
             cancel_for_task,
+            false, // fork_pending: normal task
         )
         .await;
     });

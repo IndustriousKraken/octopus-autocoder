@@ -64,6 +64,8 @@ mod outcome;
 pub(crate) use outcome::*;
 mod loop_drive;
 pub(crate) use loop_drive::*;
+mod fork_pending;
+pub(crate) use fork_pending::*;
 mod pass;
 pub(crate) use pass::*;
 mod commits;
@@ -299,6 +301,10 @@ pub async fn run(
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
+    // startup-fork-setup-retries-transient-failures: when true, the task
+    // starts in the fork-pending state (re-attempts fork setup each iteration
+    // and does no other work until it succeeds).
+    fork_pending: bool,
 ) {
     run_with_hooks(
         paths,
@@ -333,6 +339,7 @@ pub async fn run(
         iteration_cancel,
         iteration_drained,
         cancel,
+        fork_pending,
         RunHooks::default(),
     )
     .await
@@ -349,6 +356,13 @@ pub struct RunHooks {
     /// race a cancel against the sleep wait on this to know the loop
     /// reached the sleep window.
     pub on_iteration_sleep: Option<Arc<tokio::sync::Notify>>,
+    /// Test-only override for the fork-setup primitives the fork-pending
+    /// loop driver uses (startup-fork-setup-retries-transient-failures).
+    /// Production leaves this `None` so the driver uses the real
+    /// `GitForkOps`; a loop-level test injects a scripted `ForkOps` to
+    /// exercise the Ready/RetryTransient/Permanent state transitions
+    /// (e.g. the `Permanent => break` arm) without network.
+    pub(crate) fork_ops: Option<Arc<dyn crate::cli::run::ForkOps>>,
 }
 
 /// Drops at the end of the iteration body — including the panic-unwind
@@ -417,6 +431,10 @@ pub async fn run_with_hooks(
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
+    // startup-fork-setup-retries-transient-failures: start in the fork-pending
+    // state when true. Mutated to `false` on the first successful re-attempt,
+    // after which the task runs the normal polling cycle.
+    mut fork_pending: bool,
     hooks: RunHooks,
 ) {
     if log_startup_and_jitter(&repo, &paths, startup_jitter_max_secs, &cancel).await {
@@ -445,6 +463,66 @@ pub async fn run_with_hooks(
     loop {
         if cancel.is_cancelled() {
             break;
+        }
+
+        // Fork-pending exception (startup-fork-setup-retries-transient-failures):
+        // while fork-pending, an iteration runs ONLY the fork-setup re-attempt —
+        // no branch init, no lane walks, no audits, no executor — until it
+        // succeeds. The sleep, jitter, and cancellation semantics of the normal
+        // cycle apply identically here.
+        if fork_pending {
+            let (step, base_secs) = {
+                let snapshot = repo.load();
+                let snapshot_ref: &RepositoryConfig = snapshot.as_ref();
+                let workspace = workspace::resolve_path(&paths, snapshot_ref);
+                let github_snap = github_holder.load_full();
+                let chatops_snap = chatops_holder.load_full();
+                let chatops_ctx = chatops_snap
+                    .as_ref()
+                    .as_ref()
+                    .map(|slot| build_chatops_ctx(snapshot_ref, slot));
+                let git_ops = crate::cli::run::GitForkOps;
+                let ops: &dyn crate::cli::run::ForkOps =
+                    hooks.fork_ops.as_deref().unwrap_or(&git_ops);
+                let step = run_fork_pending_iteration(
+                    &paths,
+                    &workspace,
+                    snapshot_ref,
+                    &github_snap,
+                    chatops_ctx.as_ref(),
+                    ops,
+                    crate::cli::run::FORK_REACHABILITY_TIMEOUT,
+                    crate::cli::run::FORK_REACHABILITY_POLL_INTERVAL,
+                )
+                .await;
+                (step, snapshot_ref.poll_interval_sec)
+            };
+            match step {
+                // Fork is set up: clear the fork-pending flag so the NEXT
+                // iteration runs the normal polling cycle (the recovery INFO
+                // notice was already logged inside the re-attempt).
+                ForkPendingStep::Ready => fork_pending = false,
+                // Permanent cause (e.g. upstream renamed while pending): exit
+                // the polling set, as if skipped at startup. The self-removal
+                // after the loop drops this task's map entry.
+                ForkPendingStep::Permanent => break,
+                // Still transient: stay fork-pending and re-attempt next tick.
+                ForkPendingStep::RetryTransient => {}
+            }
+            // Both a successful re-attempt (now a normal task) and a still-
+            // transient one park until the next tick, honouring the SAME jitter
+            // + cancellation contract as the normal inter-iteration sleep, then
+            // re-enter the loop.
+            let sleep_dur = jittered_sleep_duration(base_secs, inter_iteration_jitter_pct);
+            if let Some(notify) = &hooks.on_iteration_sleep {
+                notify.notify_waiters();
+            }
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => break,
+                () = sleep(sleep_dur) => {}
+            }
+            continue;
         }
 
         // Per-iteration cancel token (child of the global cancel). The

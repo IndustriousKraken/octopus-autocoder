@@ -62,6 +62,13 @@ pub enum AlertCategory {
     /// operator-visible. The in-memory consecutive-failure counter resets on
     /// any successful query.
     OpenPrGateFailure,
+    /// A repository whose startup fork setup failed transiently is running
+    /// in the fork-pending state: each polling iteration re-attempts the
+    /// fork setup and does no other work until it succeeds. A throttled
+    /// alert under this category tells the operator the repo is degraded
+    /// without spamming one alert per failed re-attempt
+    /// (startup-fork-setup-retries-transient-failures).
+    ForkSetupPending,
 }
 
 impl AlertCategory {
@@ -77,6 +84,7 @@ impl AlertCategory {
             Self::SpecNeedsRevision => "spec needs revision",
             Self::ArchiveCollision => "archive collision",
             Self::OpenPrGateFailure => "open-PR gate query keeps failing",
+            Self::ForkSetupPending => "fork setup pending",
         }
     }
 }
