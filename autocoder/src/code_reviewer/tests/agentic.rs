@@ -76,7 +76,7 @@ fn agentic_prompt_lists_paths_and_references_diff_artifact() {
         diff: "DIFFBODY".into(),
         target: None,
     };
-    let prompt = render_agentic_review_prompt(&ctx, "", &artifact_rel);
+    let prompt = render_agentic_review_prompt(&ctx, "", "", &artifact_rel);
     assert!(prompt.contains("src/big.rs"), "path must be listed");
     assert!(
         !prompt.contains("SECRET_FILE_BODY"),
@@ -112,8 +112,8 @@ fn agentic_prompt_is_bounded_regardless_of_diff_size() {
         diff,
         target: None,
     };
-    let small = render_agentic_review_prompt(&mk("a".into()), "", &artifact_rel);
-    let huge = render_agentic_review_prompt(&mk("x".repeat(500_000)), "", &artifact_rel);
+    let small = render_agentic_review_prompt(&mk("a".into()), "", "", &artifact_rel);
+    let huge = render_agentic_review_prompt(&mk("x".repeat(500_000)), "", "", &artifact_rel);
     assert_eq!(
         small.len(),
         huge.len(),
@@ -585,6 +585,216 @@ fn synthesize_agentic_per_change_empty_input_is_block() {
         result.attribution.as_deref(),
         Some("p/m"),
         "attribution is preserved through the guard"
+    );
+}
+
+// =====================================================================
+// agentic-reviewer-honors-prompt-override: the configured reviewer prompt
+// override becomes an operator guidance preamble on the agentic prompt.
+// =====================================================================
+
+/// 2.1: with an operator preamble, its content is the FIRST thing in the
+/// prompt AND every code-built section still follows it, unchanged.
+#[test]
+fn agentic_operator_preamble_leads_prompt_with_all_sections_following() {
+    let artifact_rel = review_diff_artifact_rel("");
+    let ctx = ReviewContext {
+        archived_changes: vec![brief("demo")],
+        changed_files: vec![ChangedFile {
+            path: "src/x.rs".into(),
+            contents: String::new(),
+        }],
+        diff: "d".into(),
+        target: None,
+    };
+    let preamble = "OPERATOR_HOUSE_RULES: block on non-null concerns";
+    let prompt = render_agentic_review_prompt(&ctx, preamble, "", &artifact_rel);
+    assert!(
+        prompt.starts_with("OPERATOR_HOUSE_RULES"),
+        "operator preamble must lead the prompt: {prompt:.80}"
+    );
+    // Every code-built section follows the preamble, in order.
+    let p_idx = prompt.find("OPERATOR_HOUSE_RULES").unwrap();
+    let scope_idx = prompt.find("reviewing code for quality").expect("quality-scope section");
+    assert!(p_idx < scope_idx, "quality-scope must follow the operator preamble");
+    assert!(prompt.contains("src/x.rs"), "changed-path list retained");
+    assert!(prompt.contains(&artifact_rel), "diff-artifact reference retained");
+    assert!(prompt.contains("submit_review"), "submit_review contract retained");
+}
+
+/// 2.1: without an override the prompt is byte-identical to the pre-override
+/// rendering — an empty (or whitespace-only) operator preamble contributes
+/// nothing, so the prompt leads with the code-built quality-scope section.
+#[test]
+fn agentic_no_override_renders_prompt_unchanged() {
+    let artifact_rel = review_diff_artifact_rel("");
+    let ctx = ReviewContext {
+        archived_changes: vec![brief("demo")],
+        changed_files: Vec::new(),
+        diff: "d".into(),
+        target: None,
+    };
+    let plain = render_agentic_review_prompt(&ctx, "", "", &artifact_rel);
+    assert!(
+        plain.starts_with("You are reviewing code for quality"),
+        "no override → prompt leads with the code-built quality-scope section"
+    );
+    let whitespace = render_agentic_review_prompt(&ctx, "  \n\t ", "", &artifact_rel);
+    assert_eq!(
+        whitespace, plain,
+        "a whitespace-only override is treated as absent (byte-identical)"
+    );
+}
+
+/// 2.2: a configured-but-MISSING override file discards the review loudly —
+/// the reason names the file, AND no session is spawned. Removing the config
+/// key (no override paths) restores normal rendering (a valid submission
+/// produces a `Reviewed` outcome).
+#[tokio::test]
+async fn agentic_missing_override_fails_loud_no_session() {
+    let (client, _) = stub_with_capture("");
+    let missing = std::path::PathBuf::from(
+        "/nonexistent/agentic-reviewer-honors-prompt-override-missing.md",
+    );
+    let reviewer = CodeReviewer::new(client, "t".to_string())
+        .with_prompt_override_paths(Some(missing.clone()), None);
+    let runner = CannedRunner::new(vec![Some(valid_review_payload("Approve"))]);
+    let outcome = run_agentic_review_with_runner(&reviewer, &ReviewContext::default(), &runner)
+        .await
+        .unwrap();
+    match outcome {
+        AgenticReviewOutcome::Discarded { reason } => {
+            assert!(
+                reason.contains(&missing.display().to_string()),
+                "the discard reason names the override file: {reason}"
+            );
+        }
+        AgenticReviewOutcome::Reviewed(_) => {
+            panic!("a broken override must discard, never produce a verdict")
+        }
+    }
+    assert_eq!(runner.session_count(), 0, "no session is spawned on a broken override");
+
+    // Removing the config key restores normal rendering: the same runner's
+    // canned submission now drives a Reviewed outcome.
+    let (client2, _) = stub_with_capture("");
+    let plain_reviewer = CodeReviewer::new(client2, "t".to_string());
+    let runner2 = CannedRunner::new(vec![Some(valid_review_payload("Approve"))]);
+    let outcome2 = run_agentic_review_with_runner(&plain_reviewer, &ReviewContext::default(), &runner2)
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome2, AgenticReviewOutcome::Reviewed(_)),
+        "with no override configured the review runs normally"
+    );
+    assert_eq!(runner2.session_count(), 1);
+}
+
+/// 2.2: a configured-but-EMPTY override file discards the review loudly (the
+/// use-time fail-loud posture — an empty override is not a silent fallback to
+/// the embedded guidance) AND spawns no session.
+#[tokio::test]
+async fn agentic_empty_override_fails_loud_no_session() {
+    let (client, _) = stub_with_capture("");
+    let dir = tempfile::TempDir::new().unwrap();
+    let empty = dir.path().join("empty-override.md");
+    std::fs::write(&empty, "   \n\t\n").unwrap();
+    let reviewer = CodeReviewer::new(client, "t".to_string())
+        .with_prompt_override_paths(Some(empty.clone()), None);
+    let runner = CannedRunner::new(vec![Some(valid_review_payload("Approve"))]);
+    let outcome = run_agentic_review_with_runner(&reviewer, &ReviewContext::default(), &runner)
+        .await
+        .unwrap();
+    match outcome {
+        AgenticReviewOutcome::Discarded { reason } => {
+            assert!(
+                reason.contains(&empty.display().to_string()),
+                "the discard reason names the empty override file: {reason}"
+            );
+        }
+        AgenticReviewOutcome::Reviewed(_) => panic!("an empty override must discard"),
+    }
+    assert_eq!(runner.session_count(), 0, "no session is spawned on an empty override");
+}
+
+/// 2.3: in `per_change` mode each session carries the operator preamble AHEAD
+/// of its cross-change preamble; in `bundled` mode the preamble is carried
+/// once. The override is resolved once per review and re-read at review time.
+#[tokio::test]
+async fn agentic_operator_preamble_carried_in_both_modes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let override_file = dir.path().join("guidance.md");
+    std::fs::write(&override_file, "OPERATOR_PREAMBLE_SENTINEL").unwrap();
+
+    let ctx = ReviewContext {
+        archived_changes: vec![brief("a-one"), brief("b-two")],
+        changed_files: Vec::new(),
+        diff: "d".into(),
+        target: None,
+    };
+
+    // per_change: one session per change, each leading with the operator
+    // preamble ahead of the "This PR contains …" cross-change preamble.
+    let (client, _) = stub_with_capture("");
+    let per_change = CodeReviewer::new(client, "t".to_string())
+        .with_mode(crate::config::ReviewerMode::PerChange)
+        .with_prompt_override_paths(Some(override_file.clone()), None);
+    let runner = CannedRunner::new(vec![
+        Some(valid_review_payload("Approve")),
+        Some(valid_review_payload("Approve")),
+    ]);
+    run_agentic_review_with_runner(&per_change, &ctx, &runner)
+        .await
+        .unwrap();
+    let prompts = runner.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 2, "one session per change");
+    for p in prompts.iter() {
+        let pre_idx = p.find("OPERATOR_PREAMBLE_SENTINEL").expect("operator preamble present");
+        let cross_idx = p.find("This PR contains").expect("cross-change preamble present");
+        assert!(
+            pre_idx < cross_idx,
+            "operator preamble must precede the cross-change preamble"
+        );
+    }
+    drop(prompts);
+
+    // bundled: exactly one session, carrying the preamble once.
+    let (client2, _) = stub_with_capture("");
+    let bundled = CodeReviewer::new(client2, "t".to_string())
+        .with_mode(crate::config::ReviewerMode::Bundled)
+        .with_prompt_override_paths(Some(override_file.clone()), None);
+    let runner2 = CannedRunner::new(vec![Some(valid_review_payload("Approve"))]);
+    run_agentic_review_with_runner(&bundled, &ctx, &runner2)
+        .await
+        .unwrap();
+    let prompts2 = runner2.prompts.lock().unwrap();
+    assert_eq!(prompts2.len(), 1, "bundled runs one session");
+    assert_eq!(
+        prompts2[0].matches("OPERATOR_PREAMBLE_SENTINEL").count(),
+        1,
+        "bundled carries the operator preamble exactly once"
+    );
+}
+
+/// The legacy flat key (`reviewer.prompt_template_path`) is honored by the
+/// agentic path when the nested key is unset — the same nested→legacy
+/// selection the oneshot loader uses.
+#[tokio::test]
+async fn agentic_legacy_override_key_is_honored() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let legacy = dir.path().join("legacy-guidance.md");
+    std::fs::write(&legacy, "LEGACY_PREAMBLE_SENTINEL").unwrap();
+    let (client, _) = stub_with_capture("");
+    let reviewer = CodeReviewer::new(client, "t".to_string())
+        .with_prompt_override_paths(None, Some(legacy));
+    let runner = CannedRunner::new(vec![Some(valid_review_payload("Approve"))]);
+    run_agentic_review_with_runner(&reviewer, &ReviewContext::default(), &runner)
+        .await
+        .unwrap();
+    let prompts = runner.prompts.lock().unwrap();
+    assert!(
+        prompts[0].starts_with("LEGACY_PREAMBLE_SENTINEL"),
+        "legacy override key content leads the prompt"
     );
 }
 
