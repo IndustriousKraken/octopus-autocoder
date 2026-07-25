@@ -12,14 +12,17 @@ branch is never consulted.
 
 EXCEPT when a **push-block marker** is present for the workspace AND the agent
 branch tip matches the marker's recorded tip commit (the state left by a prior pass
-whose branch push failed, per the `orchestrator-cli` requirement "Branch-push
-failure preserves completed work via a push-block hold"): in that case the pass
-SHALL NOT recreate or overwrite the agent branch, so the preserved commits are
-retained, AND it SHALL NOT re-run the executor for those already-committed changes.
-The pass instead retries the push step only; on success the marker is removed and
-the PR opened. A push failure SHALL never cause the completed work on the branch to
-be discarded. If a marker is present but the tip no longer matches, the marker is
-stale: it is removed and the branch is recreated normally.
+whose branch push — or whose PR creation after a successful push — failed, per the
+`orchestrator-cli` requirement "Branch-push failure preserves completed work via a
+push-block hold"): in that case the pass SHALL NOT recreate or overwrite the agent
+branch, so the preserved commits are retained, AND it SHALL NOT re-run the executor
+for those already-committed changes or issue units. The pass instead retries the
+remaining delivery steps only (the push, then PR creation — for a PR-creation hold
+the push retry is a no-op on the already-pushed tip); on success the marker is
+removed and the PR opened. A push or PR-creation failure SHALL never cause the
+completed work on the branch to be discarded. If a marker is present but the tip no
+longer matches, the marker is stale: it is removed and the branch is recreated
+normally.
 
 #### Scenario: Branch initialization at start of pass
 - **WHEN** a polling pass begins for a repository AND the queue
@@ -52,9 +55,10 @@ stale: it is removed and the branch is recreated normally.
 - **THEN** the manager SHALL NOT run `git checkout -B <agent_branch>` and SHALL NOT
   otherwise reset or overwrite the agent branch
 - **AND** the preserved commits remain on `<agent_branch>`
-- **AND** the executor is NOT re-run for the already-committed changes
-- **AND** whether the push is retried this pass is governed by the push-block hold
-  (per the `orchestrator-cli` requirement), independent of recreating the branch
+- **AND** the executor is NOT re-run for the already-committed changes or issue units
+- **AND** whether the push or the PR creation is retried this pass is governed by the
+  push-block hold (per the `orchestrator-cli` requirement), independent of recreating
+  the branch
 
 ### Requirement: Serial commit per change
 The git workflow manager SHALL produce one commit per successfully implemented change, on the agent branch, in queue order. A change is "successfully implemented" only when the executor returns `Completed` AND `git status --porcelain` returns a non-empty result. If the workspace is clean after a `Completed` outcome, the manager SHALL NOT commit or archive the change; the iteration SHALL be marked Failed and the change SHALL remain pending for retry. The single commit per change SHALL include both the executor's working-tree modifications AND the archive move of `openspec/changes/<change>/` to `openspec/changes/archive/<YYYY-MM-DD>-<change>/`, so after the commit the working tree is clean and the change's archive move is fully captured in git history.

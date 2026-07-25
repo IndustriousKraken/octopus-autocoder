@@ -214,44 +214,26 @@ pub async fn execute_one_pass(
     };
     let _ = guard.set_stage(busy_marker::Stage::Push);
     if let Err(e) = git::push_force_with_lease(workspace, &repo.agent_branch, push_remote) {
-        // The changes are committed + archived on the agent branch but the push
-        // failed. Preserve the completed work: write a push-block marker anchored
-        // to the branch tip so the next pass resumes at the push step instead of
-        // recreating the branch and re-implementing (orchestrator-cli "Branch-push
-        // failure preserves completed work via a push-block hold"). Audit-only
-        // passes (no processed changes) keep the old behavior — their commits are
-        // cheap to regenerate.
-        if !processed.is_empty() {
-            match git::rev_parse(workspace, &repo.agent_branch) {
-                Ok(tip) => {
-                    let marker = crate::push_block::PushBlock {
-                        tip_commit: tip,
-                        change_slugs: processed.clone(),
-                        reason: format!("{e:#}"),
-                        blocked_at: chrono::Utc::now(),
-                        review_report: review_report.clone(),
-                        spec_verification_section: spec_verification_section.clone(),
-                        gate_verdicts_section: gate_verdicts_section.clone(),
-                    };
-                    match crate::push_block::write(paths, workspace, &marker) {
-                        Ok(()) => tracing::warn!(
-                            url = %repo.url,
-                            slugs = ?processed,
-                            "branch push failed; preserved completed work on {} via push-block hold (no re-implementation next pass)",
-                            repo.agent_branch
-                        ),
-                        Err(we) => tracing::warn!(
-                            url = %repo.url,
-                            "failed to write push-block marker (work still on branch): {we:#}"
-                        ),
-                    }
-                }
-                Err(re) => tracing::warn!(
-                    url = %repo.url,
-                    "branch push failed and the agent-branch tip could not be resolved for a push-block marker ({re:#}); work remains on the branch but the next pass will recreate it"
-                ),
-            }
-        }
+        // The changes/issues are committed + archived on the agent branch but the
+        // push failed. Preserve the completed work: write a push-block marker
+        // anchored to the branch tip so the next pass resumes at the push step
+        // instead of recreating the branch and re-implementing (orchestrator-cli
+        // "Branch-push failure preserves completed work via a push-block hold").
+        // Issue-bearing passes get the same hold (their slugs recorded in
+        // `issue_slugs`); audit-only passes (no processed change or issue) keep the
+        // old behavior — their commits are cheap to regenerate.
+        write_push_block_hold(
+            paths,
+            workspace,
+            repo,
+            crate::push_block::FailedStep::Push,
+            &processed,
+            &processed_issues,
+            format!("{e:#}"),
+            review_report.as_ref(),
+            spec_verification_section.as_deref(),
+            gate_verdicts_section.as_deref(),
+        );
         handle_predictable_failure(
             paths,
             workspace,
@@ -267,7 +249,7 @@ pub async fn execute_one_pass(
         return Err(e);
     }
     let _ = guard.set_stage(busy_marker::Stage::Pr);
-    open_pull_request(
+    if let Err(e) = open_pull_request(
         paths,
         repo,
         github_cfg,
@@ -283,7 +265,29 @@ pub async fn execute_one_pass(
         spec_verification_section.as_deref(),
         gate_verdicts_section.as_deref(),
     )
-    .await?;
+    .await
+    {
+        // The push already succeeded; PR creation then failed. Preserve the pushed
+        // work: write a push-block marker recording PR creation as the failed step
+        // so the next pass retries PR creation ONLY (the push retry is a no-op on
+        // the already-pushed tip) instead of recreating the branch and
+        // re-implementing (orchestrator-cli "Branch-push failure preserves
+        // completed work via a push-block hold", PR-creation arm). The throttled
+        // `PrCreationFailure` alert already fired inside `open_pull_request`.
+        write_push_block_hold(
+            paths,
+            workspace,
+            repo,
+            crate::push_block::FailedStep::PrCreation,
+            &processed,
+            &processed_issues,
+            format!("{e:#}"),
+            review_report.as_ref(),
+            spec_verification_section.as_deref(),
+            gate_verdicts_section.as_deref(),
+        );
+        return Err(e);
+    }
     // End-of-pass success: push and PR creation both succeeded. Clear the
     // entire alert-state map so the next failure (whatever category) re-
     // alerts immediately. Per design.md, this is intentionally coarse —
@@ -364,20 +368,24 @@ async fn resume_push_block(
         .await;
         return Err(e);
     }
-    // Push succeeded. Open the PR from the carried slugs, restoring the
-    // review report and gate sections that were computed in the original
-    // pass (stored in the marker) so the PR body includes them.
+    // Push succeeded (or was a no-op for a PR-creation hold). Open the PR from
+    // the carried change AND issue slugs (orchestrator-cli: the resumed PR body
+    // is derived from both), restoring the review report and gate sections that
+    // were computed in the original pass (stored in the marker) so the PR body
+    // includes them.
     let _ = guard.set_stage(busy_marker::Stage::Pr);
     let revision_concerns: Vec<_> = marker
         .review_report
         .as_ref()
         .map(|r| r.concerns.clone())
         .unwrap_or_default();
-    open_pull_request(
+    let mut pr_slugs = marker.change_slugs.clone();
+    pr_slugs.extend(marker.issue_slugs.iter().cloned());
+    if let Err(e) = open_pull_request(
         paths,
         repo,
         github_cfg,
-        &marker.change_slugs,
+        &pr_slugs,
         false,
         marker.review_report.as_ref(),
         reviewer,
@@ -389,7 +397,23 @@ async fn resume_push_block(
         marker.spec_verification_section.as_deref(),
         marker.gate_verdicts_section.as_deref(),
     )
-    .await?;
+    .await
+    {
+        // The push retry succeeded (or was a no-op) but PR creation failed. Retain
+        // the hold as a PR-creation hold — refresh its reason AND record PR
+        // creation as the failed step — so the next pass retries PR creation only
+        // (orchestrator-cli: "if the PR-creation call itself then fails, a
+        // PR-creation hold is written"). The throttled `PrCreationFailure` alert
+        // already fired inside `open_pull_request`; the preserved work stays on the
+        // branch.
+        let updated = crate::push_block::PushBlock {
+            reason: format!("{e:#}"),
+            failed_step: crate::push_block::FailedStep::PrCreation,
+            ..marker
+        };
+        let _ = crate::push_block::write(paths, workspace, &updated);
+        return Err(e);
+    }
     if let Err(e) = crate::push_block::clear(paths, workspace) {
         tracing::warn!(
             url = %repo.url,
@@ -403,6 +427,65 @@ async fn resume_push_block(
         );
     }
     Ok(())
+}
+
+/// Write a push-block hold that preserves the pass's completed work on the agent
+/// branch. Called on a branch-push failure (`FailedStep::Push`) or a PR-creation
+/// failure after a successful push (`FailedStep::PrCreation`). The hold is written
+/// ONLY when the pass carried at least one change OR issue unit — audit-only
+/// commits are cheap to regenerate, so they keep the recreate-next-pass behavior.
+/// The recorded tip anchors branch preservation on the next pass; an unresolvable
+/// tip logs a WARN and skips the hold (the work stays on the branch, but the next
+/// pass recreates it — the existing best-effort degraded behavior, unchanged).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_push_block_hold(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    failed_step: crate::push_block::FailedStep,
+    processed: &[String],
+    processed_issues: &[String],
+    reason: String,
+    review_report: Option<&ReviewReport>,
+    spec_verification_section: Option<&str>,
+    gate_verdicts_section: Option<&str>,
+) {
+    if processed.is_empty() && processed_issues.is_empty() {
+        return;
+    }
+    match git::rev_parse(workspace, &repo.agent_branch) {
+        Ok(tip) => {
+            let marker = crate::push_block::PushBlock {
+                tip_commit: tip,
+                change_slugs: processed.to_vec(),
+                issue_slugs: processed_issues.to_vec(),
+                reason,
+                blocked_at: chrono::Utc::now(),
+                failed_step,
+                review_report: review_report.cloned(),
+                spec_verification_section: spec_verification_section.map(str::to_string),
+                gate_verdicts_section: gate_verdicts_section.map(str::to_string),
+            };
+            match crate::push_block::write(paths, workspace, &marker) {
+                Ok(()) => tracing::warn!(
+                    url = %repo.url,
+                    change_slugs = ?processed,
+                    issue_slugs = ?processed_issues,
+                    failed_step = ?failed_step,
+                    "delivery step failed; preserved completed work on {} via push-block hold (no re-implementation next pass)",
+                    repo.agent_branch
+                ),
+                Err(we) => tracing::warn!(
+                    url = %repo.url,
+                    "failed to write push-block marker (work still on branch): {we:#}"
+                ),
+            }
+        }
+        Err(re) => tracing::warn!(
+            url = %repo.url,
+            "delivery step failed and the agent-branch tip could not be resolved for a push-block marker ({re:#}); work remains on the branch but the next pass will recreate it"
+        ),
+    }
 }
 
 /// Run the PR-comment revision dispatcher and the chat-driven changelog

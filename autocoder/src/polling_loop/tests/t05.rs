@@ -848,8 +848,10 @@ async fn stale_push_block_marker_is_cleared_and_pass_proceeds() {
         &crate::push_block::PushBlock {
             tip_commit: "0000000000000000000000000000000000000000".into(),
             change_slugs: vec!["already-merged".into()],
+            issue_slugs: vec![],
             reason: "stale".into(),
             blocked_at: chrono::Utc::now(),
+            failed_step: crate::push_block::FailedStep::Push,
             review_report: None,
             spec_verification_section: None,
             gate_verdicts_section: None,
@@ -882,6 +884,350 @@ async fn stale_push_block_marker_is_cleared_and_pass_proceeds() {
 
     // The stale marker was cleared and the normal flow ran (recreate + executor),
     // so the marker now reflects the freshly-processed change, not the stale one.
+    let marker = crate::push_block::read(&paths, &ws).expect("normal flow re-failed the push");
+    assert_ne!(
+        marker.tip_commit, "0000000000000000000000000000000000000000",
+        "stale marker must have been replaced by a fresh one"
+    );
+    assert!(
+        marker.change_slugs.iter().any(|s| s == "needs-push"),
+        "fresh marker carries the reprocessed change: {:?}",
+        marker.change_slugs
+    );
+}
+
+/// hold-covers-pr-creation-failure 4.1: a PR-creation failure AFTER a successful
+/// push writes the push-block marker with `failed_step: pr_creation`; the next
+/// pass does NOT recreate the branch, does NOT run the executor, retries PR
+/// creation only, and clears the marker on success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr_creation_failure_writes_hold_then_next_pass_retries_pr_only() {
+    use crate::executor::ResumeHandle;
+    use async_trait::async_trait;
+
+    // Iteration-2 executor: its `run` must never be called on a resume.
+    struct PanicOnRun;
+    #[async_trait]
+    impl Executor for PanicOnRun {
+        async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+            panic!("executor must not run while a push-block hold is active");
+        }
+        async fn resume(&self, _h: ResumeHandle, _a: &str) -> Result<ExecutorOutcome> {
+            unreachable!()
+        }
+    }
+
+    let (_dir, ws) = fixture_workspace_with_remote();
+    // Unique basename so global namespaces (run-logs) don't collide with
+    // parallel tests sharing the default "workspace" name.
+    let ws = {
+        let renamed = ws.parent().unwrap().join("workspace-prfail-hold");
+        std::fs::rename(&ws, &renamed).unwrap();
+        renamed
+    };
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    add_committed_change(&ws, "needs-pr", "pr-creation-failure fixture");
+
+    let github = open_pr_gate_ok_github();
+    let _hook = test_hooks::lock();
+
+    // Iteration 1: push SUCCEEDS (working remote), PR creation FAILS (500).
+    let mut server1 = mockito::Server::new_async().await;
+    let _gate_mock = mock_open_pr_gate_empty(&mut server1).await; // GET /pulls -> []
+    let pr_fail_mock = server1
+        .mock("POST", "/repos/owner/fixture/pulls")
+        .with_status(500)
+        .with_body(r#"{"message":"server error"}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    test_hooks::set_github_api_base(Some(server1.url()));
+
+    let exec1 = CompletingExecutorWithDiff {
+        artifact_name: "PRFAIL.txt".into(),
+        artifact_text: "x".into(),
+    };
+    let r1 = execute_one_pass(
+        &paths, &ws, &fixture_repo(&ws), &exec1, &github, None, None,
+        2400u64, u32::MAX, u32::MAX, 0, Some(10),
+        &crate::audits::AuditRegistry::default(), None,
+        &std::collections::HashMap::new(), &std::sync::Mutex::new(Vec::new()),
+        &mut 0u32,
+    )
+    .await;
+    test_hooks::set_github_api_base(None);
+    assert!(r1.is_err(), "PR-creation failure must fail the iteration");
+    pr_fail_mock.assert_async().await;
+
+    let marker = crate::push_block::read(&paths, &ws)
+        .expect("PR-creation failure must write a push-block marker");
+    assert_eq!(
+        marker.failed_step,
+        crate::push_block::FailedStep::PrCreation,
+        "marker must record PR creation as the failed step"
+    );
+    assert!(
+        marker.change_slugs.iter().any(|s| s == "needs-pr"),
+        "marker records the carried change slug: {:?}",
+        marker.change_slugs
+    );
+    let tip_after_iter1 = crate::git::rev_parse(&ws, "agent-q").unwrap();
+    assert_eq!(
+        marker.tip_commit, tip_after_iter1,
+        "marker anchors the already-pushed tip"
+    );
+
+    // Iteration 2: marker present + tip matches → resume. PanicOnRun proves the
+    // executor is not re-run. The push retry is a no-op on the already-pushed
+    // tip; PR creation now succeeds → the marker is cleared.
+    let mut server2 = mockito::Server::new_async().await;
+    let pr_ok_mock = server2
+        .mock("POST", "/repos/owner/fixture/pulls")
+        .with_status(201)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"html_url":"https://github.com/owner/fixture/pull/9","number":9}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    test_hooks::set_github_api_base(Some(server2.url()));
+
+    let r2 = execute_one_pass(
+        &paths, &ws, &fixture_repo(&ws), &PanicOnRun, &github, None, None,
+        2400u64, u32::MAX, u32::MAX, 0, Some(10),
+        &crate::audits::AuditRegistry::default(), None,
+        &std::collections::HashMap::new(), &std::sync::Mutex::new(Vec::new()),
+        &mut 0u32,
+    )
+    .await;
+    test_hooks::set_github_api_base(None);
+    r2.expect("resume must retry PR creation and succeed");
+    pr_ok_mock.assert_async().await;
+
+    assert!(
+        !crate::push_block::exists(&paths, &ws),
+        "marker must be cleared after the resumed PR creation succeeds"
+    );
+    // Branch was NOT recreated: its tip is unchanged from iter 1.
+    let tip_after_iter2 = crate::git::rev_parse(&ws, "agent-q").unwrap();
+    assert_eq!(
+        tip_after_iter1, tip_after_iter2,
+        "resume must not recreate/reset the agent branch"
+    );
+}
+
+/// hold-covers-pr-creation-failure 4.2 (marker fields): a hold written for a pass
+/// that carried ONLY issue units records the issue slugs in `issue_slugs` (with
+/// an empty `change_slugs`) — the write guard triggers on issues, not just
+/// changes. An audit-only pass (no change, no issue) still writes NO hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue_only_pass_hold_records_issue_slugs() {
+    fn git(ws: &Path, args: &[&str]) {
+        let st = std::process::Command::new("git")
+            .args(args)
+            .current_dir(ws)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?} failed");
+    }
+
+    let (_dir, ws) = fixture_workspace_with_remote();
+    let ws = {
+        let renamed = ws.parent().unwrap().join("workspace-issue-hold-fields");
+        std::fs::rename(&ws, &renamed).unwrap();
+        renamed
+    };
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    // A commit on agent-q so the hold's tip resolves.
+    git(&ws, &["checkout", "-q", "-b", "agent-q"]);
+    std::fs::write(ws.join("issue-work.txt"), "x\n").unwrap();
+    git(&ws, &["add", "-A"]);
+    git(&ws, &["commit", "-q", "-m", "fix-the-widget: work"]);
+
+    write_push_block_hold(
+        &paths,
+        &ws,
+        &fixture_repo(&ws),
+        crate::push_block::FailedStep::Push,
+        &[],                        // no changes
+        &["fix-the-widget".into()], // one issue unit
+        "remote rejected".into(),
+        None,
+        None,
+        None,
+    );
+
+    let marker = crate::push_block::read(&paths, &ws)
+        .expect("an issue-only pass must still write a hold");
+    assert!(
+        marker.change_slugs.is_empty(),
+        "no change carried: change_slugs empty, got {:?}",
+        marker.change_slugs
+    );
+    assert_eq!(
+        marker.issue_slugs,
+        vec!["fix-the-widget".to_string()],
+        "the issue slug must be recorded in issue_slugs"
+    );
+
+    // An audit-only pass (no change AND no issue) writes NO hold.
+    crate::push_block::clear(&paths, &ws).unwrap();
+    write_push_block_hold(
+        &paths,
+        &ws,
+        &fixture_repo(&ws),
+        crate::push_block::FailedStep::Push,
+        &[],
+        &[],
+        "reason".into(),
+        None,
+        None,
+        None,
+    );
+    assert!(
+        !crate::push_block::exists(&paths, &ws),
+        "audit-only pass (no change, no issue) must not write a hold"
+    );
+}
+
+/// hold-covers-pr-creation-failure 4.2 (resume): with an issue-only push hold
+/// present AND its tip matching, the next pass resumes at the push step and NEVER
+/// re-runs the executor; the issue-slug hold is retained while the push fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue_only_push_hold_resume_skips_executor() {
+    use crate::executor::ResumeHandle;
+    use async_trait::async_trait;
+    struct PanicOnRun;
+    #[async_trait]
+    impl Executor for PanicOnRun {
+        async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+            panic!("executor must not run while a push-block hold is active");
+        }
+        async fn resume(&self, _h: ResumeHandle, _a: &str) -> Result<ExecutorOutcome> {
+            unreachable!()
+        }
+    }
+    fn git(ws: &Path, args: &[&str]) {
+        let st = std::process::Command::new("git")
+            .args(args)
+            .current_dir(ws)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?} failed");
+    }
+
+    let (_dir, ws) = fixture_workspace_with_broken_remote("issue-hold-resume");
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+
+    // Seed an agent-q commit and plant a matching issue-only push hold.
+    git(&ws, &["checkout", "-q", "-b", "agent-q"]);
+    std::fs::write(ws.join("issue-work.txt"), "x\n").unwrap();
+    git(&ws, &["add", "-A"]);
+    git(&ws, &["commit", "-q", "-m", "fix-the-widget: work"]);
+    let tip = crate::git::rev_parse(&ws, "agent-q").unwrap();
+
+    crate::push_block::write(
+        &paths,
+        &ws,
+        &crate::push_block::PushBlock {
+            tip_commit: tip.clone(),
+            change_slugs: vec![],
+            issue_slugs: vec!["fix-the-widget".into()],
+            reason: "prior push failed".into(),
+            blocked_at: chrono::Utc::now(),
+            failed_step: crate::push_block::FailedStep::Push,
+            review_report: None,
+            spec_verification_section: None,
+            gate_verdicts_section: None,
+        },
+    )
+    .unwrap();
+
+    // Resume: broken remote → the push retry fails before PR creation. PanicOnRun
+    // proves the executor is not invoked; the hold is retained.
+    let res = execute_one_pass(
+        &paths,
+        &ws,
+        &fixture_repo(&ws),
+        &PanicOnRun,
+        &open_pr_gate_ok_github(),
+        None,
+        None,
+        2400u64,
+        u32::MAX,
+        u32::MAX,
+        0,
+        Some(10),
+        &crate::audits::AuditRegistry::default(),
+        None,
+        &std::collections::HashMap::new(),
+        &std::sync::Mutex::new(Vec::new()),
+        &mut 0u32,
+    )
+    .await;
+    assert!(res.is_err(), "the broken-remote push retry must fail");
+
+    let marker = crate::push_block::read(&paths, &ws)
+        .expect("the issue-only hold is retained while the push keeps failing");
+    assert_eq!(
+        marker.issue_slugs,
+        vec!["fix-the-widget".to_string()],
+        "the retained hold still records the issue slug"
+    );
+    // Tip preserved: resume never recreated the branch.
+    assert_eq!(crate::git::rev_parse(&ws, "agent-q").unwrap(), tip);
+}
+
+/// hold-covers-pr-creation-failure 4.4: stale-marker handling (tip mismatch) is
+/// unchanged for a `failed_step: pr_creation` hold — the stale marker is removed
+/// and the pass proceeds normally (recreate + executor).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_pr_creation_marker_is_cleared_and_pass_proceeds() {
+    let (_dir, ws) = fixture_workspace_with_broken_remote("pushblock-stale-prcreation");
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    add_committed_change(&ws, "needs-push", "push-block fixture");
+
+    // Plant a PR-creation hold whose tip will NOT match the live agent branch.
+    crate::push_block::write(
+        &paths,
+        &ws,
+        &crate::push_block::PushBlock {
+            tip_commit: "0000000000000000000000000000000000000000".into(),
+            change_slugs: vec!["already-merged".into()],
+            issue_slugs: vec![],
+            reason: "stale".into(),
+            blocked_at: chrono::Utc::now(),
+            failed_step: crate::push_block::FailedStep::PrCreation,
+            review_report: None,
+            spec_verification_section: None,
+            gate_verdicts_section: None,
+        },
+    )
+    .unwrap();
+
+    let executor = CompletingExecutorWithDiff {
+        artifact_name: "PB_ART.txt".into(),
+        artifact_text: "x".into(),
+    };
+    let github = open_pr_gate_ok_github();
+    let _hook = test_hooks::lock();
+    let mut server = mockito::Server::new_async().await;
+    let _gate_mock = mock_open_pr_gate_empty(&mut server).await;
+    test_hooks::set_github_api_base(Some(server.url()));
+
+    let res = execute_one_pass(
+        &paths, &ws, &fixture_repo(&ws), &executor, &github, None, None,
+        2400u64, u32::MAX, u32::MAX, 0, Some(10),
+        &crate::audits::AuditRegistry::default(), None,
+        &std::collections::HashMap::new(), &std::sync::Mutex::new(Vec::new()),
+        &mut 0u32,
+    )
+    .await;
+    test_hooks::set_github_api_base(None);
+    assert!(res.is_err(), "broken-remote push still fails the iteration");
+
+    // The stale PR-creation marker was cleared and the normal flow ran (recreate +
+    // executor), so the marker now reflects the freshly-processed change (a fresh
+    // push hold), not the stale pr_creation one.
     let marker = crate::push_block::read(&paths, &ws).expect("normal flow re-failed the push");
     assert_ne!(
         marker.tip_commit, "0000000000000000000000000000000000000000",
