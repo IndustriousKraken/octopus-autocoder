@@ -64,6 +64,65 @@ pub(crate) async fn post_spec_verification_gaps_alert(
     }
 }
 
+/// Make a verifier-gate invocation's retry billing operator-visible
+/// (gate-retry-billing-visibility). A verifier-gate session that ends without a
+/// schema-valid submission is re-attempted (bounded by
+/// `executor.verifier_gate_retries`), and EVERY re-attempt is a fresh, fully
+/// billed agentic session. When `report` shows at least one re-attempt was
+/// consumed ([`RetryReport::retried`](crate::verifier_gate::RetryReport::retried)),
+/// post EXACTLY ONE notification for that invocation (never one per attempt),
+/// naming the gate's stable identifier, the change slug, attempts used vs.
+/// allowed, the final `disposition` (`clean` / `findings` / `held`), and the
+/// model-attribution line — so an operator can attribute rising gate spend to
+/// the model and act (e.g. switch models).
+///
+/// The notification fires regardless of the final disposition and is NOT
+/// throttled: each occurrence already represents at least one extra billed
+/// session, and its purpose is spend attribution. In daemon-absent contexts
+/// (the local `verify` subcommand, standalone gate runs), pass
+/// `chatops_ctx = None`: the same fields are emitted as a single WARN log line
+/// instead of a chatops post. When no re-attempt was consumed this is a no-op.
+pub(crate) async fn announce_gate_retry(
+    chatops_ctx: Option<&ChatOpsContext>,
+    gate: crate::verifier_gate::VerifierGate,
+    change: &str,
+    report: &crate::verifier_gate::RetryReport,
+    disposition: &str,
+    attribution: Option<&str>,
+) {
+    // Only a consumed re-attempt is worth a signal — each represents extra
+    // billed spend. A single (first) attempt is the normal, un-billed-extra path.
+    if !report.retried() {
+        return;
+    }
+    let attribution_suffix = attribution
+        .map(|a| format!(" — {}", crate::attribution::attribution_line("Verifier-gate", a)))
+        .unwrap_or_default();
+    let text = gate.label_line(&format!(
+        "gate retried on `{change}`: {used}/{allowed} attempts used before a {disposition} \
+         disposition. Each attempt is a fresh, fully billed agentic session — a model that \
+         habitually ends gate sessions without submitting multiplies gate spend (still failing \
+         closed); consider switching models if this recurs.{attribution_suffix}",
+        used = report.attempts_used,
+        allowed = report.attempts_allowed,
+    ));
+    match chatops_ctx {
+        Some(ctx) => {
+            if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+                tracing::warn!(
+                    change = %change,
+                    "{} failed to post retry-billing notification: {e:#}",
+                    gate.label()
+                );
+            }
+        }
+        None => {
+            // Daemon-absent: the same fields as a single WARN log line, no post.
+            tracing::warn!(change = %change, "{text}");
+        }
+    }
+}
+
 /// Which per-change throttle map in the alert-state file a throttled alert
 /// reads/writes. (a68 §3.2: the five throttle-family helpers share one
 /// 24h-per-change throttle skeleton, [`post_throttled_change_alert`], and
@@ -764,5 +823,196 @@ pub(crate) fn truncate_reason(reason: &str) -> String {
             .collect();
         out.push('…');
         out
+    }
+}
+
+/// Retry-billing visibility (gate-retry-billing-visibility): the retry wrapper
+/// surfaces attempts-used, and `announce_gate_retry` posts exactly one
+/// notification per retried invocation (or a WARN in daemon-absent contexts).
+#[cfg(test)]
+mod retry_billing_tests {
+    use super::*;
+    use crate::verifier_gate::{RetryReport, SessionSubmission, VerifierGate, run_session_with_retry};
+    use std::cell::Cell;
+    use std::sync::Mutex;
+
+    /// A gate session outcome for the retry wrapper; `submitted` mirrors the
+    /// real gates' `has_submission()`.
+    struct TestSession {
+        submitted: bool,
+    }
+    impl SessionSubmission for TestSession {
+        fn has_submission(&self) -> bool {
+            self.submitted
+        }
+    }
+
+    /// Records every `post_notification` so a test can assert exactly-once
+    /// posting AND the fields the message carries.
+    struct RecordingBackend {
+        posts: Mutex<Vec<(String, String)>>,
+    }
+    #[async_trait::async_trait]
+    impl ChatOpsBackend for RecordingBackend {
+        fn provider_name(&self) -> &'static str {
+            "recording"
+        }
+        fn is_experimental(&self) -> bool {
+            true
+        }
+        async fn post_question(&self, _c: &str, _ch: &str, _q: &str) -> anyhow::Result<String> {
+            unreachable!()
+        }
+        async fn poll_thread_for_human_reply(
+            &self,
+            _c: &str,
+            _h: &str,
+        ) -> anyhow::Result<Option<crate::chatops::HumanReply>> {
+            unreachable!()
+        }
+        async fn post_notification(&self, channel: &str, text: &str) -> anyhow::Result<()> {
+            self.posts
+                .lock()
+                .unwrap()
+                .push((channel.to_string(), text.to_string()));
+            Ok(())
+        }
+    }
+
+    fn recording_ctx(backend: Arc<RecordingBackend>) -> ChatOpsContext {
+        ChatOpsContext {
+            chatops: backend,
+            channel: "C_TEST".into(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        }
+    }
+
+    /// 3.1: a no-submission first attempt followed by a clean second attempt
+    /// yields attempts-used = 2 AND triggers exactly one notification carrying
+    /// the gate id, slug, attempt counts, and disposition.
+    #[tokio::test]
+    async fn retried_recovery_posts_exactly_one_notification_with_all_fields() {
+        // Drive the REAL retry wrapper: attempt 1 no submission, attempt 2 submits.
+        let calls = Cell::new(0);
+        let mut retry = RetryReport::default();
+        let out: TestSession =
+            run_session_with_retry(VerifierGate::Canon, "slug-x", 2, &mut retry, || {
+                let n = calls.get();
+                calls.set(n + 1);
+                async move { Ok(TestSession { submitted: n >= 1 }) }
+            })
+            .await
+            .unwrap();
+        assert!(out.has_submission());
+        assert_eq!(retry.attempts_used, 2, "one re-attempt consumed");
+        assert_eq!(retry.attempts_allowed, 3);
+
+        let backend = Arc::new(RecordingBackend {
+            posts: Mutex::new(Vec::new()),
+        });
+        let ctx = recording_ctx(backend.clone());
+        announce_gate_retry(
+            Some(&ctx),
+            VerifierGate::Canon,
+            "slug-x",
+            &retry,
+            "clean",
+            Some("opus"),
+        )
+        .await;
+
+        let posts = backend.posts.lock().unwrap();
+        assert_eq!(
+            posts.len(),
+            1,
+            "exactly one notification per invocation, never one per attempt"
+        );
+        let (channel, text) = &posts[0];
+        assert_eq!(channel, "C_TEST");
+        assert!(text.contains("[verifier:canon]"), "gate id: {text}");
+        assert!(text.contains("slug-x"), "slug: {text}");
+        assert!(text.contains("2/3"), "attempts used vs allowed: {text}");
+        assert!(text.contains("clean"), "disposition: {text}");
+    }
+
+    /// 3.2: a session error consumes one attempt, is not re-attempted, and
+    /// triggers no retry notification (even though its disposition is a
+    /// fail-closed `held`).
+    #[tokio::test]
+    async fn errored_first_attempt_is_not_retried_and_does_not_notify() {
+        let calls = Cell::new(0);
+        let mut retry = RetryReport::default();
+        let result: anyhow::Result<TestSession> =
+            run_session_with_retry(VerifierGate::In, "slug-e", 2, &mut retry, || {
+                let n = calls.get();
+                calls.set(n + 1);
+                async move { Err::<TestSession, _>(anyhow::anyhow!("session error")) }
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1, "an error is not retried");
+        assert_eq!(retry.attempts_used, 1);
+        assert!(!retry.retried());
+
+        let backend = Arc::new(RecordingBackend {
+            posts: Mutex::new(Vec::new()),
+        });
+        let ctx = recording_ctx(backend.clone());
+        announce_gate_retry(Some(&ctx), VerifierGate::In, "slug-e", &retry, "held", None).await;
+        assert!(
+            backend.posts.lock().unwrap().is_empty(),
+            "an un-retried error must not notify"
+        );
+    }
+
+    /// 3.3: `executor.verifier_gate_retries: 0` produces a single attempt and no
+    /// retry notification (even on a no-submission fail-closed hold).
+    #[tokio::test]
+    async fn zero_retries_single_attempt_does_not_notify() {
+        let calls = Cell::new(0);
+        let mut retry = RetryReport::default();
+        // retries = 0 → one attempt; never submits → fail-closed hold.
+        let out: TestSession =
+            run_session_with_retry(VerifierGate::Rules, "slug-z", 0, &mut retry, || {
+                let n = calls.get();
+                calls.set(n + 1);
+                async move { Ok(TestSession { submitted: false }) }
+            })
+            .await
+            .unwrap();
+        assert!(!out.has_submission());
+        assert_eq!(calls.get(), 1, "retries=0 → one attempt");
+        assert_eq!(retry.attempts_used, 1);
+        assert_eq!(retry.attempts_allowed, 1);
+        assert!(!retry.retried());
+
+        let backend = Arc::new(RecordingBackend {
+            posts: Mutex::new(Vec::new()),
+        });
+        let ctx = recording_ctx(backend.clone());
+        announce_gate_retry(Some(&ctx), VerifierGate::Rules, "slug-z", &retry, "held", None).await;
+        assert!(
+            backend.posts.lock().unwrap().is_empty(),
+            "retries=0 must not notify"
+        );
+    }
+
+    /// Daemon-absent (task 2.2): `None` chatops emits a WARN carrying the same
+    /// fields (gate id, slug, attempts used vs. allowed, disposition) and posts
+    /// nothing.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn daemon_absent_logs_warn_with_fields() {
+        let retry = RetryReport {
+            attempts_used: 2,
+            attempts_allowed: 3,
+        };
+        announce_gate_retry(None, VerifierGate::Rules, "slug-w", &retry, "findings", None).await;
+        assert!(logs_contain("[verifier:rules]"), "gate id in WARN");
+        assert!(logs_contain("slug-w"), "slug in WARN");
+        assert!(logs_contain("2/3"), "attempts used vs allowed in WARN");
+        assert!(logs_contain("findings"), "disposition in WARN");
     }
 }

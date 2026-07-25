@@ -78,8 +78,12 @@ impl AlertCategory {
         match self {
             Self::WorkspaceInitFailure => "workspace init keeps failing",
             Self::WorkspaceDirtyMidIteration => "workspace dirty mid-iteration",
-            Self::BranchPushFailure => "branch push keeps failing",
-            Self::PrCreationFailure => "PR creation keeps failing",
+            Self::BranchPushFailure => {
+                "branch push keeps failing (completed work is preserved on the agent branch; the push is retried without re-implementation)"
+            }
+            Self::PrCreationFailure => {
+                "PR creation keeps failing (completed work is preserved on the agent branch; PR creation is retried without re-implementation)"
+            }
             Self::AuditWritePolicyViolation => "audit attempted disallowed write",
             Self::SpecNeedsRevision => "spec needs revision",
             Self::ArchiveCollision => "archive collision",

@@ -28,7 +28,7 @@
 //! module surfaces the distinction as [`SpecVerificationOutcome`].
 
 use crate::agentic_run::ResolvedModel;
-use crate::verifier_gate::VerifierGate;
+use crate::verifier_gate::{RetryReport, VerifierGate};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -574,6 +574,30 @@ pub async fn run_code_implements_spec_check(
     diff: &str,
     changed_files: &[String],
 ) -> SpecVerificationOutcome {
+    let mut report = RetryReport::default();
+    run_code_implements_spec_check_reporting(
+        ctx,
+        workspace_root,
+        change_slugs,
+        diff,
+        changed_files,
+        &mut report,
+    )
+    .await
+}
+
+/// As [`run_code_implements_spec_check`], but ALSO surfaces the bounded-retry
+/// [`RetryReport`] into `report` so the post-executor daemon call site can post
+/// the operator-visible retry-billing notification
+/// (gate-retry-billing-visibility). The advisory verdict is unchanged.
+pub async fn run_code_implements_spec_check_reporting(
+    ctx: &CodeImplementsSpecCheckCtx,
+    workspace_root: &Path,
+    change_slugs: &[String],
+    diff: &str,
+    changed_files: &[String],
+    report: &mut RetryReport,
+) -> SpecVerificationOutcome {
     // Test seam: an injected submission stands in for the CLI + control socket
     // so the orchestration is exercised without spawning a process.
     #[cfg(test)]
@@ -581,13 +605,14 @@ pub async fn run_code_implements_spec_check(
         let runner = CannedVerdictRunner {
             submission: injected.clone(),
         };
-        return run_code_implements_spec_check_with_runner(
+        return run_code_implements_spec_check_with_runner_reporting(
             ctx,
             workspace_root,
             change_slugs,
             diff,
             changed_files,
             &runner,
+            report,
         )
         .await;
     }
@@ -617,13 +642,14 @@ pub async fn run_code_implements_spec_check(
         paths: ctx.paths.clone(),
         subject: change_slugs.join(","),
     };
-    run_code_implements_spec_check_with_runner(
+    run_code_implements_spec_check_with_runner_reporting(
         ctx,
         workspace_root,
         change_slugs,
         diff,
         changed_files,
         &runner,
+        report,
     )
     .await
 }
@@ -640,6 +666,30 @@ async fn run_code_implements_spec_check_with_runner(
     diff: &str,
     changed_files: &[String],
     runner: &dyn VerdictSessionRunner,
+) -> SpecVerificationOutcome {
+    let mut report = RetryReport::default();
+    run_code_implements_spec_check_with_runner_reporting(
+        ctx,
+        workspace_root,
+        change_slugs,
+        diff,
+        changed_files,
+        runner,
+        &mut report,
+    )
+    .await
+}
+
+/// As [`run_code_implements_spec_check_with_runner`], but threads the
+/// bounded-retry [`RetryReport`] out through `report`.
+async fn run_code_implements_spec_check_with_runner_reporting(
+    ctx: &CodeImplementsSpecCheckCtx,
+    workspace_root: &Path,
+    change_slugs: &[String],
+    diff: &str,
+    changed_files: &[String],
+    runner: &dyn VerdictSessionRunner,
+    report: &mut RetryReport,
 ) -> SpecVerificationOutcome {
     // a61: every advisory diagnostic this gate emits carries the `[out]`
     // verifier-gate label so the finding is attributable to the gate.
@@ -681,6 +731,7 @@ async fn run_code_implements_spec_check_with_runner(
         VerifierGate::Out,
         &changes,
         ctx.retries,
+        report,
         || runner.run_session(&prompt),
     )
     .await;

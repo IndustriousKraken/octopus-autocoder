@@ -31,7 +31,7 @@
 //! a clean result the caller proceeds on.
 
 use crate::agentic_run::ResolvedModel;
-use crate::verifier_gate::{SessionSubmission, VerifierGate};
+use crate::verifier_gate::{RetryReport, SessionSubmission, VerifierGate};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -245,6 +245,24 @@ pub async fn run_corpus_check_with_runner(
     prompt: &str,
     runner: &dyn CorpusCheckSessionRunner,
 ) -> CorpusCheckSession {
+    let mut report = RetryReport::default();
+    run_corpus_check_with_runner_reporting(gate, subject_slug, retries, prompt, runner, &mut report)
+        .await
+}
+
+/// As [`run_corpus_check_with_runner`], but threads the bounded-retry
+/// [`RetryReport`] out through `report` so a caller (the `[canon]` / `[rules]`
+/// gate) can post the operator-visible retry-billing notification
+/// (gate-retry-billing-visibility). The session/retry/fail-closed disposition
+/// is unchanged.
+pub async fn run_corpus_check_with_runner_reporting(
+    gate: VerifierGate,
+    subject_slug: &str,
+    retries: u32,
+    prompt: &str,
+    runner: &dyn CorpusCheckSessionRunner,
+    report: &mut RetryReport,
+) -> CorpusCheckSession {
     let label = gate.label();
     // Bounded retry of the agentic session on the flaky no-submission case
     // (`executor.verifier_gate_retries`); a successful submission, a session
@@ -254,6 +272,7 @@ pub async fn run_corpus_check_with_runner(
         gate,
         subject_slug,
         retries,
+        report,
         || runner.run_session(prompt),
     )
     .await;
