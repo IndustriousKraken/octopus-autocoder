@@ -25,6 +25,7 @@ mod executor;
 mod failure_state;
 mod forge;
 mod gate_ledger;
+mod gate_pass_record;
 mod git;
 mod github_credentials;
 // a007: `github.rs` moved into the `forge` module (`forge::github`) as the

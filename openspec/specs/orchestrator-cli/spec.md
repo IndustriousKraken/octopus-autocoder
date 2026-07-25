@@ -6930,6 +6930,8 @@ autocoder's change-lifecycle consistency checks SHALL be organized as a verifier
 
 Each gate SHALL be individually opt-in AND SHALL own its disposition, but NO gate treats an inability to run as a pass (the gatekeepers-fail-closed standard). The pre-executor gates (`[in]`, `[canon]`, `[rules]`) FAIL CLOSED: a gate's own failure (transport, parse, unregistered strategy, no submission) does NOT proceed as "no findings" — it holds the change in an explicit failed-to-run state (the change was NOT evaluated), surfaces a distinct "gate FAILED TO RUN — change held" alert, AND halts the iteration; an operator clears the hold (after fixing the gate) to retry. The `[out]` gate is advisory — it never auto-acts (no revision, no block) — AND fails to a VISIBLE state: on its own failure it renders an explicit "FAILED TO RUN" section rather than silently omitting one. Each gate's diagnostics (log lines AND any operator surface it writes) SHALL carry the gate's stable identifier so a finding — OR a held/failed-to-run state — is attributable to the gate that produced it.
 
+Pre-executor gate evaluation SHALL be SEQUENCE-scoped, not invocation-scoped. When every enabled pre-executor gate passes for a change and the executor then requests an iteration, the recorded pass covers the continuation iterations of that sequence: at gate-pass time the daemon SHALL record a content hash of the change directory's gate inputs (every regular file under the change's directory, excluding daemon bookkeeping markers) in a state-dir gate-pass record keyed to the workspace and change. A continuation pickup — one whose iteration-pending marker is present — whose recomputed hash equals the record SHALL NOT re-spawn the pre-executor gate sessions: for gate-invocation purposes it does not re-enter the pre-executor pipeline; the sequence's recorded verdicts stand and the verdict ledger renders them annotated as carried forward. No verdict is manufactured — the gates judged exactly these bytes when the sequence began, and the record only extends that judgment across its own sequence. Any hash difference, a missing or unreadable record, or any error computing the hash SHALL run the gates in full: the skip fails toward RUNNING, never toward passing. The record is removed whenever the sequence terminates (wherever the iteration-pending marker is dropped — `Completed`, `Failed`, or `SpecNeedsRevision`), so a fresh sequence always re-gates, and it is replaced whenever the gates run in full and pass again. The per-gate requirements define each gate's behavior WHEN it runs; this framework requirement owns WHEN the gates are invoked.
+
 The `[in]` gate IS the existing change-internal contradiction pre-flight check (its own requirement defines its behavior, opt-in gating, fail-closed posture, marker, AND alert); this framework reframes that check under the `[in]` identifier. The `[canon]`, `[rules]`, AND `[out]` gates are realized by their own requirements; until a gate is realized the framework treats it as absent AND invokes nothing for it.
 
 #### Scenario: The `[in]` gate runs the contradiction check, labeled
@@ -6954,6 +6956,25 @@ The `[in]` gate IS the existing change-internal contradiction pre-flight check (
 - **THEN** the framework renders an explicit "FAILED TO RUN" section (advisory, never blocking) rather than omitting one
 - **WHEN** the `[out]` gate produces findings
 - **THEN** the framework treats them as advisory: they annotate operator surfaces AND do NOT auto-trigger a revision or block
+
+#### Scenario: A continuation iteration with unchanged inputs does not re-spawn gate sessions
+- **WHEN** a change is picked up as a continuation (its iteration-pending marker is present) AND a gate-pass record exists for it AND the recomputed inputs hash equals the recorded hash
+- **THEN** no pre-executor gate session is spawned for this pickup
+- **AND** the verdict ledger renders the sequence's recorded verdicts annotated as carried forward
+
+#### Scenario: A mid-sequence edit re-gates in full
+- **WHEN** a change is picked up as a continuation AND any regular file under its directory changed since the record was written (the recomputed hash differs)
+- **THEN** the pre-executor gates run in full, exactly as for a fresh pickup
+- **AND** a new record is written only if they all pass
+
+#### Scenario: Any doubt runs the gates
+- **WHEN** a change is picked up as a continuation AND the gate-pass record is missing or unreadable, OR the inputs hash cannot be computed
+- **THEN** the pre-executor gates run in full (the skip fails toward running, never toward passing)
+
+#### Scenario: A fresh sequence always gates
+- **WHEN** a change is picked up with no iteration-pending marker
+- **THEN** the pre-executor gates run regardless of any leftover gate-pass record
+- **AND** the record is replaced when they pass AND removed wherever the sequence terminates
 
 ### Requirement: Change-vs-canonical contradiction pre-flight check (the [canon] gate)
 autocoder SHALL provide an opt-in pre-flight check — the `[canon]` gate of the verifier framework — that detects semantic contradictions between a single OpenSpec change's spec deltas AND the project's EXISTING canonical specs, before the executor is invoked. The check runs a CLI-wrapped agentic session through the shared `agentic_run` primitive (a56) in a read-only sandbox that reads the change's spec-delta files AND the canonical specs on demand, AND returns its findings via the `submit_canon_contradictions` MCP tool. On non-empty findings, autocoder SHALL write `.needs-spec-revision.json` with `revision_suggestion` populated from the canon-contradiction narrative, post the existing `AlertCategory::SpecNeedsRevision` chatops alert, AND halt the queue walk for this iteration. The executor SHALL NOT be invoked when contradictions are found. The gate's disposition is identical to the `[in]` gate's; the gates differ only in what they read (deltas-only vs deltas-plus-canon) AND what each finding names.

@@ -395,6 +395,20 @@ fn handle_completed_outcome(
                 "failed to remove iteration-pending marker on Completed: {e:#}"
             );
         }
+        // iteration-sequence-gates-once: the sequence terminated (the marker was
+        // just dropped) — drop the gate-pass record too so a future fresh
+        // sequence for this change always re-gates. Idempotent; a leftover would
+        // be harmless (only consulted behind the marker check) but we clean up
+        // where the marker is dropped.
+        if let Err(e) =
+            crate::gate_pass_record::remove_record(paths, basename_for_marker, change)
+        {
+            tracing::warn!(
+                url = %repo.url,
+                change = %change,
+                "failed to remove gate-pass record on Completed: {e:#}"
+            );
+        }
         // Archive BEFORE the commit so the single commit captures
         // both the executor's implementation diff AND the archive
         // rename. After this sequence the working tree is clean,
@@ -463,6 +477,16 @@ async fn handle_spec_needs_revision_outcome(
             url = %repo.url,
             change = %change,
             "failed to remove iteration-pending marker on SpecNeedsRevision: {e:#}"
+        );
+    }
+    // iteration-sequence-gates-once: SpecNeedsRevision terminates the sequence
+    // (the marker was just dropped) — drop the gate-pass record too so a fresh
+    // sequence always re-gates. Idempotent.
+    if let Err(e) = crate::gate_pass_record::remove_record(paths, basename_for_marker, change) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "failed to remove gate-pass record on SpecNeedsRevision: {e:#}"
         );
     }
     // (c) Post the chatops alert. Best-effort: any failure is

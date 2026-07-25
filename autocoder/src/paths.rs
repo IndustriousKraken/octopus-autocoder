@@ -274,6 +274,31 @@ impl DaemonPaths {
             .join(format!("{change}.json"))
     }
 
+    /// `<state>/gate-pass/` — root for per-change sequence-scoped gate-pass
+    /// records (iteration-sequence-gates-once). When every enabled pre-executor
+    /// gate passes for a change, the daemon records the change directory's
+    /// gate-inputs hash here so a continuation iteration whose inputs are
+    /// byte-identical can carry the recorded verdicts forward instead of
+    /// re-spawning the gate sessions. Lives under `<state>/` (NOT the workspace)
+    /// for the same reasons as the iteration-pending marker: the record must
+    /// never ride a commit AND must survive `git clean` / a re-clone.
+    pub fn gate_pass_dir(&self) -> PathBuf {
+        self.state.join("gate-pass")
+    }
+
+    /// `<state>/gate-pass/<workspace_basename>/` — per-workspace directory
+    /// holding one `<change>.json` gate-pass record per change.
+    pub fn gate_pass_basename_dir(&self, workspace_basename: &str) -> PathBuf {
+        self.gate_pass_dir().join(workspace_basename)
+    }
+
+    /// `<state>/gate-pass/<workspace_basename>/<change>.json` — the gate-pass
+    /// record for `change` in the named workspace.
+    pub fn gate_pass_path(&self, workspace_basename: &str, change: &str) -> PathBuf {
+        self.gate_pass_basename_dir(workspace_basename)
+            .join(format!("{change}.json"))
+    }
+
     /// `<cache>/workspaces/` — per-repo cloned workspaces, keyed by
     /// URL-sanitized basename.
     pub fn workspaces_dir(&self) -> PathBuf {
@@ -1016,6 +1041,15 @@ mod tests {
         assert_eq!(
             p.gate_logs_dir("github_com_owner_repo"),
             PathBuf::from("/srv/logs/runs/github_com_owner_repo/gates")
+        );
+        assert_eq!(p.gate_pass_dir(), PathBuf::from("/srv/state/gate-pass"));
+        assert_eq!(
+            p.gate_pass_basename_dir("github_com_owner_repo"),
+            PathBuf::from("/srv/state/gate-pass/github_com_owner_repo")
+        );
+        assert_eq!(
+            p.gate_pass_path("github_com_owner_repo", "a99-change"),
+            PathBuf::from("/srv/state/gate-pass/github_com_owner_repo/a99-change.json")
         );
         assert_eq!(
             p.workspaces_dir(),

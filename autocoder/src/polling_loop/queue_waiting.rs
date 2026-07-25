@@ -334,6 +334,15 @@ async fn resume_spec_needs_revision(
             "failed to remove iteration-pending marker on SpecNeedsRevision (resume): {e:#}"
         );
     }
+    // iteration-sequence-gates-once: same sequence termination as the pending
+    // path — drop the gate-pass record so a fresh sequence always re-gates.
+    if let Err(e) = crate::gate_pass_record::remove_record(paths, basename_for_marker, change) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "failed to remove gate-pass record on SpecNeedsRevision (resume): {e:#}"
+        );
+    }
     maybe_post_spec_revision_alert(
         paths,
         Some(ctx),

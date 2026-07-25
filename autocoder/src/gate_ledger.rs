@@ -81,6 +81,18 @@ pub struct GateEntry {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// iteration-sequence-gates-once: this verdict was carried forward from an
+    /// earlier pass of the same iteration sequence (the gate was NOT re-spawned
+    /// this pickup). Rendered as a "carried forward (sequence)" annotation so the
+    /// PR record stays honest about when the judgment was made.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub carried_forward: bool,
+}
+
+/// serde `skip_serializing_if` predicate for the default-`false` bool — keeps the
+/// persisted ledger unchanged for the common (not-carried) case.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// The per-change verdict ledger: one [`GateEntry`] per gate slot, all
@@ -107,6 +119,7 @@ impl GateLedger {
             verdict,
             model,
             summary,
+            carried_forward: false,
         };
     }
 
@@ -121,6 +134,7 @@ impl GateLedger {
             verdict,
             model,
             summary,
+            carried_forward: false,
         };
     }
 
@@ -135,6 +149,7 @@ impl GateLedger {
             verdict,
             model,
             summary,
+            carried_forward: false,
         };
     }
 
@@ -144,7 +159,23 @@ impl GateLedger {
             verdict,
             model,
             summary,
+            carried_forward: false,
         };
+    }
+
+    /// iteration-sequence-gates-once: mark the pre-executor gates (`[in]`,
+    /// `[canon]`, `[rules]`) that actually RAN-and-passed as carried forward from
+    /// the pass that recorded them. Only `Pass` entries are annotated — a
+    /// `Disabled` gate did not run, so "carried forward" would be noise; the
+    /// advisory `[out]` gate runs post-executor and is never carried. Called on
+    /// the ledger read back from the prior pass when a continuation pickup skips
+    /// the gate sessions.
+    pub fn mark_pre_executor_carried_forward(&mut self) {
+        for entry in [&mut self.r#in, &mut self.canon, &mut self.rules] {
+            if entry.verdict == GateVerdict::Pass {
+                entry.carried_forward = true;
+            }
+        }
     }
 
     /// The fail-closed proceed decision: true iff EVERY blocking gate (`[in]`,
@@ -234,6 +265,12 @@ fn render_entry_line(gate: VerifierGate, entry: &GateEntry) -> String {
     ) && let Some(summary) = entry.summary.as_deref().filter(|s| !s.trim().is_empty())
     {
         line.push_str(&format!(" — {}", one_line(summary)));
+    }
+    // iteration-sequence-gates-once: a verdict carried from an earlier pass of
+    // the same iteration sequence is annotated so the PR record names when the
+    // judgment was actually made.
+    if entry.carried_forward {
+        line.push_str(" — carried forward (sequence)");
     }
     line.push('\n');
     line
@@ -386,6 +423,33 @@ mod tests {
         );
         let back = read_ledger(ws, "my-change").expect("ledger reads back");
         assert_eq!(l, back);
+    }
+
+    #[test]
+    fn mark_carried_forward_annotates_only_ran_gates() {
+        // iteration-sequence-gates-once: carrying a prior pass's verdicts forward
+        // annotates the gates that RAN-and-passed; a Disabled gate is left plain.
+        let mut l = GateLedger::new();
+        l.set_in(GateVerdict::Pass, Some("m-in".into()), None);
+        l.set_canon(GateVerdict::Disabled, None, None);
+        l.set_rules(GateVerdict::Pass, Some("m-rules".into()), None);
+        l.mark_pre_executor_carried_forward();
+        assert!(l.r#in.carried_forward, "a ran-and-passed gate is carried");
+        assert!(!l.canon.carried_forward, "a Disabled gate is not annotated");
+        assert!(l.rules.carried_forward);
+
+        let section = l.render_pr_section();
+        // The carried Pass rows name the annotation; the Disabled row does not.
+        assert_eq!(
+            section.matches("carried forward (sequence)").count(),
+            2,
+            "only the two ran-and-passed gates are annotated: {section}"
+        );
+        // Still blocking-ok (Pass/Disabled) so the executor proceeds.
+        assert!(l.blocking_ok());
+        // The carried_forward flag round-trips through JSON.
+        let back: GateLedger = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        assert_eq!(back, l);
     }
 
     #[test]
