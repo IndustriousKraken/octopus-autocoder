@@ -453,10 +453,7 @@ pub(crate) async fn process_one_pending_change(
     // RUNNING, never toward passing. No verdict is manufactured; the gates
     // judged exactly these bytes when the sequence began, and the record only
     // extends that judgment across its own sequence.
-    let workspace_basename = workspace
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
+    let workspace_basename = crate::workspace::basename(workspace);
     let change_dir = crate::spec_root::SpecRoot::for_repo(repo, workspace)
         .changes_dir()
         .join(change);

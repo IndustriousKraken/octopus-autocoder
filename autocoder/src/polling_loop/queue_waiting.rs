@@ -323,10 +323,7 @@ async fn resume_spec_needs_revision(
     }
     // a27a1: same lifecycle as the pending path — SpecNeedsRevision
     // terminates the iteration sequence; drop the marker.
-    let basename_for_marker = workspace
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
+    let basename_for_marker = crate::workspace::basename(workspace);
     if let Err(e) = crate::iteration_pending::remove_marker(paths, basename_for_marker, change) {
         tracing::warn!(
             url = %repo.url,

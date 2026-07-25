@@ -634,10 +634,7 @@ fn should_stop_after_commit_check(
     // after the iteration-pending change concludes via outcome_success,
     // outcome_spec_needs_revision, OR the a27a1 5-iteration cap.
     let pending_iteration_changes = {
-        let basename = workspace
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown");
+        let basename = crate::workspace::basename(workspace);
         crate::iteration_pending::list_pending_changes(paths, basename)
     };
     if !pending_iteration_changes.is_empty() {

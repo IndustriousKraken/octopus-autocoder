@@ -36,6 +36,20 @@ pub fn sanitize_url(url: &str) -> String {
     sanitize(url)
 }
 
+/// The workspace directory's basename — the per-repo identifier used to key
+/// state-dir bookkeeping (iteration-pending markers, gate-pass records, …).
+/// Single-sources the `"unknown"` fallback so every state write agrees on it
+/// (a per-site fallback could let two distinct workspaces that both fail
+/// extraction collide on one state key). The fallback is practically
+/// unreachable: a derived workspace path's basename is the sanitized URL, so
+/// `file_name()`/`to_str()` always succeed.
+pub fn basename(workspace: &Path) -> &str {
+    workspace
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+}
+
 fn sanitize(url: &str) -> String {
     let stripped = url
         .strip_prefix("git@")
@@ -300,12 +314,11 @@ pub fn ensure_initialized(
     // no-op. Failures inside the migration log WARN AND do not block
     // workspace initialization (a corrupt marker is operator-cleanable).
     {
-        let basename = workspace
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown");
-        if let Err(e) =
-            crate::iteration_pending::migrate_legacy_workspace_markers(paths, workspace, basename)
+        if let Err(e) = crate::iteration_pending::migrate_legacy_workspace_markers(
+            paths,
+            workspace,
+            basename(workspace),
+        )
         {
             tracing::warn!(
                 workspace = %workspace.display(),

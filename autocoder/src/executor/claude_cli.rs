@@ -1263,10 +1263,7 @@ pub(crate) fn append_iteration_continuation_block(
     change: &str,
     rendered: String,
 ) -> String {
-    let basename = workspace
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
+    let basename = crate::workspace::basename(workspace);
     match crate::iteration_pending::read_marker(paths, basename, change) {
         Ok(Some(marker)) => {
             let block = render_iteration_continuation_block(&marker);
@@ -1478,10 +1475,7 @@ fn map_recorded_outcome(
             // (the just-finished run). A corrupt / unreadable marker
             // is treated as absent (corrupt-as-absent) per design.md
             // D5's degraded-recovery story.
-            let basename_for_marker = workspace
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown");
+            let basename_for_marker = crate::workspace::basename(workspace);
             let prior_iteration_number = match crate::iteration_pending::read_marker(
                 paths,
                 basename_for_marker,

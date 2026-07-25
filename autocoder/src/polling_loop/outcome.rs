@@ -383,10 +383,7 @@ fn handle_completed_outcome(
         // marker (now in state_dir; no longer in the archived
         // directory regardless). Idempotent — absent marker is
         // fine.
-        let basename_for_marker = workspace
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown");
+        let basename_for_marker = crate::workspace::basename(workspace);
         if let Err(e) = crate::iteration_pending::remove_marker(paths, basename_for_marker, change)
         {
             tracing::warn!(
@@ -468,10 +465,7 @@ async fn handle_spec_needs_revision_outcome(
     // iteration-pending marker so the change reverts to normal
     // queue ordering on the next iteration. Idempotent — absent
     // marker is OK.
-    let basename_for_marker = workspace
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
+    let basename_for_marker = crate::workspace::basename(workspace);
     if let Err(e) = crate::iteration_pending::remove_marker(paths, basename_for_marker, change) {
         tracing::warn!(
             url = %repo.url,
@@ -638,10 +632,7 @@ async fn run_iteration_requested_steps(
         reason,
         iteration_number,
     };
-    let basename_for_marker = workspace
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
+    let basename_for_marker = crate::workspace::basename(workspace);
     if let Err(e) =
         crate::iteration_pending::write_marker(paths, basename_for_marker, change, &marker)
     {
