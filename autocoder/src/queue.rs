@@ -126,10 +126,7 @@ pub fn list_pending(paths: &crate::paths::DaemonPaths, workspace: &Path) -> Resu
         // (NOT the workspace) per the architectural fix that removed
         // it from the git working tree where `git clean -fd` would
         // periodically wipe it.
-        let basename = workspace
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown");
+        let basename = crate::workspace::basename(workspace);
         if crate::iteration_pending::marker_exists(paths, basename, &name) {
             // Tier 1: a change mid-iteration sorts first regardless of any
             // `.priority.json` marker it may ALSO carry — priority never

@@ -443,26 +443,79 @@ pub(crate) async fn process_one_pending_change(
     // path — that is the thing that used to let a gate silently fail open.
     let mut ledger = crate::gate_ledger::GateLedger::new();
 
-    // `[in]` gate: run its runner (enabled → handler verdict; disabled → stub
-    // `Disabled`), record the verdict + model in the ledger. A short-circuit
-    // holds the change immediately on a blocking-fail so we do NOT run `[canon]`
-    // on a change already held (preserving the single-marker behavior).
-    run_in_gate(paths, workspace, repo, chatops_ctx, change, &mut ledger).await?;
-    if let Some(step) = hold_if_blocking_fail(workspace, change, ledger.r#in.verdict, &ledger) {
-        return Ok(step);
-    }
+    // iteration-sequence-gates-once: pre-executor gate evaluation is
+    // SEQUENCE-scoped. A CONTINUATION pickup (its iteration-pending marker is
+    // present) whose gate inputs are byte-identical to the pass that recorded a
+    // gate-pass carries that pass's recorded verdicts forward instead of
+    // re-spawning the three gate sessions. Any doubt — a fresh pickup, a missing
+    // or unreadable record, a hash mismatch, a hashing I/O error, OR an
+    // unreadable recorded ledger — runs the gates in full: the skip fails toward
+    // RUNNING, never toward passing. No verdict is manufactured; the gates
+    // judged exactly these bytes when the sequence began, and the record only
+    // extends that judgment across its own sequence.
+    let workspace_basename = crate::workspace::basename(workspace);
+    let change_dir = crate::spec_root::SpecRoot::for_repo(repo, workspace)
+        .changes_dir()
+        .join(change);
+    let carried_ledger = if crate::iteration_pending::marker_exists(
+        paths,
+        workspace_basename,
+        change,
+    ) && crate::gate_pass_record::hash_matches(paths, workspace_basename, change, &change_dir)
+    {
+        // The recorded verdicts live in the per-change ledger persisted under
+        // `.git/` when the gates last passed. Carry them forward annotated; if
+        // that ledger is missing/unreadable we cannot honestly reconstruct the
+        // verdicts, so fall through to running the gates in full.
+        crate::gate_ledger::read_ledger(workspace, change).map(|mut prior| {
+            prior.mark_pre_executor_carried_forward();
+            prior
+        })
+    } else {
+        None
+    };
 
-    // `[canon]` gate: same no-skip runner + record.
-    run_canon_gate(paths, workspace, repo, chatops_ctx, change, &mut ledger).await?;
-    if let Some(step) = hold_if_blocking_fail(workspace, change, ledger.canon.verdict, &ledger) {
-        return Ok(step);
-    }
+    let ran_gates_in_full = match carried_ledger {
+        Some(prior) => {
+            tracing::info!(
+                url = %repo.url,
+                change = %change,
+                "continuation pickup with unchanged gate inputs; carrying the sequence's recorded pre-executor verdicts forward (no gate sessions spawned)"
+            );
+            ledger = prior;
+            false
+        }
+        None => {
+            // `[in]` gate: run its runner (enabled → handler verdict; disabled →
+            // stub `Disabled`), record the verdict + model in the ledger. A
+            // short-circuit holds the change immediately on a blocking-fail so we
+            // do NOT run `[canon]` on a change already held (preserving the
+            // single-marker behavior).
+            run_in_gate(paths, workspace, repo, chatops_ctx, change, &mut ledger).await?;
+            if let Some(step) =
+                hold_if_blocking_fail(workspace, change, ledger.r#in.verdict, &ledger)
+            {
+                return Ok(step);
+            }
 
-    // `[rules]` gate (global-rules-gate): same no-skip runner + record.
-    run_rules_gate(paths, workspace, repo, chatops_ctx, change, &mut ledger).await?;
-    if let Some(step) = hold_if_blocking_fail(workspace, change, ledger.rules.verdict, &ledger) {
-        return Ok(step);
-    }
+            // `[canon]` gate: same no-skip runner + record.
+            run_canon_gate(paths, workspace, repo, chatops_ctx, change, &mut ledger).await?;
+            if let Some(step) =
+                hold_if_blocking_fail(workspace, change, ledger.canon.verdict, &ledger)
+            {
+                return Ok(step);
+            }
+
+            // `[rules]` gate (global-rules-gate): same no-skip runner + record.
+            run_rules_gate(paths, workspace, repo, chatops_ctx, change, &mut ledger).await?;
+            if let Some(step) =
+                hold_if_blocking_fail(workspace, change, ledger.rules.verdict, &ledger)
+            {
+                return Ok(step);
+            }
+            true
+        }
+    };
 
     // DEFENSIVE proceed-gate (the structural fail-closed guarantee): read the
     // ledger. If any blocking gate is NOT `Pass`/`Disabled` — including a
@@ -494,6 +547,39 @@ pub(crate) async fn process_one_pending_change(
             change = %change,
             "failed to persist gate ledger (PR will render only the post-executor verdict): {e:#}"
         );
+    }
+
+    // iteration-sequence-gates-once: when the gates RAN in full this pickup AND
+    // every blocking gate passed (we are past the fail-closed proceed-gate),
+    // record the change directory's gate-inputs hash so the rest of this
+    // iteration sequence can carry these verdicts forward. Replaces any prior
+    // record. A carry pickup already has a matching record — do NOT rewrite it
+    // (it did not run the gates). Best-effort: a write failure just re-gates the
+    // next continuation.
+    if ran_gates_in_full {
+        match crate::gate_pass_record::compute_inputs_hash(&change_dir) {
+            Ok(hash) => {
+                if let Err(e) = crate::gate_pass_record::write_record(
+                    paths,
+                    workspace_basename,
+                    change,
+                    &hash,
+                ) {
+                    tracing::warn!(
+                        url = %repo.url,
+                        change = %change,
+                        "failed to write gate-pass record (next continuation re-gates): {e:#}"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    url = %repo.url,
+                    change = %change,
+                    "could not hash gate inputs to record gate-pass (next continuation re-gates): {e:#}"
+                );
+            }
+        }
     }
 
     queue::lock(workspace, change).with_context(|| format!("locking change `{change}`"))?;

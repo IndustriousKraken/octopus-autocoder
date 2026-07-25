@@ -323,15 +323,21 @@ async fn resume_spec_needs_revision(
     }
     // a27a1: same lifecycle as the pending path — SpecNeedsRevision
     // terminates the iteration sequence; drop the marker.
-    let basename_for_marker = workspace
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
+    let basename_for_marker = crate::workspace::basename(workspace);
     if let Err(e) = crate::iteration_pending::remove_marker(paths, basename_for_marker, change) {
         tracing::warn!(
             url = %repo.url,
             change = %change,
             "failed to remove iteration-pending marker on SpecNeedsRevision (resume): {e:#}"
+        );
+    }
+    // iteration-sequence-gates-once: same sequence termination as the pending
+    // path — drop the gate-pass record so a fresh sequence always re-gates.
+    if let Err(e) = crate::gate_pass_record::remove_record(paths, basename_for_marker, change) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "failed to remove gate-pass record on SpecNeedsRevision (resume): {e:#}"
         );
     }
     maybe_post_spec_revision_alert(
