@@ -351,6 +351,35 @@ async fn drive_one_audit(
         }
     }
 
+    // Re-attempt backoff. A cadence-driven audit whose last attempt
+    // failed is NOT re-attempted until a backoff has elapsed since that
+    // attempt — otherwise a deterministically failing audit re-bills a
+    // full session every iteration. Queued on-demand runs bypass this
+    // (an explicit operator retry is always allowed). Placed AFTER the
+    // cadence gate: cadence-not-due already returned above, so reaching
+    // here means the audit is otherwise due.
+    if !bypass_cadence
+        && let Some(failure) = state.failure(audit_type)
+        && failure.consecutive_failures > 0
+        && let Some(last_failed) = failure.last_failed_attempt_at
+    {
+        let poll = chrono::Duration::seconds(repo.poll_interval_sec as i64);
+        let backoff = compute_backoff(poll, cadence.interval(), failure.consecutive_failures);
+        let elapsed = now - last_failed;
+        if elapsed < backoff {
+            let remaining = backoff - elapsed;
+            tracing::info!(
+                audit_type,
+                consecutive_failures = failure.consecutive_failures,
+                remaining_secs = remaining.num_seconds(),
+                "audit backing off after {} consecutive failure(s); next re-attempt in ~{}s",
+                failure.consecutive_failures,
+                remaining.num_seconds(),
+            );
+            return Ok(false);
+        }
+    }
+
     let log_writer = AuditLogWriter::open(paths, workspace, audit_type)?;
     // Record run-prelude metadata so operators reading the log later see
     // exactly when the run started and what cadence/SHA context it had.
@@ -399,6 +428,10 @@ async fn drive_one_audit(
                 "audit_run_error",
                 &format!("end: {}\nerror: {e:#}", end_ts.to_rfc3339()),
             )?;
+            // Record the failed attempt for the re-attempt backoff. The
+            // cadence fields stay untouched (this path never advances
+            // cadence); only the failure-tracking fields move.
+            record_failed_attempt(state, workspace, repo, audit_type, end_ts);
             return Err(e);
         }
     };
@@ -513,9 +546,16 @@ async fn drive_one_audit(
                 // No post-hoc enforcement.
             }
         }
+        // Record the failed attempt for the re-attempt backoff BEFORE
+        // rendering the alert, so the alert names the consecutive-failure
+        // count AND the next eligible re-attempt time.
+        record_failed_attempt(state, workspace, repo, audit_type, end_ts);
+        let (count, next_eligible) =
+            failure_backoff_summary(state, repo, cadence.interval(), audit_type);
         let alert_err = anyhow::anyhow!(
-            "audit `{audit_type}` violated WritePolicy::{policy:?}: {}",
-            violation.reason
+            "audit `{audit_type}` violated WritePolicy::{policy:?}: {} ({})",
+            violation.reason,
+            super::format_backoff_clause(count, next_eligible),
         );
         handle_predictable_failure(
             paths,
@@ -684,6 +724,12 @@ async fn drive_one_audit(
                 "audit `{at}` did not complete ({}); failing closed — cadence NOT advanced",
                 cause.as_str(),
             );
+            // Record the failed attempt for the re-attempt backoff, then
+            // surface the count + next eligible re-attempt time in the
+            // alert.
+            record_failed_attempt(state, workspace, repo, audit_type, end_ts);
+            let (count, next_eligible) =
+                failure_backoff_summary(state, repo, cadence.interval(), audit_type);
             if let Some(ctx) = chatops_ctx {
                 if let Err(e) = super::post_did_not_complete_notification(
                     ctx,
@@ -691,6 +737,8 @@ async fn drive_one_audit(
                     at.as_str(),
                     *cause,
                     examined_summary.as_deref(),
+                    count,
+                    next_eligible,
                 )
                 .await
                 {
@@ -716,6 +764,11 @@ async fn drive_one_audit(
     // Persist state. Validation-exhausted runs still update last_run_at
     // so the cadence retriggers naturally on the next due-date rather
     // than burning through retries on every iteration.
+    //
+    // Any outcome reaching here is a successful terminal outcome (it
+    // advances cadence) — clear the failure tracking so a prior backoff
+    // does not linger after the audit recovers.
+    state.clear_failure(audit_type);
     state.record(
         audit_type,
         AuditRunEntry {
@@ -740,10 +793,16 @@ async fn drive_one_audit(
             "failed to persist audit state after successful run: {e:#}"
         );
     }
-    // Ensure .audit-state.json is registered in .git/info/exclude. Most
-    // callers go through workspace::ensure_initialized which already
-    // registers it, but tests that build a workspace by hand may skip
-    // that path. The helper is idempotent.
+    ensure_audit_state_excluded(workspace, repo);
+    Ok(true)
+}
+
+/// Register `.audit-state.json` in `.git/info/exclude` so the write-policy
+/// post-hoc `git status` check never mistakes it for an audit-authored
+/// diff. Most callers go through `workspace::ensure_initialized` which
+/// already registers it, but tests that build a workspace by hand may
+/// skip that path. Idempotent; failures are logged and swallowed.
+fn ensure_audit_state_excluded(workspace: &Path, repo: &RepositoryConfig) {
     if workspace.join(".git").is_dir() {
         if let Err(e) = workspace::ensure_git_info_excluded(workspace, ".audit-state.json") {
             tracing::warn!(
@@ -752,7 +811,86 @@ async fn drive_one_audit(
             );
         }
     }
-    Ok(true)
+}
+
+/// Record a failed audit attempt in the failure-tracking fields (for the
+/// re-attempt backoff) and persist. Never touches the cadence fields, so
+/// a failure never advances cadence. A save failure is logged and
+/// swallowed — the in-memory count still stands for the rest of the
+/// iteration. Also re-registers `.audit-state.json` in the git exclude
+/// list, since a failed attempt now writes that file too.
+fn record_failed_attempt(
+    state: &mut AuditState,
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    audit_type: &str,
+    when: chrono::DateTime<Utc>,
+) {
+    state.record_failure(audit_type, when);
+    if let Err(e) = state.save(workspace) {
+        tracing::warn!(
+            url = %repo.url,
+            audit_type,
+            "failed to persist audit failure-tracking state: {e:#}"
+        );
+    }
+    ensure_audit_state_excluded(workspace, repo);
+}
+
+/// Re-attempt backoff for a failing audit: starts at one poll interval,
+/// doubles per consecutive failure, capped at the smaller of the audit's
+/// cadence interval and 24h so eventual retry is preserved. A `None`
+/// cadence (disabled — on-demand only) caps at 24h alone. Zero failures
+/// → `Duration::zero()`. The exponent and multiply saturate, so a large
+/// failure count can never overflow (the cap bounds the result anyway).
+fn compute_backoff(
+    poll_interval: chrono::Duration,
+    cadence_interval: Option<chrono::Duration>,
+    consecutive_failures: u32,
+) -> chrono::Duration {
+    if consecutive_failures == 0 {
+        return chrono::Duration::zero();
+    }
+    let day = chrono::Duration::hours(24);
+    let cap = match cadence_interval {
+        Some(c) => std::cmp::min(c, day),
+        None => day,
+    };
+    // Clamp to the cap in SECONDS before building the Duration: an
+    // uncapped `poll * 2^(n-1)` overflows chrono's Duration range for a
+    // large `n` and `Duration::seconds` would panic. The cap (≤ 24h)
+    // makes the result trivially in-range.
+    let cap_secs = cap.num_seconds().max(0) as u64;
+    let shift = consecutive_failures - 1;
+    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+    let poll_secs = poll_interval.num_seconds().max(0) as u64;
+    let backoff_secs = poll_secs.saturating_mul(multiplier).min(cap_secs);
+    chrono::Duration::seconds(backoff_secs as i64)
+}
+
+/// After a failed attempt has been recorded, derive the alert-facing
+/// summary: the consecutive-failure count AND the next eligible
+/// automatic re-attempt time. `next_eligible` is `None` when there is no
+/// automatic cadence (disabled audit) — an on-demand-only audit has no
+/// scheduled retry to name.
+fn failure_backoff_summary(
+    state: &AuditState,
+    repo: &RepositoryConfig,
+    cadence_interval: Option<chrono::Duration>,
+    audit_type: &str,
+) -> (u32, Option<chrono::DateTime<Utc>>) {
+    let Some(f) = state.failure(audit_type) else {
+        return (0, None);
+    };
+    let count = f.consecutive_failures;
+    let next = match (f.last_failed_attempt_at, cadence_interval) {
+        (Some(last), Some(_)) => {
+            let poll = chrono::Duration::seconds(repo.poll_interval_sec as i64);
+            Some(last + compute_backoff(poll, cadence_interval, count))
+        }
+        _ => None,
+    };
+    (count, next)
 }
 
 /// Maximum number of offending paths a write-policy violation reason names
@@ -3251,5 +3389,167 @@ mod tests {
             1,
             "skipped audit did not consume the bound's slot, so b runs"
         );
+    }
+
+    // ---------------- audit-failure-backoff ----------------
+
+    /// 3.1: a failed attempt is NOT re-attempted on the immediately
+    /// following iteration; it IS re-attempted once the backoff elapses.
+    /// Uses a `run()`-erroring audit so the arming path (1.2) and the
+    /// gate (2.1) are exercised end-to-end.
+    #[tokio::test]
+    async fn failed_attempt_backs_off_then_reattempts_after_backoff() {
+        let (_t, ws) = init_workspace();
+        let audit = Arc::new(CountingAudit::new("bo1").fails("boom"));
+        let counter = audit.invocations.clone();
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let repo = fixture_repo(); // poll_interval_sec = 60
+        let cfg = audits_cfg_daily("bo1");
+        let empty_queue = std::sync::Mutex::new(Vec::new());
+
+        // Iteration 1: audit runs and errors → arms the backoff.
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &empty_queue)
+            .await
+            .unwrap();
+        assert_eq!(*counter.lock().unwrap(), 1, "first attempt runs");
+        let state = AuditState::load_or_default(&ws);
+        let f = state.failure("bo1").expect("failure armed");
+        assert_eq!(f.consecutive_failures, 1);
+        assert!(f.last_failed_attempt_at.is_some());
+
+        // Iteration 2 (immediately after): within the 60s backoff → skip.
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &empty_queue)
+            .await
+            .unwrap();
+        assert_eq!(*counter.lock().unwrap(), 1, "within backoff → NOT re-attempted");
+
+        // Age the failed attempt past the backoff, then it re-attempts.
+        let mut state = AuditState::load_or_default(&ws);
+        state
+            .failures
+            .get_mut("bo1")
+            .unwrap()
+            .last_failed_attempt_at = Some(Utc::now() - chrono::Duration::seconds(120));
+        state.save(&ws).unwrap();
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &empty_queue)
+            .await
+            .unwrap();
+        assert_eq!(*counter.lock().unwrap(), 2, "backoff elapsed → re-attempted");
+    }
+
+    /// 3.2: the backoff doubles per consecutive failure and never exceeds
+    /// the smaller of the cadence interval and 24 hours.
+    #[test]
+    fn backoff_doubles_per_failure_and_is_capped() {
+        use chrono::Duration;
+        let poll = Duration::seconds(60);
+        let daily = Some(Duration::days(1));
+        // Doubling from the poll interval.
+        assert_eq!(compute_backoff(poll, daily, 1), Duration::seconds(60));
+        assert_eq!(compute_backoff(poll, daily, 2), Duration::seconds(120));
+        assert_eq!(compute_backoff(poll, daily, 3), Duration::seconds(240));
+        assert_eq!(compute_backoff(poll, daily, 4), Duration::seconds(480));
+        // Zero failures → zero backoff.
+        assert_eq!(compute_backoff(poll, daily, 0), Duration::zero());
+        // Capped at min(cadence, 24h). Daily = 24h, so the cap is 24h.
+        assert_eq!(compute_backoff(poll, daily, 40), Duration::hours(24));
+        // A weekly cadence still caps at 24h (the smaller of the two).
+        assert_eq!(compute_backoff(poll, Some(Duration::days(7)), 40), Duration::hours(24));
+        // A sub-day cadence caps at the cadence, not 24h.
+        let short = Some(Duration::hours(2));
+        assert_eq!(compute_backoff(poll, short, 40), Duration::hours(2));
+        // Exhaustive: never exceeds the cap and never panics for any count.
+        for n in 1..=64u32 {
+            let b = compute_backoff(poll, daily, n);
+            assert!(b <= Duration::hours(24), "n={n} exceeded cap: {b:?}");
+            assert!(b >= Duration::zero());
+        }
+        // Disabled cadence (None) caps at 24h alone.
+        assert_eq!(compute_backoff(poll, None, 40), Duration::hours(24));
+    }
+
+    /// 3.3 (part 1): a successful run clears the failure tracking.
+    #[tokio::test]
+    async fn successful_run_clears_failure_tracking() {
+        let (_t, ws) = init_workspace();
+        let audit = Arc::new(CountingAudit::new("sc1")); // default outcome: NoFindings
+        let counter = audit.invocations.clone();
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let repo = fixture_repo();
+        let cfg = audits_cfg_daily("sc1");
+
+        // Arm a stale failure (2 in a row, a day ago → backoff long elapsed).
+        let mut state = AuditState::default();
+        state.record_failure("sc1", Utc::now() - chrono::Duration::days(1));
+        state.record_failure("sc1", Utc::now() - chrono::Duration::days(1));
+        state.save(&ws).unwrap();
+
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
+            .await
+            .unwrap();
+        assert_eq!(*counter.lock().unwrap(), 1, "backoff elapsed → audit runs");
+        let state = AuditState::load_or_default(&ws);
+        assert!(state.failure("sc1").is_none(), "success must clear failure tracking");
+        assert!(state.runs.contains_key("sc1"), "success advances cadence");
+    }
+
+    /// 3.3 (part 2): a queued on-demand run executes despite an open
+    /// backoff, and its terminal outcome still updates the tracking.
+    #[tokio::test]
+    async fn queued_run_bypasses_open_backoff() {
+        let (_t, ws) = init_workspace();
+        let audit = Arc::new(CountingAudit::new("qb1"));
+        let counter = audit.invocations.clone();
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let repo = fixture_repo();
+        let cfg = audits_cfg_daily("qb1");
+
+        // Arm a FRESH failure (3 in a row, just now → backoff wide open).
+        let mut state = AuditState::default();
+        for _ in 0..3 {
+            state.record_failure("qb1", Utc::now());
+        }
+        state.save(&ws).unwrap();
+
+        // Queue the audit on-demand: it must run despite the open backoff.
+        let queue = to_queue(&HashSet::from(["qb1".to_string()]));
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &queue)
+            .await
+            .unwrap();
+        assert_eq!(*counter.lock().unwrap(), 1, "queued run bypasses backoff");
+        let state = AuditState::load_or_default(&ws);
+        assert!(
+            state.failure("qb1").is_none(),
+            "queued success updates tracking (clears it)"
+        );
+    }
+
+    /// 3.4: `WorkspaceUnavailable` neither records a failed attempt nor
+    /// arms a backoff.
+    #[tokio::test]
+    async fn workspace_unavailable_does_not_arm_backoff() {
+        let (_t, ws) = init_workspace();
+        let audit = Arc::new(CountingAudit::new("wu1").with_outcome(
+            AuditOutcome::WorkspaceUnavailable {
+                audit_type: "wu1".into(),
+                workspace_path: ws.clone(),
+                reason: "workspace missing".into(),
+            },
+        ));
+        let counter = audit.invocations.clone();
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let repo = fixture_repo();
+        let cfg = audits_cfg_daily("wu1");
+
+        run_due_audits(test_paths(), &registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &std::sync::Mutex::new(Vec::new()))
+            .await
+            .unwrap();
+        assert_eq!(*counter.lock().unwrap(), 1, "audit ran and returned WorkspaceUnavailable");
+        let state = AuditState::load_or_default(&ws);
+        assert!(
+            state.failure("wu1").is_none(),
+            "WorkspaceUnavailable must NOT arm a backoff"
+        );
+        assert!(!state.runs.contains_key("wu1"), "WorkspaceUnavailable does not advance cadence");
     }
 }

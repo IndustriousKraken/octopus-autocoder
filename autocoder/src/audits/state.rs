@@ -45,6 +45,22 @@ pub struct AuditRunEntry {
     pub last_outcome: AuditOutcomeKind,
 }
 
+/// Failure-tracking fields for the re-attempt backoff, kept DISTINCT
+/// from the cadence fields in [`AuditRunEntry`] so a failed attempt
+/// never advances cadence. Stored per-audit-type in
+/// [`AuditState::failures`]; an absent entry means "no consecutive
+/// failures". Kept out of `AuditRunEntry` deliberately: an audit that
+/// fails on its very first attempt has no run entry (no valid
+/// `last_run_at`), so failure tracking must live independently of the
+/// cadence record.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FailureTracking {
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default)]
+    pub last_failed_attempt_at: Option<DateTime<Utc>>,
+}
+
 /// One entry in an audit's `attempt_history`. Persisted alongside the
 /// most-recent-run entry so operators (and future observability work)
 /// have a per-audit-type trail of validation-failure metadata without
@@ -74,6 +90,12 @@ pub struct AuditState {
     /// predate this field deserialize cleanly with an empty map.
     #[serde(default)]
     pub attempt_history: HashMap<String, Vec<AttemptEntry>>,
+    /// Per-audit-type failure tracking for the re-attempt backoff (see
+    /// [`FailureTracking`]). Distinct from `runs` so a failure never
+    /// advances cadence. Backwards-compatible: older state files
+    /// deserialize with an empty map.
+    #[serde(default)]
+    pub failures: HashMap<String, FailureTracking>,
 }
 
 fn audit_state_path(workspace: &Path) -> PathBuf {
@@ -242,6 +264,28 @@ impl AuditState {
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
+
+    /// Record a failed audit attempt: bump the consecutive-failure count
+    /// and stamp the attempt time. Only touches the failure-tracking
+    /// fields — the cadence entry in `runs` is left untouched so a
+    /// failure never advances cadence.
+    pub fn record_failure(&mut self, audit_type: &str, when: DateTime<Utc>) {
+        let f = self.failures.entry(audit_type.to_string()).or_default();
+        f.consecutive_failures = f.consecutive_failures.saturating_add(1);
+        f.last_failed_attempt_at = Some(when);
+    }
+
+    /// Clear the failure tracking for `audit_type` after a successful
+    /// terminal outcome. Idempotent when no failures were recorded.
+    pub fn clear_failure(&mut self, audit_type: &str) {
+        self.failures.remove(audit_type);
+    }
+
+    /// Borrow the failure tracking for `audit_type`, if any failed
+    /// attempts have been recorded since the last success.
+    pub fn failure(&self, audit_type: &str) -> Option<&FailureTracking> {
+        self.failures.get(audit_type)
+    }
 }
 
 #[cfg(test)]
@@ -312,6 +356,40 @@ mod tests {
         assert_eq!(s.runs.len(), 1);
         assert!(s.attempt_history.is_empty(), "missing field → empty map");
         assert!(s.history("architecture_advisor").is_empty());
+    }
+
+    #[test]
+    fn old_file_without_failures_field_loads_and_failure_round_trips() {
+        // A state file predating the backoff feature has no `failures`
+        // key; it must load with an empty failures map (serde default).
+        let dir = TempDir::new().unwrap();
+        let raw = r#"{
+            "runs": {
+                "a": { "last_run_at": "2026-01-01T00:00:00Z", "last_run_sha": "x", "last_outcome": "no_findings" }
+            }
+        }"#;
+        std::fs::write(dir.path().join(".audit-state.json"), raw).unwrap();
+        let mut s = AuditState::load_or_default(dir.path());
+        assert!(s.failures.is_empty(), "missing `failures` → empty map");
+        assert!(s.failure("a").is_none());
+
+        // record_failure bumps the count + stamps the time; it round-trips.
+        let t0 = Utc::now();
+        s.record_failure("a", t0);
+        s.record_failure("a", t0);
+        s.save(dir.path()).unwrap();
+        let reloaded = AuditState::load_or_default(dir.path());
+        let f = reloaded.failure("a").expect("failure persisted");
+        assert_eq!(f.consecutive_failures, 2);
+        assert!(f.last_failed_attempt_at.is_some());
+        // The cadence entry is untouched by a failed attempt.
+        assert_eq!(reloaded.runs.get("a").unwrap().last_run_sha.as_deref(), Some("x"));
+
+        // clear_failure removes the tracking; idempotent when absent.
+        let mut s = reloaded;
+        s.clear_failure("a");
+        s.clear_failure("a");
+        assert!(s.failure("a").is_none(), "clear removes the tracking");
     }
 
     #[test]
