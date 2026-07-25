@@ -106,11 +106,30 @@ pub(crate) async fn handle_contradiction_preflight(
 ) -> Result<crate::gate_ledger::GateVerdict> {
     use crate::gate_ledger::GateVerdict;
     use crate::preflight::change_contradiction::ContradictionCheckOutcome;
-    let findings = match crate::preflight::change_contradiction::run_agentic_contradiction_check(
-        cc_ctx, workspace, change,
+    // Bounded-retry billing visibility (gate-retry-billing-visibility): capture
+    // the attempts consumed, then post ONE notification per invocation if a
+    // re-attempt was billed. Disposition is derived from the outcome BEFORE the
+    // early-returning match arms so a held (Errored) invocation still notifies.
+    let mut retry = crate::verifier_gate::RetryReport::default();
+    let outcome = crate::preflight::change_contradiction::run_agentic_contradiction_check_reporting(
+        cc_ctx, workspace, change, &mut retry,
     )
-    .await
-    {
+    .await;
+    let disposition = match &outcome {
+        ContradictionCheckOutcome::Clean => "clean",
+        ContradictionCheckOutcome::Found { .. } => "findings",
+        ContradictionCheckOutcome::Errored { .. } => "held",
+    };
+    announce_gate_retry(
+        chatops_ctx,
+        crate::verifier_gate::VerifierGate::In,
+        change,
+        &retry,
+        disposition,
+        cc_ctx.attribution.as_deref(),
+    )
+    .await;
+    let findings = match outcome {
         ContradictionCheckOutcome::Clean => {
             // Positive signal: a clean pass is logged, so an operator can verify
             // the gate RAN and PASSED rather than inferring it from silence.
@@ -354,11 +373,28 @@ pub(crate) async fn handle_canon_contradiction_preflight(
 ) -> Result<crate::gate_ledger::GateVerdict> {
     use crate::gate_ledger::GateVerdict;
     use crate::preflight::canon_contradiction::CanonContradictionCheckOutcome;
-    let findings = match crate::preflight::canon_contradiction::run_agentic_canon_contradiction_check(
-        canon_ctx, workspace, change,
+    // Bounded-retry billing visibility (gate-retry-billing-visibility).
+    let mut retry = crate::verifier_gate::RetryReport::default();
+    let outcome =
+        crate::preflight::canon_contradiction::run_agentic_canon_contradiction_check_reporting(
+            canon_ctx, workspace, change, &mut retry,
+        )
+        .await;
+    let disposition = match &outcome {
+        CanonContradictionCheckOutcome::Clean => "clean",
+        CanonContradictionCheckOutcome::Found(_) => "findings",
+        CanonContradictionCheckOutcome::Errored { .. } => "held",
+    };
+    announce_gate_retry(
+        chatops_ctx,
+        crate::verifier_gate::VerifierGate::Canon,
+        change,
+        &retry,
+        disposition,
+        canon_ctx.attribution.as_deref(),
     )
-    .await
-    {
+    .await;
+    let findings = match outcome {
         CanonContradictionCheckOutcome::Clean => {
             // Positive signal: a clean pass is logged, so an operator can verify
             // the gate RAN and PASSED rather than inferring it from silence.
@@ -486,11 +522,27 @@ pub(crate) async fn handle_rules_violations_preflight(
 ) -> Result<crate::gate_ledger::GateVerdict> {
     use crate::gate_ledger::GateVerdict;
     use crate::preflight::global_rules::GlobalRulesCheckOutcome;
-    let findings = match crate::preflight::global_rules::run_agentic_global_rules_check(
-        rules_ctx, workspace, change,
+    // Bounded-retry billing visibility (gate-retry-billing-visibility).
+    let mut retry = crate::verifier_gate::RetryReport::default();
+    let outcome = crate::preflight::global_rules::run_agentic_global_rules_check_reporting(
+        rules_ctx, workspace, change, &mut retry,
     )
-    .await
-    {
+    .await;
+    let disposition = match &outcome {
+        GlobalRulesCheckOutcome::Clean => "clean",
+        GlobalRulesCheckOutcome::Found(_) => "findings",
+        GlobalRulesCheckOutcome::Errored { .. } => "held",
+    };
+    announce_gate_retry(
+        chatops_ctx,
+        crate::verifier_gate::VerifierGate::Rules,
+        change,
+        &retry,
+        disposition,
+        rules_ctx.attribution.as_deref(),
+    )
+    .await;
+    let findings = match outcome {
         GlobalRulesCheckOutcome::Clean => {
             // Positive signal: a clean pass is logged, so an operator can verify
             // the gate RAN and PASSED rather than inferring it from silence.

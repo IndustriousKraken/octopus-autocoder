@@ -32,9 +32,10 @@
 
 use crate::agentic_run::ResolvedModel;
 use crate::preflight::corpus_check::{
-    CliCorpusCheckSessionRunner, CorpusCheckSession, CorpusCheckSessionRunner, run_corpus_check_with_runner,
+    CliCorpusCheckSessionRunner, CorpusCheckSession, CorpusCheckSessionRunner,
+    run_corpus_check_with_runner, run_corpus_check_with_runner_reporting,
 };
-use crate::verifier_gate::VerifierGate;
+use crate::verifier_gate::{RetryReport, VerifierGate};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::future::Future;
@@ -325,6 +326,21 @@ pub async fn run_agentic_canon_contradiction_check(
     workspace_root: &Path,
     change_slug: &str,
 ) -> CanonContradictionCheckOutcome {
+    let mut report = RetryReport::default();
+    run_agentic_canon_contradiction_check_reporting(ctx, workspace_root, change_slug, &mut report)
+        .await
+}
+
+/// As [`run_agentic_canon_contradiction_check`], but ALSO surfaces the
+/// bounded-retry [`RetryReport`] into `report` so a daemon call site can post
+/// the operator-visible retry-billing notification
+/// (gate-retry-billing-visibility). The gate's disposition is unchanged.
+pub async fn run_agentic_canon_contradiction_check_reporting(
+    ctx: &CanonContradictionCheckCtx,
+    workspace_root: &Path,
+    change_slug: &str,
+    report: &mut RetryReport,
+) -> CanonContradictionCheckOutcome {
     // Test seam: an injected submission stands in for the CLI + control socket
     // so the orchestration is exercised without spawning a process.
     #[cfg(test)]
@@ -332,11 +348,12 @@ pub async fn run_agentic_canon_contradiction_check(
         let runner = CannedCanonContradictionRunner {
             submission: injected.clone(),
         };
-        return run_agentic_canon_contradiction_check_with_runner(
+        return run_agentic_canon_contradiction_check_with_runner_reporting(
             ctx,
             workspace_root,
             change_slug,
             &runner,
+            report,
         )
         .await;
     }
@@ -370,8 +387,14 @@ pub async fn run_agentic_canon_contradiction_check(
         subject_slug: change_slug,
         paths: ctx.paths.clone(),
     };
-    run_agentic_canon_contradiction_check_with_runner(ctx, workspace_root, change_slug, &runner)
-        .await
+    run_agentic_canon_contradiction_check_with_runner_reporting(
+        ctx,
+        workspace_root,
+        change_slug,
+        &runner,
+        report,
+    )
+    .await
 }
 
 /// Map a corpus-check session result into a [`CanonContradictionCheckOutcome`]
@@ -412,10 +435,36 @@ async fn run_agentic_canon_contradiction_check_with_runner(
     change_slug: &str,
     runner: &dyn CorpusCheckSessionRunner,
 ) -> CanonContradictionCheckOutcome {
+    let mut report = RetryReport::default();
+    run_agentic_canon_contradiction_check_with_runner_reporting(
+        ctx,
+        workspace_root,
+        change_slug,
+        runner,
+        &mut report,
+    )
+    .await
+}
+
+/// As [`run_agentic_canon_contradiction_check_with_runner`], but threads the
+/// bounded-retry [`RetryReport`] out through `report`.
+async fn run_agentic_canon_contradiction_check_with_runner_reporting(
+    ctx: &CanonContradictionCheckCtx,
+    workspace_root: &Path,
+    change_slug: &str,
+    runner: &dyn CorpusCheckSessionRunner,
+    report: &mut RetryReport,
+) -> CanonContradictionCheckOutcome {
     let prompt = build_canon_contradiction_prompt(&ctx.prompt_template, workspace_root, change_slug);
-    let session =
-        run_corpus_check_with_runner(VerifierGate::Canon, change_slug, ctx.retries, &prompt, runner)
-            .await;
+    let session = run_corpus_check_with_runner_reporting(
+        VerifierGate::Canon,
+        change_slug,
+        ctx.retries,
+        &prompt,
+        runner,
+        report,
+    )
+    .await;
     map_canon_session(session, change_slug)
 }
 

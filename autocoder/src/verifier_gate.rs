@@ -96,11 +96,44 @@ pub(crate) trait SessionSubmission {
     fn has_submission(&self) -> bool;
 }
 
+/// How many gate-session attempts an invocation consumed vs. how many it was
+/// allowed. [`run_session_with_retry`] writes it so a caller can make the retry
+/// billing operator-visible (gate-retry-billing-visibility): every attempt
+/// after the first is a fresh, fully billed agentic session, so a consumed
+/// re-attempt is spend the operator should be able to attribute to the model.
+/// `attempts_allowed` is `retries + 1` (the first attempt plus the configured
+/// re-attempts).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RetryReport {
+    /// Attempts actually run. `1` means no re-attempt was needed; `2` means the
+    /// first attempt ended with no submission AND a re-attempt was made, etc.
+    /// Written for EVERY outcome including the `Err(_)` short-circuit (a session
+    /// error on attempt N reports `attempts_used == N`), so the caller can
+    /// attribute a held disposition to the attempts it cost.
+    pub attempts_used: u32,
+    /// Attempts the budget allowed for this invocation (`retries + 1`).
+    pub attempts_allowed: u32,
+}
+
+impl RetryReport {
+    /// True when at least one re-attempt was consumed (more attempts than the
+    /// single first one). This is the trigger for the operator-visible retry
+    /// notification: only a consumed re-attempt represents extra billed spend.
+    pub fn retried(&self) -> bool {
+        self.attempts_used > 1
+    }
+}
+
 /// Run ONE agentic gate session via `run_one`, retrying ONLY the flaky
 /// no-submission case up to `retries` additional attempts (so `retries + 1`
 /// attempts total; `retries == 0` preserves the historical single-attempt
 /// behavior). This is the SHARED seam all three verifier gates ([in]/[canon]/
 /// [out]) wrap their "run a session, then drain the submission" step in.
+///
+/// `report` is written with the attempts consumed AND the budget allowed (for
+/// EVERY outcome, including the error short-circuit) so the caller can surface
+/// the retry billing — the retry SEMANTICS are unchanged, this only observes
+/// them (gate-retry-billing-visibility).
 ///
 /// Weak local models are non-deterministically flaky: they often read the
 /// spec then end the session WITHOUT calling their `submit_*` MCP tool, so the
@@ -132,6 +165,7 @@ pub(crate) async fn run_session_with_retry<O, F, Fut>(
     gate: VerifierGate,
     change: &str,
     retries: u32,
+    report: &mut RetryReport,
     mut run_one: F,
 ) -> anyhow::Result<O>
 where
@@ -140,9 +174,11 @@ where
     Fut: Future<Output = anyhow::Result<O>>,
 {
     let total_attempts = retries.saturating_add(1);
+    report.attempts_allowed = total_attempts;
     let label = gate.label();
     let mut attempt: u32 = 1;
     loop {
+        report.attempts_used = attempt;
         let result = run_one().await;
         match &result {
             // A successful run with a submission, OR any session error: return
@@ -499,14 +535,16 @@ mod tests {
     }
 
     /// A successful run with no submission on the first `no_submit_for`
-    /// attempts, a submission afterward. `Cell` tracks the call count.
+    /// attempts, a submission afterward. `Cell` tracks the call count; `report`
+    /// receives the attempts-used/allowed the wrapper surfaced.
     async fn run_helper(
         gate: VerifierGate,
         retries: u32,
         no_submit_for: u32,
         calls: &Cell<u32>,
+        report: &mut RetryReport,
     ) -> anyhow::Result<TestOutcome> {
-        run_session_with_retry(gate, "c1", retries, || {
+        run_session_with_retry(gate, "c1", retries, report, || {
             let n = calls.get();
             calls.set(n + 1);
             async move { Ok(TestOutcome { has: n >= no_submit_for }) }
@@ -515,52 +553,71 @@ mod tests {
     }
 
     /// No submission on attempt 1, a submission on attempt 2 → returns the
-    /// submitting outcome after exactly two attempts.
+    /// submitting outcome after exactly two attempts, AND the report carries
+    /// attempts-used = 2 (of 3 allowed) so a caller can notify on the retry.
     #[tokio::test]
     async fn retry_returns_submission_after_one_retry() {
         let calls = Cell::new(0);
-        let out = run_helper(VerifierGate::In, 2, 1, &calls).await.unwrap();
+        let mut report = RetryReport::default();
+        let out = run_helper(VerifierGate::In, 2, 1, &calls, &mut report).await.unwrap();
         assert!(out.has_submission());
         assert_eq!(calls.get(), 2, "one retry → two attempts");
+        assert_eq!(report.attempts_used, 2, "one re-attempt was consumed");
+        assert_eq!(report.attempts_allowed, 3, "retries(2) + 1 = 3 allowed");
+        assert!(report.retried(), "a consumed re-attempt is a retry");
     }
 
     /// No submission on every attempt → returns a no-submission outcome after
-    /// exactly `retries + 1` attempts (the caller then fails closed).
+    /// exactly `retries + 1` attempts (the caller then fails closed); the report
+    /// carries attempts-used = allowed.
     #[tokio::test]
     async fn retry_exhausts_bound_then_returns_no_submission() {
         let calls = Cell::new(0);
+        let mut report = RetryReport::default();
         // no_submit_for is huge → the closure never submits.
-        let out = run_helper(VerifierGate::Canon, 2, u32::MAX, &calls).await.unwrap();
+        let out = run_helper(VerifierGate::Canon, 2, u32::MAX, &calls, &mut report).await.unwrap();
         assert!(!out.has_submission());
         assert_eq!(calls.get(), 3, "retries(2) + 1 = 3 attempts");
+        assert_eq!(report.attempts_used, 3);
+        assert_eq!(report.attempts_allowed, 3);
+        assert!(report.retried());
     }
 
-    /// `retries == 0` → exactly one attempt.
+    /// `retries == 0` → exactly one attempt AND the report is not a retry.
     #[tokio::test]
     async fn retry_zero_is_one_attempt() {
         let calls = Cell::new(0);
-        let out = run_helper(VerifierGate::Out, 0, u32::MAX, &calls).await.unwrap();
+        let mut report = RetryReport::default();
+        let out = run_helper(VerifierGate::Out, 0, u32::MAX, &calls, &mut report).await.unwrap();
         assert!(!out.has_submission());
         assert_eq!(calls.get(), 1, "retries=0 → one attempt");
+        assert_eq!(report.attempts_used, 1);
+        assert_eq!(report.attempts_allowed, 1);
+        assert!(!report.retried(), "a single attempt is not a retry");
     }
 
     /// A submission on attempt 1 → exactly one attempt (no needless retry).
     #[tokio::test]
     async fn retry_no_op_when_first_attempt_submits() {
         let calls = Cell::new(0);
-        let out = run_helper(VerifierGate::In, 5, 0, &calls).await.unwrap();
+        let mut report = RetryReport::default();
+        let out = run_helper(VerifierGate::In, 5, 0, &calls, &mut report).await.unwrap();
         assert!(out.has_submission());
         assert_eq!(calls.get(), 1, "a submission on attempt 1 needs no retry");
+        assert_eq!(report.attempts_used, 1);
+        assert!(!report.retried());
     }
 
     /// A session ERROR short-circuits immediately — it is NOT retried (a
     /// timeout would just time out again; an unregistered-strategy /
-    /// CLI-unavailable error is config-level).
+    /// CLI-unavailable error is config-level). The report still records the one
+    /// attempt it cost, and it is NOT a retry.
     #[tokio::test]
     async fn retry_does_not_retry_errors() {
         let calls = Cell::new(0);
+        let mut report = RetryReport::default();
         let result: anyhow::Result<TestOutcome> =
-            run_session_with_retry(VerifierGate::In, "c1", 5, || {
+            run_session_with_retry(VerifierGate::In, "c1", 5, &mut report, || {
                 let n = calls.get();
                 calls.set(n + 1);
                 async move { Err::<TestOutcome, _>(anyhow::anyhow!("spawn error")) }
@@ -568,6 +625,8 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert_eq!(calls.get(), 1, "an error is not retried");
+        assert_eq!(report.attempts_used, 1, "the one errored attempt is recorded");
+        assert!(!report.retried(), "an un-retried error is not a retry");
     }
 
     /// Each retry logs at INFO with the gate label, attempt number, AND bound.
@@ -575,7 +634,8 @@ mod tests {
     #[tracing_test::traced_test]
     async fn retry_logs_attempt_and_bound_at_info() {
         let calls = Cell::new(0);
-        let _ = run_helper(VerifierGate::In, 2, u32::MAX, &calls).await.unwrap();
+        let mut report = RetryReport::default();
+        let _ = run_helper(VerifierGate::In, 2, u32::MAX, &calls, &mut report).await.unwrap();
         assert!(
             logs_contain("[verifier:in] no submission on attempt 1/3; retrying"),
             "the first retry must log the gate label, attempt, and bound"

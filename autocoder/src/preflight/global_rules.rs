@@ -28,9 +28,9 @@
 use crate::agentic_run::ResolvedModel;
 use crate::preflight::corpus_check::{
     CliCorpusCheckSessionRunner, CorpusCheckSession, CorpusCheckSessionRunner,
-    run_corpus_check_with_runner,
+    run_corpus_check_with_runner, run_corpus_check_with_runner_reporting,
 };
-use crate::verifier_gate::VerifierGate;
+use crate::verifier_gate::{RetryReport, VerifierGate};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::future::Future;
@@ -449,14 +449,34 @@ pub async fn run_agentic_global_rules_check(
     workspace_root: &Path,
     change_slug: &str,
 ) -> GlobalRulesCheckOutcome {
+    let mut report = RetryReport::default();
+    run_agentic_global_rules_check_reporting(ctx, workspace_root, change_slug, &mut report).await
+}
+
+/// As [`run_agentic_global_rules_check`], but ALSO surfaces the bounded-retry
+/// [`RetryReport`] into `report` so a daemon call site can post the
+/// operator-visible retry-billing notification (gate-retry-billing-visibility).
+/// The gate's disposition is unchanged.
+pub async fn run_agentic_global_rules_check_reporting(
+    ctx: &GlobalRulesCheckCtx,
+    workspace_root: &Path,
+    change_slug: &str,
+    report: &mut RetryReport,
+) -> GlobalRulesCheckOutcome {
     // Test seam: an injected submission stands in for the CLI + control socket.
     #[cfg(test)]
     if let Some(injected) = &ctx.test_submission {
         let runner = CannedRuleViolationRunner {
             submission: injected.clone(),
         };
-        return run_agentic_global_rules_check_with_runner(ctx, workspace_root, change_slug, &runner)
-            .await;
+        return run_agentic_global_rules_check_with_runner_reporting(
+            ctx,
+            workspace_root,
+            change_slug,
+            &runner,
+            report,
+        )
+        .await;
     }
 
     let strategy = match crate::agentic_run::strategy_for_provider(
@@ -488,7 +508,14 @@ pub async fn run_agentic_global_rules_check(
         subject_slug: change_slug,
         paths: ctx.paths.clone(),
     };
-    run_agentic_global_rules_check_with_runner(ctx, workspace_root, change_slug, &runner).await
+    run_agentic_global_rules_check_with_runner_reporting(
+        ctx,
+        workspace_root,
+        change_slug,
+        &runner,
+        report,
+    )
+    .await
 }
 
 /// Map a corpus-check session result into a [`GlobalRulesCheckOutcome`] (the
@@ -522,11 +549,37 @@ async fn run_agentic_global_rules_check_with_runner(
     change_slug: &str,
     runner: &dyn CorpusCheckSessionRunner,
 ) -> GlobalRulesCheckOutcome {
+    let mut report = RetryReport::default();
+    run_agentic_global_rules_check_with_runner_reporting(
+        ctx,
+        workspace_root,
+        change_slug,
+        runner,
+        &mut report,
+    )
+    .await
+}
+
+/// As [`run_agentic_global_rules_check_with_runner`], but threads the
+/// bounded-retry [`RetryReport`] out through `report`.
+async fn run_agentic_global_rules_check_with_runner_reporting(
+    ctx: &GlobalRulesCheckCtx,
+    workspace_root: &Path,
+    change_slug: &str,
+    runner: &dyn CorpusCheckSessionRunner,
+    report: &mut RetryReport,
+) -> GlobalRulesCheckOutcome {
     let prompt =
         build_global_rules_prompt(&ctx.prompt_template, workspace_root, change_slug, &ctx.corpus_dir);
-    let session =
-        run_corpus_check_with_runner(VerifierGate::Rules, change_slug, ctx.retries, &prompt, runner)
-            .await;
+    let session = run_corpus_check_with_runner_reporting(
+        VerifierGate::Rules,
+        change_slug,
+        ctx.retries,
+        &prompt,
+        runner,
+        report,
+    )
+    .await;
     map_rules_session(session, change_slug)
 }
 

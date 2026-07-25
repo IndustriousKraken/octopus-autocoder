@@ -788,15 +788,36 @@ pub(crate) async fn run_spec_verification_gate_recording(
     };
     let changed_files = git::diff_files_changed(workspace, &repo.base_branch, &repo.agent_branch)
         .unwrap_or_default();
-    match crate::code_implements_spec::run_code_implements_spec_check(
+    // Bounded-retry billing visibility (gate-retry-billing-visibility): surface
+    // the attempts consumed and post ONE notification per invocation if a
+    // re-attempt was billed. Disposition is derived from the verdict.
+    let mut retry = crate::verifier_gate::RetryReport::default();
+    let outcome = crate::code_implements_spec::run_code_implements_spec_check_reporting(
         &ctx,
         workspace,
         processed,
         &diff,
         &changed_files,
+        &mut retry,
     )
-    .await
-    {
+    .await;
+    let disposition = match &outcome {
+        crate::code_implements_spec::SpecVerificationOutcome::Verified(v) if v.has_gaps() => {
+            "findings"
+        }
+        crate::code_implements_spec::SpecVerificationOutcome::Verified(_) => "clean",
+        crate::code_implements_spec::SpecVerificationOutcome::FailedToRun { .. } => "held",
+    };
+    announce_gate_retry(
+        chatops_ctx,
+        crate::verifier_gate::VerifierGate::Out,
+        &processed.join(", "),
+        &retry,
+        disposition,
+        model.as_deref(),
+    )
+    .await;
+    match outcome {
         crate::code_implements_spec::SpecVerificationOutcome::Verified(verification) => {
             // Post the advisory chatops heads-up ONLY when gaps are found.
             if verification.has_gaps() {

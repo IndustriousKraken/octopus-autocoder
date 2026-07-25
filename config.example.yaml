@@ -483,6 +483,14 @@ executor:
   # (one attempt). Only the no-submission case retries — a successful
   # submission, a timeout, AND an unregistered-strategy / CLI-unavailable error
   # are NOT retried; after the bound is exhausted the gate still fails closed.
+  # BILLING: every re-attempt is a fresh, fully billed agentic session, so a
+  # higher value multiplies worst-case gate spend on a habitually flaky model.
+  # When an invocation consumes at least one re-attempt, autocoder posts ONE
+  # chatops notification per gate invocation (never one per attempt, not
+  # throttled) naming the gate, change, attempts used vs. allowed, the final
+  # disposition, and the model — so rising spend is attributable to the model
+  # and you can switch. `verify` / standalone runs emit the same fields as a
+  # WARN log instead. Set `0` to bill exactly one attempt per gate.
   # verifier_gate_retries: 2
   #
   # Bounded retry of the `@<bot> send it` spec-revision session's thread-

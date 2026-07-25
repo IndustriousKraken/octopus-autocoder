@@ -450,11 +450,15 @@ async fn evaluate_gates(
 ) -> VerifyReport {
     let mut results = Vec::new();
     for &gate in selected {
+        // Daemon-absent (gate-retry-billing-visibility task 2.2): when an
+        // invocation consumed a re-attempt, emit the same fields as a WARN log
+        // line (via `announce_gate_retry(None, ...)`) instead of a chatops post.
+        let mut retry = crate::verifier_gate::RetryReport::default();
         let result = match gate {
             VerifierGate::In => match &ctxs.in_ctx {
                 Some(ctx) => map_in(
-                    crate::preflight::change_contradiction::run_agentic_contradiction_check(
-                        ctx, workspace, change_slug,
+                    crate::preflight::change_contradiction::run_agentic_contradiction_check_reporting(
+                        ctx, workspace, change_slug, &mut retry,
                     )
                     .await,
                 ),
@@ -464,8 +468,8 @@ async fn evaluate_gates(
             },
             VerifierGate::Canon => match &ctxs.canon_ctx {
                 Some(ctx) => map_canon(
-                    crate::preflight::canon_contradiction::run_agentic_canon_contradiction_check(
-                        ctx, workspace, change_slug,
+                    crate::preflight::canon_contradiction::run_agentic_canon_contradiction_check_reporting(
+                        ctx, workspace, change_slug, &mut retry,
                     )
                     .await,
                 ),
@@ -475,8 +479,8 @@ async fn evaluate_gates(
             },
             VerifierGate::Rules => match &ctxs.rules_ctx {
                 Some(ctx) => map_rules(
-                    crate::preflight::global_rules::run_agentic_global_rules_check(
-                        ctx, workspace, change_slug,
+                    crate::preflight::global_rules::run_agentic_global_rules_check_reporting(
+                        ctx, workspace, change_slug, &mut retry,
                     )
                     .await,
                 ),
@@ -491,11 +495,35 @@ async fn evaluate_gates(
                 "the [out] gate is post-executor and not a verify gate".to_string(),
             ),
         };
+        // No chatops in the `verify` CLI: pass `None` so a consumed re-attempt
+        // logs a WARN carrying gate id, slug, attempts used vs. allowed, and the
+        // disposition. A no-retry (or an unconfigured `CouldNotRun`) is a no-op.
+        crate::polling_loop::announce_gate_retry(
+            None,
+            gate,
+            change_slug,
+            &retry,
+            gate_result_disposition(&result),
+            None,
+        )
+        .await;
         results.push((gate, result));
     }
     VerifyReport {
         results,
         empty_selection: false,
+    }
+}
+
+/// The final-disposition word (`clean` / `findings` / `held`) for a gate's
+/// `verify` result, used in the daemon-absent retry-billing WARN line
+/// (gate-retry-billing-visibility). A gate that could not run is `held` — the
+/// fail-closed disposition.
+fn gate_result_disposition(result: &GateResult) -> &'static str {
+    match result {
+        GateResult::Clean => "clean",
+        GateResult::Found(_) => "findings",
+        GateResult::CouldNotRun(_) => "held",
     }
 }
 

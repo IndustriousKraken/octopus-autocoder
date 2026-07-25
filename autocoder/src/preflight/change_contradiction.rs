@@ -27,7 +27,7 @@
 //! the executor runs only when every blocking gate is `PASS`/`DISABLED`.
 
 use crate::agentic_run::ResolvedModel;
-use crate::verifier_gate::VerifierGate;
+use crate::verifier_gate::{RetryReport, VerifierGate};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -489,6 +489,20 @@ pub async fn run_agentic_contradiction_check(
     workspace_root: &Path,
     change_slug: &str,
 ) -> ContradictionCheckOutcome {
+    let mut report = RetryReport::default();
+    run_agentic_contradiction_check_reporting(ctx, workspace_root, change_slug, &mut report).await
+}
+
+/// As [`run_agentic_contradiction_check`], but ALSO surfaces the bounded-retry
+/// [`RetryReport`] (attempts used vs. allowed) into `report` so a daemon call
+/// site can post the operator-visible retry-billing notification
+/// (gate-retry-billing-visibility). The gate's disposition is unchanged.
+pub async fn run_agentic_contradiction_check_reporting(
+    ctx: &ContradictionCheckCtx,
+    workspace_root: &Path,
+    change_slug: &str,
+    report: &mut RetryReport,
+) -> ContradictionCheckOutcome {
     // Test seam: an injected submission stands in for the CLI + control
     // socket so the orchestration is exercised without spawning a process.
     #[cfg(test)]
@@ -496,11 +510,12 @@ pub async fn run_agentic_contradiction_check(
         let runner = CannedContradictionRunner {
             submission: injected.clone(),
         };
-        return run_agentic_contradiction_check_with_runner(
+        return run_agentic_contradiction_check_with_runner_reporting(
             ctx,
             workspace_root,
             change_slug,
             &runner,
+            report,
         )
         .await;
     }
@@ -530,7 +545,14 @@ pub async fn run_agentic_contradiction_check(
         paths: ctx.paths.clone(),
         change_slug,
     };
-    run_agentic_contradiction_check_with_runner(ctx, workspace_root, change_slug, &runner).await
+    run_agentic_contradiction_check_with_runner_reporting(
+        ctx,
+        workspace_root,
+        change_slug,
+        &runner,
+        report,
+    )
+    .await
 }
 
 /// Orchestration shared by production AND tests. Builds the prompt, runs one
@@ -542,6 +564,28 @@ async fn run_agentic_contradiction_check_with_runner(
     workspace_root: &Path,
     change_slug: &str,
     runner: &dyn ContradictionSessionRunner,
+) -> ContradictionCheckOutcome {
+    let mut report = RetryReport::default();
+    run_agentic_contradiction_check_with_runner_reporting(
+        ctx,
+        workspace_root,
+        change_slug,
+        runner,
+        &mut report,
+    )
+    .await
+}
+
+/// As [`run_agentic_contradiction_check_with_runner`], but threads the
+/// bounded-retry [`RetryReport`] out through `report`. The real orchestration
+/// body lives here; the non-reporting wrapper above is retained so existing
+/// callers/tests need not thread a report.
+async fn run_agentic_contradiction_check_with_runner_reporting(
+    ctx: &ContradictionCheckCtx,
+    workspace_root: &Path,
+    change_slug: &str,
+    runner: &dyn ContradictionSessionRunner,
+    report: &mut RetryReport,
 ) -> ContradictionCheckOutcome {
     let prompt = build_contradiction_prompt(&ctx.prompt_template, workspace_root, change_slug);
     // a61: every diagnostic this gate emits carries the `[in]` verifier-gate
@@ -557,6 +601,7 @@ async fn run_agentic_contradiction_check_with_runner(
         VerifierGate::In,
         change_slug,
         ctx.retries,
+        report,
         || runner.run_session(&prompt),
     )
     .await;
