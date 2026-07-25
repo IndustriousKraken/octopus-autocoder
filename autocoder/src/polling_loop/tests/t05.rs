@@ -1177,6 +1177,83 @@ async fn issue_only_push_hold_resume_skips_executor() {
     assert_eq!(crate::git::rev_parse(&ws, "agent-q").unwrap(), tip);
 }
 
+/// Revision: when a resume of a `failed_step: pr_creation` hold has its (no-op)
+/// push retry itself fail, the retained marker records `failed_step: push` — the
+/// diagnostic must match the current failing step and the BranchPushFailure alert
+/// that fired, not the stale `pr_creation` value carried over via `..marker`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr_creation_hold_push_retry_failure_rewrites_failed_step_to_push() {
+    use crate::executor::ResumeHandle;
+    use async_trait::async_trait;
+    struct PanicOnRun;
+    #[async_trait]
+    impl Executor for PanicOnRun {
+        async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+            panic!("executor must not run while a push-block hold is active");
+        }
+        async fn resume(&self, _h: ResumeHandle, _a: &str) -> Result<ExecutorOutcome> {
+            unreachable!()
+        }
+    }
+    fn git(ws: &Path, args: &[&str]) {
+        let st = std::process::Command::new("git")
+            .args(args)
+            .current_dir(ws)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?} failed");
+    }
+
+    let (_dir, ws) = fixture_workspace_with_broken_remote("prcreation-hold-push-retry-fail");
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+
+    // Seed an agent-q commit and plant a matching PR-creation hold. The broken
+    // remote makes the resume's push retry fail before PR creation is reached.
+    git(&ws, &["checkout", "-q", "-b", "agent-q"]);
+    std::fs::write(ws.join("pr-hold-work.txt"), "x\n").unwrap();
+    git(&ws, &["add", "-A"]);
+    git(&ws, &["commit", "-q", "-m", "needs-pr: work"]);
+    let tip = crate::git::rev_parse(&ws, "agent-q").unwrap();
+
+    crate::push_block::write(
+        &paths,
+        &ws,
+        &crate::push_block::PushBlock {
+            tip_commit: tip.clone(),
+            change_slugs: vec!["needs-pr".into()],
+            issue_slugs: vec![],
+            reason: "prior PR creation failed".into(),
+            blocked_at: chrono::Utc::now(),
+            failed_step: crate::push_block::FailedStep::PrCreation,
+            review_report: None,
+            spec_verification_section: None,
+            gate_verdicts_section: None,
+        },
+    )
+    .unwrap();
+
+    let res = execute_one_pass(
+        &paths, &ws, &fixture_repo(&ws), &PanicOnRun, &open_pr_gate_ok_github(), None, None,
+        2400u64, u32::MAX, u32::MAX, 0, Some(10),
+        &crate::audits::AuditRegistry::default(), None,
+        &std::collections::HashMap::new(), &std::sync::Mutex::new(Vec::new()),
+        &mut 0u32,
+    )
+    .await;
+    assert!(res.is_err(), "the broken-remote push retry must fail");
+
+    let marker = crate::push_block::read(&paths, &ws)
+        .expect("the hold is retained while the push keeps failing");
+    assert_eq!(
+        marker.failed_step,
+        crate::push_block::FailedStep::Push,
+        "the failed push retry must rewrite failed_step to Push (not keep the stale PrCreation)"
+    );
+    // Carried slug and tip are preserved: resume never recreated the branch.
+    assert!(marker.change_slugs.iter().any(|s| s == "needs-pr"));
+    assert_eq!(crate::git::rev_parse(&ws, "agent-q").unwrap(), tip);
+}
+
 /// hold-covers-pr-creation-failure 4.4: stale-marker handling (tip mismatch) is
 /// unchanged for a `failed_step: pr_creation` hold — the stale marker is removed
 /// and the pass proceeds normally (recreate + executor).

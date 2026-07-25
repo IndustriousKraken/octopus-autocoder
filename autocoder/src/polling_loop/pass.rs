@@ -349,8 +349,12 @@ async fn resume_push_block(
     if let Err(e) = git::push_force_with_lease(workspace, &repo.agent_branch, push_remote) {
         // Still blocked. Refresh the marker's reason and re-alert (the work stays
         // preserved on the branch; the next pass retries the cheap push again).
+        // The push is the step that just failed, so record it: a PrCreation hold
+        // whose no-op push retry fails here must not keep its stale
+        // `failed_step: PrCreation` diagnostic while a BranchPushFailure alert fires.
         let updated = crate::push_block::PushBlock {
             reason: format!("{e:#}"),
+            failed_step: crate::push_block::FailedStep::Push,
             ..marker
         };
         let _ = crate::push_block::write(paths, workspace, &updated);
