@@ -98,7 +98,19 @@ pub fn read_record(
 ) -> Option<GatePassRecord> {
     let path = paths.gate_pass_path(workspace_basename, change);
     let raw = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&raw).ok()
+    match serde_json::from_str(&raw) {
+        Ok(record) => Some(record),
+        Err(e) => {
+            // Present but unparseable: log so an operator can diagnose why this
+            // sequence re-gated (we still return None → the caller re-gates).
+            tracing::warn!(
+                change = %change,
+                path = %path.display(),
+                "gate-pass: record present but unparseable; treating as no usable record (re-gating): {e:#}"
+            );
+            None
+        }
+    }
 }
 
 /// True IFF a record exists for `(workspace_basename, change)` AND the hash
