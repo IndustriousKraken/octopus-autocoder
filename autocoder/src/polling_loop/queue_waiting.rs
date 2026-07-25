@@ -374,11 +374,18 @@ fn resume_completed(
                 Some("agent reported Completed without modifying the workspace (resume)".into()),
             )
         } else {
+            // Compute the subject BEFORE the archive rename (it reads the
+            // change's proposal.md at the active path), then archive, then
+            // add_all + commit — matching the pending path in outcome.rs so
+            // the single completion commit captures both the implementation
+            // diff AND the archive move. Archive failure short-circuits via
+            // `?` before any staging or commit, so no partial completion
+            // commit is recorded and the change stays at its active path.
             let subject = build_commit_subject(workspace, change)?;
-            git::add_all(workspace)?;
-            git::commit(workspace, &subject)?;
             let spec_root = crate::spec_root::SpecRoot::for_repo(repo, workspace);
             queue::archive_at(&spec_root, change)?;
+            git::add_all(workspace)?;
+            git::commit(workspace, &subject)?;
             (ResumeDisposition::Archived, None)
         }
     };

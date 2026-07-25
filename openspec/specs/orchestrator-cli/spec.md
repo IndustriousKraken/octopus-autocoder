@@ -14,7 +14,7 @@ The orchestrator SHALL provide a `run` subcommand that loads a YAML configuratio
 #### Scenario: Resuming a change after an answer arrives
 - **WHEN** the orchestrator processes a waiting change AND `chatops_manager.poll_thread_for_human_reply` returns `Some(reply)`
 - **THEN** the orchestrator (in this exact order) writes `.answer.json` containing the reply, reads `resume_handle` from `.question.json`, deletes `.question.json`, calls `executor.resume(resume_handle, &reply.text)`, and on any returned outcome deletes `.answer.json`
-- **AND** the resumed call's outcome is handled identically to a fresh `executor.run` outcome: `Completed` ⇒ commit (if diff exists) and archive; `AskUser` ⇒ post a new question and write a fresh `.question.json` (after deleting `.answer.json`); `Failed` ⇒ log the reason naming the change
+- **AND** the resumed call's outcome is handled identically to a fresh `executor.run` outcome: `Completed` ⇒ archive then commit when a diff exists (the archive step runs first and ONE completion commit captures the implementation diff and the archive move, per the queue-engine "Archive on completion" ordering); `AskUser` ⇒ post a new question and write a fresh `.question.json` (after deleting `.answer.json`); `Failed` ⇒ log the reason naming the change
 
 #### Scenario: Initial AskUser handling during pending iteration
 - **WHEN** `executor.run` returns `Ok(ExecutorOutcome::AskUser { question, resume_handle })` during a pending-change iteration
@@ -2685,14 +2685,16 @@ The `autocoder install` wizard SHALL prompt operators about periodic audits duri
   switch (so IaC logs distinguish "operator opted-out
 
 ### Requirement: autocoder invokes openspec archive for the archive step
-autocoder SHALL perform per-change archive operations by invoking `openspec archive <change> -y` as a subprocess in the workspace directory, rather than doing its own filesystem move. The `-y` flag suppresses confirmation prompts so the subprocess runs cleanly in the non-interactive polling-loop context. On exit code 0, autocoder treats the change as successfully archived (the change directory has moved to `openspec/changes/archive/<UTC-date>-<slug>/` AND the canonical specs at `openspec/specs/<capability>/spec.md` have been merged with the change's `## ADDED`/`## MODIFIED`/`## REMOVED`/`## RENAMED` deltas). On any non-zero exit, autocoder treats the iteration as Failed for that change, with the openspec stderr as the failure reason; the change stays at the active path for the operator to investigate.
+autocoder SHALL perform per-change archive operations by invoking `openspec archive <change> -y` as a subprocess in the workspace directory, rather than doing its own filesystem move. The `-y` flag suppresses confirmation prompts so the subprocess runs cleanly in the non-interactive polling-loop context. On exit code 0, autocoder treats the change as successfully archived (the change directory has moved to `openspec/changes/archive/<UTC-date>-<slug>/` AND — when the host's openspec profile has the `sync` workflow enabled — the canonical specs at `openspec/specs/<capability>/spec.md` have been merged with the change's `## ADDED`/`## MODIFIED`/`## REMOVED`/`## RENAMED` deltas; without `sync`, exit 0 covers the file move only and drift accumulates per the caveat below). On any non-zero exit, autocoder treats the iteration as Failed for that change, with the openspec stderr as the failure reason; the change stays at the active path for the operator to investigate.
 
 The merge step requires the openspec host profile to have the `sync` workflow enabled (one-time `openspec config profile`). Without `sync`, `openspec archive` will move the change directory but the canonical-spec merge will not run. autocoder iterations on such a host succeed at the file-move level; drift accumulates until either the operator enables `sync` and re-runs the backfill subcommand, OR (when OpenSpec re-bundles `sync` by default in a future release) the host's openspec installation acquires the workflow automatically.
 
 #### Scenario: Successful archive merges canonical specs
-- **WHEN** autocoder finishes implementing change `<slug>`,
-  commits the working tree, and invokes
-  `openspec archive <slug> -y`
+- **WHEN** autocoder finishes implementing change `<slug>` and
+  invokes `openspec archive <slug> -y` BEFORE recording the
+  completion commit (the archive subprocess's output is then
+  staged with the implementation diff and captured by that one
+  commit, per the queue-engine "Archive on completion" ordering)
 - **AND** the host's openspec profile has `sync` enabled
 - **THEN** the subprocess exits 0
 - **AND** the change directory has moved from
