@@ -991,6 +991,26 @@ pub async fn post_validation_exhausted_notification(
     }
 }
 
+/// Render the shared re-attempt-backoff clause appended to audit-failure
+/// alerts: the consecutive-failure count AND, when an automatic
+/// re-attempt is scheduled, the time it becomes eligible. `next_eligible`
+/// is `None` for an audit with no automatic cadence (disabled —
+/// on-demand only); then only the count is named. Used by the
+/// did-not-complete notification AND the write-policy-violation alert so
+/// both surfaces read consistently.
+pub fn format_backoff_clause(
+    consecutive_failures: u32,
+    next_eligible: Option<chrono::DateTime<Utc>>,
+) -> String {
+    match next_eligible {
+        Some(t) => format!(
+            "failure {consecutive_failures} in a row; next automatic re-attempt after {}",
+            t.to_rfc3339()
+        ),
+        None => format!("failure {consecutive_failures} in a row"),
+    }
+}
+
 /// Post the `🚫` did-not-complete notification: the audit could not reach an
 /// evidenced terminal verdict, so it fails closed rather than reporting a
 /// passing / no-findings result (the `gatekeepers-fail-closed` standard). The
@@ -1003,10 +1023,13 @@ pub async fn post_did_not_complete_notification(
     audit_type: &str,
     cause: AuditFailureCause,
     examined_summary: Option<&str>,
+    consecutive_failures: u32,
+    next_eligible: Option<chrono::DateTime<Utc>>,
 ) -> Result<()> {
     let top_line = format!(
-        "🚫 {audit_type} did NOT complete for {repo_url} — {cause}. Treated as failed-to-run (NOT \"no findings\"); cadence unchanged, the audit re-runs next cadence.",
+        "🚫 {audit_type} did NOT complete for {repo_url} — {cause}. Treated as failed-to-run (NOT \"no findings\"); cadence unchanged ({backoff}).",
         cause = cause.as_str(),
+        backoff = format_backoff_clause(consecutive_failures, next_eligible),
     );
     match examined_summary {
         Some(s) if !s.trim().is_empty() => {

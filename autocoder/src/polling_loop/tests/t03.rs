@@ -527,3 +527,308 @@ async fn execute_one_pass_resumed_change_counts_toward_cap() {
         "deferred change still pending: {still_pending:?}"
     );
 }
+
+/// archive-rides-completion-commit (task 2.1): a waiting change that
+/// resumes to Completed-with-diff records exactly ONE new commit whose
+/// tree carries the dated archive entry and NOT the change's active
+/// directory, and the working tree is clean afterwards. This locks in the
+/// archive-before-commit ordering on the resume path (matching the pending
+/// path), so no committed tree on the agent branch ever shows the
+/// completed change still active under `openspec/changes/`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_completion_commit_captures_archive_move() {
+    let (_dir, ws) = fixture_workspace_with_remote();
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+    add_committed_change(&ws, "resume-target", "resume then archive");
+
+    // Pre-populate .question.json so the change is enumerated as waiting.
+    let q = QuestionPayload {
+        thread_ts: "5555.5555".into(),
+        channel: "C_TEST".into(),
+        resume_handle: serde_json::json!({"change": "resume-target", "workspace": ws}),
+        asked_at: chrono::Utc::now(),
+    };
+    chatops::write_question_file(&ws, "resume-target", &q).unwrap();
+    let git_ok = |args: &[&str]| {
+        let st = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&ws)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?} failed");
+    };
+    git_ok(&["add", "-A"]);
+    git_ok(&["commit", "-q", "-m", "persist marker"]);
+
+    let pre_main = crate::git::rev_parse(&ws, "main").unwrap();
+
+    let mut server = mockito::Server::new_async().await;
+    let chatops = fixture_chatops_for(&mut server).await;
+    let _ = server
+        .mock("GET", "/conversations.replies?channel=C_TEST&ts=5555.5555")
+        .with_status(200)
+        .with_body(
+            r#"{"ok":true,"messages":[
+                {"user":"U_BOT","text":"❓ ...","ts":"5555.5555"},
+                {"user":"U_HUMAN","text":"go ahead","ts":"5555.0001"}
+            ]}"#,
+        )
+        .create_async()
+        .await;
+
+    // Resume writes a real artifact (so the tree carries executor output),
+    // then returns Completed-with-diff.
+    struct ResumeWritesArtifact {
+        ws: std::path::PathBuf,
+    }
+    #[async_trait::async_trait]
+    impl Executor for ResumeWritesArtifact {
+        async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+            unreachable!("run must not be called; the change resumes")
+        }
+        async fn resume(&self, _h: ResumeHandle, _a: &str) -> Result<ExecutorOutcome> {
+            std::fs::write(self.ws.join("RESUMED_ARTIFACT.txt"), "resume output")?;
+            Ok(ExecutorOutcome::Completed { final_answer: None })
+        }
+    }
+    let executor = ResumeWritesArtifact { ws: ws.clone() };
+    let chatops_ctx = ChatOpsContext {
+        chatops: chatops.clone(),
+        channel: "C_TEST".to_string(),
+        start_work_enabled: true,
+        failure_alerts_enabled: true,
+        pr_opened_enabled: true,
+    };
+    let test_github = GithubConfig {
+        token_env: "X".into(),
+        token: None,
+        owner_tokens: None,
+        fork_owner: None,
+        recreate_fork_on_reinit: false,
+        command_authorization: Default::default(),
+    };
+    let (processed, _, _) = run_pass_through_commits(
+        &paths,
+        &ws,
+        &fixture_repo(&ws),
+        &test_github,
+        &executor,
+        Some(&chatops_ctx),
+        u32::MAX,
+        u32::MAX,
+        &crate::audits::AuditRegistry::default(),
+        None,
+        &std::collections::HashMap::new(),
+        &std::sync::Mutex::new(Vec::new()),
+    )
+    .await
+    .expect("pass succeeds");
+
+    assert_eq!(
+        processed,
+        vec!["resume-target".to_string()],
+        "the resumed change must archive"
+    );
+
+    let git_out = |args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    // Exactly one new commit on agent-q relative to main's pre-pass tip.
+    let count: usize = git_out(&["rev-list", "--count", "main..agent-q"])
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(count, 1, "resume completion must record exactly one commit");
+    // (belt-and-suspenders: the pass did not touch main)
+    assert_eq!(crate::git::rev_parse(&ws, "main").unwrap(), pre_main);
+
+    // The single commit's tree carries the dated archive entry...
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let tree = git_out(&["ls-tree", "-r", "--name-only", "agent-q"]);
+    let archived_prefix = format!("openspec/changes/archive/{today}-resume-target/");
+    assert!(
+        tree.lines().any(|p| p.starts_with(&archived_prefix)),
+        "committed tree must contain the dated archive entry; tree=\n{tree}"
+    );
+    // ...and does NOT carry the active change directory.
+    assert!(
+        !tree
+            .lines()
+            .any(|p| p.starts_with("openspec/changes/resume-target/")),
+        "committed tree must NOT contain the active change dir; tree=\n{tree}"
+    );
+
+    // The working tree is clean afterwards — no dangling archive rename.
+    let porcelain = git_out(&["status", "--porcelain"]);
+    assert!(
+        porcelain.trim().is_empty(),
+        "working tree must be clean after resume completion; got:\n{porcelain}"
+    );
+}
+
+/// archive-rides-completion-commit (task 2.2): when the archive step fails
+/// on the resume completion path, NO completion commit is recorded and the
+/// change stays at its active path. The failure short-circuits (via `?`)
+/// before any staging or commit — matching the pending path's semantics.
+///
+/// The failure is driven by a real `openspec archive` abort: the change's
+/// spec delta MODIFIES a requirement that has no canonical spec, which
+/// openspec refuses to apply (`Aborted. No files were changed.`), and
+/// `queue::archive_at`'s post-condition helper surfaces as an `Err`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_archive_failure_records_no_commit() {
+    let (_dir, ws) = fixture_workspace_with_remote();
+    let (_td_paths, paths) = crate::testing::test_daemon_paths();
+
+    // A waiting change whose MODIFIED delta targets a nonexistent
+    // canonical spec — `openspec archive` aborts on it.
+    let dir = ws.join("openspec/changes/bad-archive");
+    std::fs::create_dir_all(dir.join("specs/somecap")).unwrap();
+    std::fs::write(
+        dir.join("proposal.md"),
+        "## Why\nresume archive-failure fixture, padded so it clears the length warning cleanly.\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("tasks.md"), "- [x] 1.1 done\n").unwrap();
+    std::fs::write(
+        dir.join("specs/somecap/spec.md"),
+        "## MODIFIED Requirements\n\n### Requirement: Nonexistent thing\nThe system SHALL do a thing never canonically specified.\n\n#### Scenario: whatever\n- **WHEN** x\n- **THEN** y\n",
+    )
+    .unwrap();
+
+    let q = QuestionPayload {
+        thread_ts: "4444.4444".into(),
+        channel: "C_TEST".into(),
+        resume_handle: serde_json::json!({"change": "bad-archive", "workspace": ws}),
+        asked_at: chrono::Utc::now(),
+    };
+    chatops::write_question_file(&ws, "bad-archive", &q).unwrap();
+    let git_ok = |args: &[&str]| {
+        let st = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&ws)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?} failed");
+    };
+    git_ok(&["add", "-A"]);
+    git_ok(&["commit", "-q", "-m", "persist bad-archive"]);
+
+    let pre_main = crate::git::rev_parse(&ws, "main").unwrap();
+
+    let mut server = mockito::Server::new_async().await;
+    let chatops = fixture_chatops_for(&mut server).await;
+    let _ = server
+        .mock("GET", "/conversations.replies?channel=C_TEST&ts=4444.4444")
+        .with_status(200)
+        .with_body(
+            r#"{"ok":true,"messages":[
+                {"user":"U_BOT","text":"❓ ...","ts":"4444.4444"},
+                {"user":"U_HUMAN","text":"go ahead","ts":"4444.0001"}
+            ]}"#,
+        )
+        .create_async()
+        .await;
+
+    // Resume writes an artifact (so the completion branch — not the
+    // no-diff branch — runs), then returns Completed. The archive step
+    // then aborts. `run` returns Failed for the post-resume pending
+    // re-pickup so that phase makes no commit either.
+    struct ResumeThenBadArchive {
+        ws: std::path::PathBuf,
+    }
+    #[async_trait::async_trait]
+    impl Executor for ResumeThenBadArchive {
+        async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+            Ok(ExecutorOutcome::Failed {
+                reason: "not implementing after a failed-archive resume".into(),
+            })
+        }
+        async fn resume(&self, _h: ResumeHandle, _a: &str) -> Result<ExecutorOutcome> {
+            std::fs::write(self.ws.join("RESUMED_ARTIFACT.txt"), "resume output")?;
+            Ok(ExecutorOutcome::Completed { final_answer: None })
+        }
+    }
+    let executor = ResumeThenBadArchive { ws: ws.clone() };
+    let chatops_ctx = ChatOpsContext {
+        chatops: chatops.clone(),
+        channel: "C_TEST".to_string(),
+        start_work_enabled: true,
+        failure_alerts_enabled: true,
+        pr_opened_enabled: true,
+    };
+    let test_github = GithubConfig {
+        token_env: "X".into(),
+        token: None,
+        owner_tokens: None,
+        fork_owner: None,
+        recreate_fork_on_reinit: false,
+        command_authorization: Default::default(),
+    };
+    let (processed, _, _) = run_pass_through_commits(
+        &paths,
+        &ws,
+        &fixture_repo(&ws),
+        &test_github,
+        &executor,
+        Some(&chatops_ctx),
+        u32::MAX,
+        u32::MAX,
+        &crate::audits::AuditRegistry::default(),
+        None,
+        &std::collections::HashMap::new(),
+        &std::sync::Mutex::new(Vec::new()),
+    )
+    .await
+    .expect("pass succeeds");
+
+    assert!(
+        processed.is_empty(),
+        "a failed-archive resume must archive nothing; got {processed:?}"
+    );
+
+    // No completion commit: agent-q sits at main's pre-pass tip.
+    let git_out = |args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let count: usize = git_out(&["rev-list", "--count", "main..agent-q"])
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(count, 0, "a failed archive must record no completion commit");
+    assert_eq!(crate::git::rev_parse(&ws, "agent-q").unwrap(), pre_main);
+
+    // The change stays at its active path (archive did not move it) and no
+    // dated archive entry was produced.
+    assert!(
+        ws.join("openspec/changes/bad-archive").is_dir(),
+        "the change must stay at its active path after a failed archive"
+    );
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    assert!(
+        !ws.join(format!("openspec/changes/archive/{today}-bad-archive"))
+            .exists(),
+        "a failed archive must not produce a dated archive entry"
+    );
+}
