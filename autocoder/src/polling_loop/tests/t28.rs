@@ -165,3 +165,42 @@ fn outcome_kinds_map_to_persisted_kinds() {
         OutcomeKind::Skipped
     );
 }
+
+/// A no-commit pass with a change waiting on a human answer records a
+/// `skipped` park naming the block — NOT `idle` ("empty queue — nothing to
+/// do"), which would misreport a human-blocked queue as empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn waiting_blocked_iteration_records_skipped_park_not_idle() {
+    let (_dir, ws) = fixture_workspace_with_remote();
+    let (_td, paths) = crate::testing::test_daemon_paths();
+    seed_stale_record(&paths, &ws);
+
+    // A waiting change: enumerated by `list_waiting` via its `.question.json`.
+    // With no chatops context the resume step cannot poll, so the change stays
+    // waiting and blocks the pending walk — zero commits result.
+    let waiting_dir = ws.join("openspec/changes/w1-waiting");
+    std::fs::create_dir_all(&waiting_dir).unwrap();
+    std::fs::write(waiting_dir.join(".question.json"), "{}").unwrap();
+
+    let github = open_pr_gate_ok_github();
+    let _hook = test_hooks::lock();
+    let mut server = mockito::Server::new_async().await;
+    let _gate = mock_open_pr_gate_empty(&mut server).await;
+    test_hooks::set_github_api_base(Some(server.url()));
+    drive_one_iteration(&paths, &ws, &CompletingExecutorNoDiff, &github).await;
+    test_hooks::set_github_api_base(None);
+
+    let rec = crate::iteration_record::read(&paths, &ws).expect("record written");
+    assert_eq!(
+        rec.outcome_kind,
+        OutcomeKind::Skipped,
+        "waiting block is a park, not idle: {}",
+        rec.outcome_summary
+    );
+    assert!(
+        rec.outcome_summary.contains("queue blocked")
+            && rec.outcome_summary.contains("w1-waiting"),
+        "park names the block: {}",
+        rec.outcome_summary
+    );
+}

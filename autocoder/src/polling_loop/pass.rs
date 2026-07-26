@@ -650,6 +650,20 @@ fn should_stop_after_commit_check(
             );
         }
         let _ = AlertState::clear(paths, workspace);
+        // A no-commit pass with changes waiting on a human answer is NOT an
+        // empty queue — name the park so the iteration record (and the status
+        // reply built from it) reports the block instead of "nothing to do"
+        // (durable-iteration-record: "queue blocked on a waiting change").
+        let waiting = queue::list_waiting(workspace).unwrap_or_default();
+        if !waiting.is_empty() {
+            return Ok(Some(IterationOutcome::Skipped {
+                park: format!(
+                    "queue blocked on {} waiting change(s): {}",
+                    waiting.len(),
+                    waiting.join(", ")
+                ),
+            }));
+        }
         return Ok(Some(IterationOutcome::Idle));
     }
     if spec_storage_dirty {

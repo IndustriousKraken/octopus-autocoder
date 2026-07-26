@@ -2029,7 +2029,13 @@ pub fn format_status_reply(resp: &RepoStatusResponse) -> String {
                     human_age_since(li.finished_at)
                 ));
                 if !li.outcome_summary.is_empty() {
-                    out.push_str(&format!("  outcome: {}\n", li.outcome_summary));
+                    // The summary carries user-influenced strings (change/issue
+                    // slugs, pass error text) — Slack-escape like every other
+                    // user-controlled field in this reply.
+                    out.push_str(&format!(
+                        "  outcome: {}\n",
+                        slack_escape(&li.outcome_summary)
+                    ));
                 }
                 if let Some(next) = li.next_iteration_estimate {
                     let delta = next - Utc::now();
@@ -7077,6 +7083,31 @@ mod tests {
         assert!(out.contains("finished: 2m ago"), "{out}");
         assert!(out.contains("outcome: archived a05-foo"), "{out}");
         assert!(out.contains("next iteration: in ~"), "{out}");
+    }
+
+    /// The `outcome:` line Slack-escapes the record's summary — it carries
+    /// user-influenced strings (change/issue slugs, pass error text) like
+    /// every other user-controlled field in this reply.
+    #[test]
+    fn format_status_outcome_line_is_slack_escaped() {
+        let resp = RepoStatusResponse {
+            url: "git@github.com:owner/repo.git".into(),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            last_iteration: Some(LastIteration {
+                finished_at: Utc::now() - chrono::Duration::minutes(2),
+                outcome_summary: "archived <!channel>-sneaky".into(),
+                next_iteration_estimate: None,
+                poll_interval_sec: 60,
+            }),
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(
+            out.contains("outcome: archived &lt;!channel&gt;-sneaky"),
+            "summary is escaped: {out}"
+        );
+        assert!(!out.contains("<!channel>"), "raw mention must not survive: {out}");
     }
 
     // ---- Issues-lane status section
