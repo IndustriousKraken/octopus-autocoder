@@ -93,6 +93,7 @@ paths inline.
 | `<state>/audit-state/`      | Per-audit-type cadence + last-run state, one `<audit-type>.json` per registered audit.             |
 | `<state>/alert-state/`      | Per-workspace alert-throttle state, one `<workspace-basename>.json` per managed repository. Holds the daemon-wide `.migration-from-workspace-done` marker for the `a16` migration. |
 | `<state>/failure-state/`    | Per-(repo, change) failure counters that drive perma-stuck detection.                              |
+| `<state>/iteration-record/` | Per-workspace latest-iteration record, one `<workspace-basename>.json` per repo. Overwritten at the end of every polling iteration; the sole source for the status reply's `last iteration:` block. |
 | `<state>/revisions/`        | Per-PR reviewer-revision state.                                                                    |
 | `<state>/audit-threads/`    | Per-`thread_ts` state files for the `audit-reply-acts` (send-it) flow.                             |
 | `<state>/proposal-requests/`| Per-`request_id` state files for the chat-request-triage (propose) flow.                           |

@@ -2339,6 +2339,79 @@ github:
         cancel.cancel();
     }
 
+    /// durable-iteration-record: `last_iteration` is sourced EXCLUSIVELY from the
+    /// iteration record, NOT failure-state residue. An old failure-state entry
+    /// alongside a fresh record → the block reflects the record; the old failure
+    /// appears nowhere in it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repo_status_last_iteration_sourced_from_record_not_failure_state() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a08-ready");
+        let (_dir, socket, state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+
+        // A weeks-old failure-state entry — the residue the deleted shim used to
+        // surface as a fake "last iteration".
+        crate::failure_state::record_failure(
+            &state.paths,
+            &workspace,
+            "long-dead-change",
+            "WEEKS_OLD_FAILURE_RESIDUE",
+        )
+        .unwrap();
+        // A fresh iteration record: idle, finished 2 minutes ago.
+        let rec = crate::iteration_record::record_for(
+            &Ok(crate::iteration_record::IterationOutcome::Idle),
+            chrono::Utc::now() - chrono::Duration::minutes(2),
+            1,
+        );
+        crate::iteration_record::write(&state.paths, &workspace, &rec).unwrap();
+
+        let req = serde_json::json!({
+            "action": "repo_status",
+            "url": "git@github.com:owner/myrepo.git",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        let li = &resp["status"]["last_iteration"];
+        assert!(!li.is_null(), "last_iteration present from the record: {resp}");
+        assert_eq!(
+            li["outcome_summary"].as_str().unwrap(),
+            "empty queue — nothing to do",
+            "block reflects the idle record's summary, not the failure residue"
+        );
+        assert!(
+            !li.to_string().contains("WEEKS_OLD_FAILURE_RESIDUE"),
+            "failure-state residue must not populate last_iteration: {li}"
+        );
+        cancel.cancel();
+    }
+
+    /// No iteration record → `last_iteration` is null in the payload (the chatops
+    /// formatter renders `no iteration yet` from that null).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repo_status_no_record_leaves_last_iteration_null() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a08-ready");
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "repo_status",
+            "url": "git@github.com:owner/myrepo.git",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert!(
+            resp["status"]["last_iteration"].is_null(),
+            "no record → last_iteration null: {resp}"
+        );
+        cancel.cancel();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn repo_status_all_aggregates_one_round_trip_per_repo() {
         // Two-repo fixture: the daemon should bundle both per-repo

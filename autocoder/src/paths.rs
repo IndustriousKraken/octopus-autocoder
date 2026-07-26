@@ -299,6 +299,22 @@ impl DaemonPaths {
             .join(format!("{change}.json"))
     }
 
+    /// `<state>/iteration-record/` — per-workspace durable iteration record
+    /// (durable-iteration-record). One `<workspace-basename>.json` file per
+    /// workspace, atomically overwritten at the end of every polling iteration.
+    /// Lives under `<state>/` (NOT the workspace) so the bookkeeping never
+    /// appears in the managed repo's working tree, mirroring `alert_state_dir`.
+    pub fn iteration_record_dir(&self) -> PathBuf {
+        self.state.join("iteration-record")
+    }
+
+    /// `<state>/iteration-record/<workspace_basename>.json` — the latest
+    /// iteration record for the named workspace.
+    pub fn iteration_record_path(&self, workspace_basename: &str) -> PathBuf {
+        self.iteration_record_dir()
+            .join(format!("{workspace_basename}.json"))
+    }
+
     /// `<cache>/workspaces/` — per-repo cloned workspaces, keyed by
     /// URL-sanitized basename.
     pub fn workspaces_dir(&self) -> PathBuf {
@@ -1050,6 +1066,14 @@ mod tests {
         assert_eq!(
             p.gate_pass_path("github_com_owner_repo", "a99-change"),
             PathBuf::from("/srv/state/gate-pass/github_com_owner_repo/a99-change.json")
+        );
+        assert_eq!(
+            p.iteration_record_dir(),
+            PathBuf::from("/srv/state/iteration-record")
+        );
+        assert_eq!(
+            p.iteration_record_path("github_com_owner_repo"),
+            PathBuf::from("/srv/state/iteration-record/github_com_owner_repo.json")
         );
         assert_eq!(
             p.workspaces_dir(),

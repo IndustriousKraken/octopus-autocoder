@@ -1,8 +1,14 @@
 use super::*;
+use crate::iteration_record::IterationOutcome;
 
 /// Single-pass workflow: workspace init → stale-lock cleanup → dirty-workspace
 /// check → branch recreation → queue walk → push + PR if commits were
 /// produced.
+///
+/// Returns the [`IterationOutcome`] describing which terminal path the pass took
+/// (success-with-work, idle, skipped, or audit-only) so the iteration driver can
+/// stamp the durable iteration record; an `Err` is mapped to a failed record by
+/// the driver (durable-iteration-record).
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_one_pass(
     paths: &DaemonPaths,
@@ -27,7 +33,7 @@ pub async fn execute_one_pass(
     // each `Unknown`, and the third consecutive failure raises the throttled
     // alert.
     open_pr_gate_failures: &mut u32,
-) -> Result<()> {
+) -> Result<IterationOutcome> {
     // Acquire the per-repo busy marker. Held across the entire pass
     // (executor → review → push → PR); released by Drop on every return.
     // A crash that bypasses Drop leaves the marker for the next pass to
@@ -50,7 +56,14 @@ pub async fn execute_one_pass(
                 recovery_eligible = details.recovery_eligible(),
                 "busy marker present; skipping iteration"
             );
-            return Ok(());
+            return Ok(IterationOutcome::Skipped {
+                park: format!(
+                    "busy marker held by pid {} (stage {}, age {})",
+                    details.marker.pid,
+                    details.marker.stage.as_str(),
+                    busy_marker::format_age_human(details.age_secs)
+                ),
+            });
         }
         Ok(busy_marker::AcquireOutcome::SkipAmbiguous(m)) => {
             tracing::error!(
@@ -60,7 +73,9 @@ pub async fn execute_one_pass(
                 "busy marker is stuck with ambiguous PID state; skipping iteration — investigate manually"
             );
             post_stuck_alert(chatops_ctx, repo, &m, true).await;
-            return Ok(());
+            return Ok(IterationOutcome::Skipped {
+                park: format!("ambiguous busy marker stuck at pid {}", m.pid),
+            });
         }
         Err(e) => {
             tracing::error!(url = %repo.url, "busy marker acquire failed: {e:#}");
@@ -134,7 +149,9 @@ pub async fn execute_one_pass(
     )
     .await
     {
-        return Ok(());
+        return Ok(IterationOutcome::Skipped {
+            park: "open agent-branch PR — skip-iteration gate active".to_string(),
+        });
     }
     let (processed, processed_issues, includes_self_heal) = run_pass_through_commits(
         paths,
@@ -152,8 +169,8 @@ pub async fn execute_one_pass(
     )
     .await?;
 
-    if should_stop_after_commit_check(paths, workspace, repo)? {
-        return Ok(());
+    if let Some(outcome) = should_stop_after_commit_check(paths, workspace, repo)? {
+        return Ok(outcome);
     }
 
     let (review_report, draft, reviewer_revision_concerns) = run_reviewer_step(
@@ -302,7 +319,17 @@ pub async fn execute_one_pass(
     // would have routed through resume_push_block; a stale one was cleared
     // pre-walk.) Idempotent — a no-op when no marker exists.
     let _ = crate::push_block::clear(paths, workspace);
-    Ok(())
+    // Commits shipped this pass. An implementer change / issue unit makes it
+    // success-with-work; commits from the audit phase alone (no processed unit)
+    // make it audit-only (durable-iteration-record).
+    Ok(if processed.is_empty() && processed_issues.is_empty() {
+        IterationOutcome::AuditOnly
+    } else {
+        IterationOutcome::SuccessWithWork {
+            changes: processed.clone(),
+            issues: processed_issues.clone(),
+        }
+    })
 }
 
 /// Resume a preserved push from a prior pass whose branch push failed (the
@@ -323,7 +350,7 @@ async fn resume_push_block(
     chatops_ctx: Option<&ChatOpsContext>,
     guard: &mut busy_marker::BusyGuard,
     marker: crate::push_block::PushBlock,
-) -> Result<()> {
+) -> Result<IterationOutcome> {
     tracing::info!(
         url = %repo.url,
         slugs = ?marker.change_slugs,
@@ -385,6 +412,16 @@ async fn resume_push_block(
         .unwrap_or_default();
     let mut pr_slugs = marker.change_slugs.clone();
     pr_slugs.extend(marker.issue_slugs.iter().cloned());
+    // Park summary for the iteration record: a resumed push-block hold is a
+    // park (durable-iteration-record), naming the preserved slugs it flushed.
+    let park = format!(
+        "resumed push-block hold: {}",
+        if pr_slugs.is_empty() {
+            "preserved work".to_string()
+        } else {
+            pr_slugs.join(", ")
+        }
+    );
     if let Err(e) = open_pull_request(
         paths,
         repo,
@@ -430,7 +467,7 @@ async fn resume_push_block(
             "failed to clear alert-state on resume success: {e:#}"
         );
     }
-    Ok(())
+    Ok(IterationOutcome::Skipped { park })
 }
 
 /// Write a push-block hold that preserves the pass's completed work on the agent
@@ -553,15 +590,16 @@ async fn run_revision_dispatchers(
     }
 }
 
-/// Commit-count + spec-storage termination gate. Returns true when the pass
-/// should stop early (no commits, or iteration-pending markers suppress the
-/// audit-only PR). Clears alert-state on the stop paths. Extracted from
-/// `execute_one_pass` (a68 function-size split).
+/// Commit-count + spec-storage termination gate. Returns `Some(outcome)` when
+/// the pass should stop early — `Idle` when no commits were produced, or a
+/// `Skipped` park when iteration-pending markers suppress the audit-only PR —
+/// and `None` when the pass should proceed to push + PR. Clears alert-state on
+/// the stop paths. Extracted from `execute_one_pass` (a68 function-size split).
 fn should_stop_after_commit_check(
     paths: &DaemonPaths,
     workspace: &Path,
     repo: &RepositoryConfig,
-) -> Result<bool> {
+) -> Result<Option<IterationOutcome>> {
     // a34: "detect working-tree state" prelude per the canonical
     // orchestrator-cli requirement. Before the iteration's commit +
     // push + PR step, classify the iteration's outcome by probing the
@@ -612,7 +650,7 @@ fn should_stop_after_commit_check(
             );
         }
         let _ = AlertState::clear(paths, workspace);
-        return Ok(true);
+        return Ok(Some(IterationOutcome::Idle));
     }
     if spec_storage_dirty {
         tracing::info!(
@@ -646,9 +684,14 @@ fn should_stop_after_commit_check(
             pending_iteration_changes.join(", ")
         );
         let _ = AlertState::clear(paths, workspace);
-        return Ok(true);
+        return Ok(Some(IterationOutcome::Skipped {
+            park: format!(
+                "iteration-pending WIP present ({}); deferring push + PR",
+                pending_iteration_changes.join(", ")
+            ),
+        }));
     }
-    Ok(false)
+    Ok(None)
 }
 
 /// Run the reviewer step (skip-decision, agentic/oneshot review, revision

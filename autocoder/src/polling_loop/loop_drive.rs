@@ -573,6 +573,8 @@ pub(crate) async fn run_iteration_work(
     audit_settings: &HashMap<String, AuditSettings>,
     open_pr_gate_failures: &mut u32,
 ) {
+    // Rebuild is an operator-triggered one-shot with its own result handling;
+    // the durable iteration record covers the normal `execute_one_pass` path.
     if want_rebuild {
         if let Err(error) = execute_rebuild_iteration(
             paths,
@@ -590,7 +592,16 @@ pub(crate) async fn run_iteration_work(
                 snapshot_ref.url
             );
         }
-    } else if let Err(error) = execute_one_pass(
+        return;
+    }
+
+    // durable-iteration-record: time the pass and stamp the per-workspace
+    // iteration record at the SINGLE point its result is handled — every
+    // terminal path (success-with-work, idle, skipped, audit-only, failed)
+    // records exactly once, so the status reply's `last iteration:` block is a
+    // true liveness signal instead of failure-counter residue.
+    let started = std::time::Instant::now();
+    let result = execute_one_pass(
         paths,
         workspace,
         snapshot_ref,
@@ -609,12 +620,22 @@ pub(crate) async fn run_iteration_work(
         queued_audit_types,
         open_pr_gate_failures,
     )
-    .await
-    {
+    .await;
+    if let Err(error) = &result {
         tracing::error!(
             url = snapshot_ref.url.as_str(),
             "polling iteration failed for {}: {error:#}",
             snapshot_ref.url
+        );
+    }
+    let record =
+        crate::iteration_record::record_for(&result, Utc::now(), started.elapsed().as_secs());
+    // Best-effort observability: a write failure logs WARN and does NOT alter
+    // the iteration's outcome or subsequent scheduling.
+    if let Err(e) = crate::iteration_record::write(paths, workspace, &record) {
+        tracing::warn!(
+            url = snapshot_ref.url.as_str(),
+            "iteration-record write failed (iteration outcome unchanged): {e:#}"
         );
     }
 }
