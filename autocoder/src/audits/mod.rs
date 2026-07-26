@@ -558,6 +558,7 @@ pub fn persist_reviewer_session_log(
     workspace: &Path,
     slug: &str,
     outcome: &crate::agentic_run::AgenticRunOutcome,
+    rejections: &[crate::submission_store::RejectedSubmission],
 ) -> Result<PathBuf> {
     let basename = workspace
         .file_name()
@@ -565,7 +566,29 @@ pub fn persist_reviewer_session_log(
         .unwrap_or("workspace");
     let dir = paths.reviewer_logs_dir(basename);
     let name = if slug.trim().is_empty() { "bundled" } else { slug };
-    persist_session_log(&dir, name, outcome)
+    let path = persist_session_log(&dir, name, outcome)?;
+    // review-discard-names-rejection: record each schema-rejected submission
+    // attempt, with its timestamp, so the full sequence is recoverable from
+    // disk even when the surfaced discard reason is truncated. Best-effort —
+    // the log's captured-output content above is already persisted.
+    if !rejections.is_empty() {
+        use std::io::Write as _;
+        let mut section = String::from("\n--- submission rejections ---\n");
+        for r in rejections {
+            section.push_str(&format!("{} {}\n", r.at.to_rfc3339(), r.reason));
+        }
+        if let Err(e) = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(section.as_bytes()))
+        {
+            tracing::warn!(
+                path = %path.display(),
+                "failed to append rejection section to reviewer session log: {e}"
+            );
+        }
+    }
+    Ok(path)
 }
 
 /// Registry of all audits the daemon knows about. Built once at startup
@@ -1473,10 +1496,28 @@ pub(crate) async fn try_consume_submission(
     workspace: &Path,
     change: &str,
 ) -> Option<serde_json::Value> {
-    let socket = std::env::var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET).ok()?;
+    try_consume_submission_full(workspace, change).await.0
+}
+
+/// Like [`try_consume_submission`], but ALSO returns the session's
+/// schema-REJECTED submission attempts, drained by the same
+/// `consume_submission` round trip (review-discard-names-rejection). The
+/// reviewer surfaces these on a no-submission discard; other roles drain
+/// and currently ignore them (the drain keeps rejections per-session for
+/// every role).
+pub(crate) async fn try_consume_submission_full(
+    workspace: &Path,
+    change: &str,
+) -> (
+    Option<serde_json::Value>,
+    Vec<crate::submission_store::RejectedSubmission>,
+) {
+    let Ok(socket) = std::env::var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET) else {
+        return (None, Vec::new());
+    };
     let socket_path = std::path::PathBuf::from(socket);
     if !socket_path.exists() {
-        return None;
+        return (None, Vec::new());
     }
     let basename = workspace
         .file_name()
@@ -1496,17 +1537,24 @@ pub(crate) async fn try_consume_submission(
                 change = %change,
                 "consume_submission relay failed: {e:#}"
             );
-            return None;
+            return (None, Vec::new());
         }
     };
     if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-        return None;
+        return (None, Vec::new());
     }
-    let submission = resp.get("submission")?;
-    if submission.is_null() {
-        return None;
-    }
-    Some(submission.clone())
+    // The same round trip drains the session's rejected attempts (empty when
+    // the field is absent — an older daemon — or when none were recorded).
+    let rejections = resp
+        .get("rejections")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let submission = match resp.get("submission") {
+        Some(s) if !s.is_null() => Some(s.clone()),
+        _ => None,
+    };
+    (submission, rejections)
 }
 
 /// One-shot UDS round trip: send the JSON request followed by a newline,

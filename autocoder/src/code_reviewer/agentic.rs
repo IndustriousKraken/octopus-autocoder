@@ -501,6 +501,14 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
 
         let outcome = result.context("spawning agentic reviewer subprocess")?;
 
+        // Consume the submission — and, in the same round trip, drain the
+        // session's schema-REJECTED attempts (review-discard-names-rejection) —
+        // BEFORE the log write so the rejection sequence lands in the
+        // per-session log. Consuming before the timeout check also drains a
+        // timed-out session's residue instead of leaking it to the next session.
+        let (submission, rejections) =
+            crate::audits::try_consume_submission_full(self.workspace, REVIEWER_ROLE).await;
+
         // Persist the session's FULL captured output to a discoverable per-
         // session log under `reviews/`, mirroring the audit-log pattern,
         // REGARDLESS of outcome (a recorded submission, a no-submission discard,
@@ -508,8 +516,13 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
         // surfaced reason is truncated. Best-effort: a log-write failure is
         // logged, never fatal.
         let log_path = self.paths.and_then(|paths| {
-            match crate::audits::persist_reviewer_session_log(paths, self.workspace, slug, &outcome)
-            {
+            match crate::audits::persist_reviewer_session_log(
+                paths,
+                self.workspace,
+                slug,
+                &outcome,
+                &rejections,
+            ) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     tracing::warn!(
@@ -530,15 +543,21 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
             ));
         }
 
-        let submission = crate::audits::try_consume_submission(self.workspace, REVIEWER_ROLE).await;
-        // On a no-submission outcome, assemble the captured-evidence diagnostic
-        // (final message / stderr / exit-signal, raw, truncated) so the discard
-        // reason surfaces WHY the session failed to submit. Name the per-session
-        // log path so the full (untruncated) output is recoverable from disk.
+        // On a no-submission outcome, lead with what the daemon itself observed
+        // about the session's submission attempts (rejected N times with the
+        // last validator reason, or never attempted), then the captured-evidence
+        // diagnostic (final message / stderr / exit-signal, raw, truncated) so
+        // the discard reason surfaces WHY the session failed to submit. Name the
+        // per-session log path so the full (untruncated) output is recoverable
+        // from disk.
         let no_submission_diagnostic = if submission.is_none() {
-            let mut diag = crate::agentic_run::failure_reason(
-                &outcome,
-                crate::agentic_run::FAILURE_REASON_MAX,
+            let mut diag = format!(
+                "{}; {}",
+                submission_attempt_evidence(&rejections),
+                crate::agentic_run::failure_reason(
+                    &outcome,
+                    crate::agentic_run::FAILURE_REASON_MAX,
+                )
             );
             if let Some(path) = &log_path {
                 diag.push_str(&format!(" (full session log: {})", path.display()));
@@ -551,6 +570,26 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
             submission,
             no_submission_diagnostic,
         })
+    }
+}
+
+/// What the daemon itself observed about a no-submission session's
+/// `submit_review` attempts (review-discard-names-rejection): rejected
+/// attempts name the count and the LAST validator reason — the daemon
+/// computed that reason when it returned the correctable tool error, so the
+/// discard surfaces it instead of discarding the diagnosis; a session that
+/// never attempted a submission says so explicitly, separating a
+/// payload-contract failure from a prompt-contract failure.
+pub(crate) fn submission_attempt_evidence(
+    rejections: &[crate::submission_store::RejectedSubmission],
+) -> String {
+    match rejections.last() {
+        Some(last) => format!(
+            "submission rejected {}x — last: {}",
+            rejections.len(),
+            last.reason
+        ),
+        None => "no submission attempted".to_string(),
     }
 }
 

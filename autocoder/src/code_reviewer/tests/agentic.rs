@@ -7,6 +7,7 @@
 use super::{CannedRunner, brief, stub_with_capture, valid_review_payload};
 use crate::code_reviewer::agentic::{
     AGENTIC_REVIEW_ALLOWED_TOOLS, agentic_review_allowed_tools, run_agentic_review_with_runner,
+    submission_attempt_evidence,
 };
 use crate::code_reviewer::{
     AgenticReviewOutcome, ChangedFile, CodeReviewer, REVIEWER_ROLE, ReviewContext, Verdict,
@@ -548,8 +549,9 @@ fn reviewer_session_writes_discoverable_log() {
         stderr: "529 Overloaded".into(),
         ..Default::default()
     };
-    let path = crate::audits::persist_reviewer_session_log(&paths, ws.path(), "bundled", &outcome)
-        .expect("the reviewer session log is written");
+    let path =
+        crate::audits::persist_reviewer_session_log(&paths, ws.path(), "bundled", &outcome, &[])
+            .expect("the reviewer session log is written");
     assert!(path.exists(), "the per-session log file exists at {}", path.display());
     let basename = ws.path().file_name().and_then(|n| n.to_str()).unwrap();
     assert!(
@@ -564,6 +566,73 @@ fn reviewer_session_writes_discoverable_log() {
     );
     let body = std::fs::read_to_string(&path).unwrap();
     assert!(body.contains("529 Overloaded"), "the captured stderr is persisted: {body}");
+    assert!(
+        !body.contains("submission rejections"),
+        "no rejection section when the session had no rejected attempts: {body}"
+    );
+}
+
+/// review-discard-names-rejection: the per-session log records each
+/// schema-rejected submission attempt with its timestamp, so the full
+/// sequence is recoverable from disk.
+#[test]
+fn reviewer_session_log_records_rejections() {
+    let (_td, paths) = crate::testing::test_daemon_paths();
+    let ws = tempfile::TempDir::new().unwrap();
+    let outcome = crate::agentic_run::AgenticRunOutcome {
+        stdout: "VERDICT: Concerns".into(),
+        ..Default::default()
+    };
+    let at = chrono::Utc::now();
+    let rejections = vec![
+        crate::submission_store::RejectedSubmission {
+            reason: "verdict `Pass` not in [Approve, Block]".into(),
+            at,
+        },
+        crate::submission_store::RejectedSubmission {
+            reason: "verdict `Concerns` not in [Approve, Block]".into(),
+            at,
+        },
+    ];
+    let path = crate::audits::persist_reviewer_session_log(
+        &paths,
+        ws.path(),
+        "bundled",
+        &outcome,
+        &rejections,
+    )
+    .expect("the reviewer session log is written");
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(body.contains("submission rejections"), "rejection section present: {body}");
+    assert!(
+        body.contains("verdict `Concerns` not in [Approve, Block]"),
+        "each rejection's reason is recorded: {body}"
+    );
+    assert!(
+        body.contains(&at.to_rfc3339()),
+        "each rejection carries its timestamp: {body}"
+    );
+}
+
+/// review-discard-names-rejection: the discard reason's leading clause names
+/// the last rejection and the count when attempts were rejected, and says
+/// `no submission attempted` when none reached the daemon — separating a
+/// payload-contract failure from a prompt-contract failure.
+#[test]
+fn submission_attempt_evidence_names_rejection_or_absence() {
+    assert_eq!(submission_attempt_evidence(&[]), "no submission attempted");
+    let at = chrono::Utc::now();
+    let rejections = vec![
+        crate::submission_store::RejectedSubmission { reason: "first".into(), at },
+        crate::submission_store::RejectedSubmission {
+            reason: "verdict `Concerns` not in [Approve, Block]".into(),
+            at,
+        },
+    ];
+    assert_eq!(
+        submission_attempt_evidence(&rejections),
+        "submission rejected 2x — last: verdict `Concerns` not in [Approve, Block]"
+    );
 }
 
 /// a015 (agentic path): the empty-input guard on

@@ -2871,6 +2871,13 @@ pub(crate) fn handle_consume_submission(parsed: &Value, state: &ControlState) ->
         .submission_store
         .consume(&workspace_basename, &change)
         .unwrap_or(Value::Null);
+    // review-discard-names-rejection: drain the session's schema-rejected
+    // attempts alongside the submission (per-session semantics — nothing
+    // leaks into the next session). A valid submission already cleared them
+    // at record time, so a non-empty list here means rejected-never-corrected.
+    let rejections = state
+        .submission_store
+        .drain_rejections(&workspace_basename, &change);
     // verifier-gates-persist-session-log tasks 4.1 + 4.2: when the consume
     // finds no live submission, report all three daemon-side facts together so a
     // held no-submission gate is fully diagnosable from the daemon's own logs,
@@ -2895,23 +2902,34 @@ pub(crate) fn handle_consume_submission(parsed: &Value, state: &ControlState) ->
             Some((role, None)) => format!("none advertised for role {role}"),
             None => "no advertisement recorded for this session".to_string(),
         };
+        // review-discard-names-rejection: rejected-never-corrected is the most
+        // diagnosable no-submission mode — name the last validator reason.
+        let mode_desc = if let Some(last) = rejections.last() {
+            format!(
+                "the daemon rejected {} submission attempt(s) that were never corrected — last: {}",
+                rejections.len(),
+                last.reason
+            )
+        } else if ever_relayed {
+            "a submission WAS relayed to the daemon but is not present at consume (relayed-but-not-consumed)"
+                .to_string()
+        } else {
+            "no submission was ever relayed for this session (never-relayed)".to_string()
+        };
         tracing::info!(
             workspace_basename = %workspace_basename,
             change = %change,
             submission_advertised = %advertised_desc,
             submission_relayed = ever_relayed,
             submission_consumed = false,
+            submission_rejections = rejections.len(),
             "consume_submission found no live submission (advertised={}, relayed={}, consumed=none): {}",
             advertised_desc,
             ever_relayed,
-            if ever_relayed {
-                "a submission WAS relayed to the daemon but is not present at consume (relayed-but-not-consumed)"
-            } else {
-                "no submission was ever relayed for this session (never-relayed)"
-            }
+            mode_desc
         );
     }
-    json!({"ok": true, "submission": submission})
+    json!({"ok": true, "submission": submission, "rejections": rejections})
 }
 
 /// Read the daemon's config path, parse + validate, diff against the

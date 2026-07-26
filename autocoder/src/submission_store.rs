@@ -17,6 +17,8 @@
 //! happens milliseconds before the wrapped CLI exits AND `consume` runs
 //! microseconds after).
 
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -25,6 +27,21 @@ use std::sync::{Arc, Mutex};
 /// satisfies the role's schema, or `Err(reason)` with a correction-
 /// suitable message the MCP relay surfaces to the agent.
 pub type SubmissionValidator = Arc<dyn Fn(&Value) -> Result<(), String> + Send + Sync>;
+
+/// One schema-REJECTED submission attempt (review-discard-names-rejection):
+/// the validator reason (truncated at record time) and when it happened. The
+/// daemon computed the reason when it returned the correctable tool error;
+/// retaining it lets a no-submission discard surface it instead of discarding
+/// the diagnosis along with the payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedSubmission {
+    pub reason: String,
+    pub at: DateTime<Utc>,
+}
+
+/// Cap on a stored rejection reason. Validator messages are short; the cap
+/// only guards against a pathological payload echoed into the reason.
+const REJECTION_REASON_MAX: usize = 300;
 
 /// Shared, mutex-protected store for in-flight submissions plus the
 /// per-role schema registry. Cheap to clone: state lives behind `Arc`s.
@@ -50,6 +67,12 @@ pub struct SubmissionStore {
     /// `consume` — it is a "what was advertised" fact, not the live payload.
     /// Observability only — never gates control flow.
     advertised: Arc<Mutex<HashMap<(String, String), (String, Option<String>)>>>,
+    /// Schema-REJECTED submission attempts per key, in arrival order
+    /// (review-discard-names-rejection). Cleared when a valid submission
+    /// records for the key; drained with the session's `consume_submission`
+    /// round trip, so a corrected rejection leaves no residue and nothing
+    /// leaks across sessions. Observability only — never gates control flow.
+    rejections: Arc<Mutex<HashMap<(String, String), Vec<RejectedSubmission>>>>,
 }
 
 impl SubmissionStore {
@@ -88,9 +111,29 @@ impl SubmissionStore {
             .get(role)
             .cloned()
         {
-            validator(&payload)?;
+            if let Err(reason) = validator(&payload) {
+                // Remember the rejection so a no-submission discard can name it
+                // (review-discard-names-rejection) instead of surfacing only a
+                // generic "no valid submission recorded".
+                self.rejections
+                    .lock()
+                    .expect("submission rejections mutex poisoned")
+                    .entry((workspace_basename, change))
+                    .or_default()
+                    .push(RejectedSubmission {
+                        reason: truncate_chars(&reason, REJECTION_REASON_MAX),
+                        at: Utc::now(),
+                    });
+                return Err(reason);
+            }
         }
         let key = (workspace_basename, change);
+        // A valid submission supersedes any prior rejected attempts for the
+        // key — a corrected rejection leaves no residue.
+        self.rejections
+            .lock()
+            .expect("submission rejections mutex poisoned")
+            .remove(&key);
         // Mark that a submission was relayed for this key BEFORE storing, so a
         // later consume that finds no live entry can still report that the
         // relay reached the daemon (mode c) vs never (mode b). Retained across
@@ -104,6 +147,22 @@ impl SubmissionStore {
             .expect("submission store mutex poisoned")
             .insert(key, payload);
         Ok(())
+    }
+
+    /// Atomically read AND remove the rejected-attempt records for
+    /// `(workspace_basename, change)` (review-discard-names-rejection).
+    /// Subsequent calls for the same key return an empty vec — draining with
+    /// the session's consume keeps rejections per-session.
+    pub fn drain_rejections(
+        &self,
+        workspace_basename: &str,
+        change: &str,
+    ) -> Vec<RejectedSubmission> {
+        self.rejections
+            .lock()
+            .expect("submission rejections mutex poisoned")
+            .remove(&(workspace_basename.to_string(), change.to_string()))
+            .unwrap_or_default()
     }
 
     /// Atomically read AND remove the entry for `(workspace_basename,
@@ -164,6 +223,15 @@ impl SubmissionStore {
             .expect("submission advertised-map mutex poisoned")
             .get(&(workspace_basename.to_string(), change.to_string()))
             .cloned()
+    }
+}
+
+/// Truncate `s` to at most `n` chars, appending an ellipsis when clipped.
+fn truncate_chars(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        s.chars().take(n).collect::<String>() + "…"
     }
 }
 
@@ -351,6 +419,49 @@ mod tests {
             Some(("reviewer".into(), Some("submit_review".into())))
         );
         assert!(!store.was_ever_relayed("repo", "held"));
+    }
+
+    /// review-discard-names-rejection: a schema-rejected attempt is remembered
+    /// with its reason, drained by `drain_rejections` (per-session semantics),
+    /// and a later VALID submission for the same key clears the residue.
+    #[test]
+    fn rejections_are_recorded_drained_and_cleared_by_valid_record() {
+        let store = SubmissionStore::new();
+        store.register_schema(
+            "reviewer",
+            Arc::new(|p: &Value| {
+                if p.get("verdict").is_some() {
+                    Ok(())
+                } else {
+                    Err("verdict `Concerns` not in [Approve, Block]".to_string())
+                }
+            }),
+        );
+        // Two rejected attempts accumulate in order.
+        let _ = store.record("r".into(), "c".into(), "reviewer", json!({"bad": 1}));
+        let _ = store.record("r".into(), "c".into(), "reviewer", json!({"bad": 2}));
+        let drained = store.drain_rejections("r", "c");
+        assert_eq!(drained.len(), 2, "both rejected attempts remembered");
+        assert!(
+            drained[1].reason.contains("Concerns"),
+            "the validator reason is retained: {}",
+            drained[1].reason
+        );
+        // Draining is per-session: a second drain is empty.
+        assert!(store.drain_rejections("r", "c").is_empty());
+
+        // A rejection followed by a corrected VALID submission leaves no residue.
+        let _ = store.record("r".into(), "c".into(), "reviewer", json!({"bad": 3}));
+        store
+            .record("r".into(), "c".into(), "reviewer", json!({"verdict": "Approve"}))
+            .expect("corrected payload accepted");
+        assert!(
+            store.drain_rejections("r", "c").is_empty(),
+            "a corrected rejection leaves no residue"
+        );
+        // Keys are isolated: another key's rejections are unaffected.
+        let _ = store.record("r".into(), "other".into(), "reviewer", json!({"bad": 4}));
+        assert_eq!(store.drain_rejections("r", "other").len(), 1);
     }
 
     #[test]

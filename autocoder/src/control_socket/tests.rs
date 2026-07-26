@@ -3340,6 +3340,61 @@ github:
         cancel.cancel();
     }
 
+    // review-discard-names-rejection: a schema-REJECTED record_submission is
+    // remembered daemon-side and drained by the consume_submission round trip,
+    // so a no-submission discard can name the rejection instead of surfacing
+    // only a generic "no valid submission recorded".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consume_submission_drains_rejected_attempts() {
+        let (_dir, socket, state, _cfg, cancel) = fixture_listener(BASE_YAML).await;
+        state.submission_store.register_schema(
+            "reviewer",
+            std::sync::Arc::new(|p: &serde_json::Value| {
+                match p.get("verdict").and_then(|v| v.as_str()) {
+                    Some("Approve") | Some("Block") => Ok(()),
+                    other => Err(format!("verdict {other:?} not in [Approve, Block]")),
+                }
+            }),
+        );
+        let rec = serde_json::json!({
+            "action": "record_submission",
+            "workspace_basename": "repo",
+            "change": "reviewer",
+            "role": "reviewer",
+            "payload": {"verdict": "Concerns"},
+        });
+        let resp = send_request(&socket, &rec.to_string()).await;
+        assert_eq!(
+            resp["ok"],
+            serde_json::Value::Bool(false),
+            "the schema-invalid payload is rejected: {resp}"
+        );
+
+        let con =
+            r#"{"action":"consume_submission","workspace_basename":"repo","change":"reviewer"}"#;
+        let resp = send_request(&socket, con).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true));
+        assert_eq!(resp["submission"], serde_json::Value::Null);
+        let rejections = resp["rejections"].as_array().expect("rejections array present");
+        assert_eq!(rejections.len(), 1, "the rejected attempt is reported: {resp}");
+        assert!(
+            rejections[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("not in [Approve, Block]"),
+            "the validator reason rides the consume response: {resp}"
+        );
+
+        // Drained with the consume — per-session semantics, nothing leaks into
+        // a later session's consume.
+        let resp2 = send_request(&socket, con).await;
+        assert!(
+            resp2["rejections"].as_array().unwrap().is_empty(),
+            "a second consume reports no rejections: {resp2}"
+        );
+        cancel.cancel();
+    }
+
     // verifier-gates-persist-session-log task 4.1/5.4: the
     // `record_advertised_tool` action records, daemon-side, which submit tool
     // the MCP child advertised for a session's role — `Some(tool)` when one
