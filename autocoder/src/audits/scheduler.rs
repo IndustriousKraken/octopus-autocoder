@@ -369,6 +369,7 @@ async fn drive_one_audit(
         if elapsed < backoff {
             let remaining = backoff - elapsed;
             tracing::info!(
+                url = %repo.url,
                 audit_type,
                 consecutive_failures = failure.consecutive_failures,
                 remaining_secs = remaining.num_seconds(),

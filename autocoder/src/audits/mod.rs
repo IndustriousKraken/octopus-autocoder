@@ -582,6 +582,7 @@ pub fn persist_reviewer_session_log(
             .open(&path)
             .and_then(|mut f| f.write_all(section.as_bytes()))
         {
+            // no-url: log writer has only the workspace path; `path` names the workspace
             tracing::warn!(
                 path = %path.display(),
                 "failed to append rejection section to reviewer session log: {e}"
