@@ -177,10 +177,19 @@ async fn waiting_blocked_iteration_records_skipped_park_not_idle() {
 
     // A waiting change: enumerated by `list_waiting` via its `.question.json`.
     // With no chatops context the resume step cannot poll, so the change stays
-    // waiting and blocks the pending walk — zero commits result.
+    // waiting and blocks the pending walk — zero commits result. Committed so
+    // the dirty-workspace recovery (`git clean -fd`) doesn't delete it.
     let waiting_dir = ws.join("openspec/changes/w1-waiting");
     std::fs::create_dir_all(&waiting_dir).unwrap();
     std::fs::write(waiting_dir.join(".question.json"), "{}").unwrap();
+    for args in [&["add", "-A"][..], &["commit", "-q", "-m", "waiting fixture"][..]] {
+        let st = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&ws)
+            .status()
+            .unwrap();
+        assert!(st.success());
+    }
 
     let github = open_pr_gate_ok_github();
     let _hook = test_hooks::lock();
