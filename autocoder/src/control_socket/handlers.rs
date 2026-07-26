@@ -105,12 +105,11 @@ pub(crate) async fn handle_repo_status_all(state: &ControlState) -> Value {
 }
 
 /// Build the `RepoStatusResponse` for one repo by reading the workspace's
-/// failure-state, alert-state, marker files, and queue state. Pure
-/// filesystem reads + config snapshot, plus one outbound GitHub API call
-/// for the "latest PR by the daemon" line. Does not interrogate the live
-/// polling-task map for `last_iteration` (no central record exists yet);
-/// the field is populated from the most recent failure-state timestamp
-/// when available.
+/// alert-state, marker files, and queue state. Pure filesystem reads + config
+/// snapshot, plus one outbound GitHub API call for the "latest PR by the
+/// daemon" line. `last_iteration` is sourced from the durable per-iteration
+/// record at `<state>/iteration-record/<basename>.json` (durable-iteration-record);
+/// failure-state residue never populates it.
 ///
 /// Per the status-enrichment spec, a GitHub or local-git failure is
 /// log-and-degrade: the affected field becomes `None` and the reply
@@ -281,30 +280,21 @@ async fn build_repo_status(
             fetch_spec_revision_park(repo, github_cfg, &resp.pending_changes).await;
     }
 
-    // Best-effort last-iteration: failure-state's most recent entry
-    // gives us a timestamp for "something happened recently"; without a
-    // central iteration log there's no archive-vs-failure outcome to
-    // report. Skip when there are no failure-state entries (a healthy
-    // workspace).
-    if let Ok(state) = failure_state::load(paths, workspace_path) {
-        if let Some(latest_entry) = state
-            .entries
-            .values()
-            .max_by_key(|e| e.last_failed_at)
-        {
-            resp.last_iteration = Some(LastIteration {
-                finished_at: latest_entry.last_failed_at,
-                outcome_summary: format!(
-                    "last failure: {}",
-                    truncate(&latest_entry.last_reason, 80)
-                ),
-                next_iteration_estimate: Some(
-                    latest_entry.last_failed_at
-                        + chrono::Duration::seconds(repo.poll_interval_sec as i64),
-                ),
-                poll_interval_sec: repo.poll_interval_sec,
-            });
-        }
+    // Last-iteration block sourced EXCLUSIVELY from the durable per-iteration
+    // record (durable-iteration-record). Failure-state residue is NEVER a proxy
+    // for iteration recency, so it no longer populates this surface: a failure
+    // appears here only when the LAST iteration itself failed (its record's
+    // outcome). When no record exists, `last_iteration` stays `None` and the
+    // formatter renders `last iteration: no iteration yet`.
+    if let Some(rec) = crate::iteration_record::read(paths, workspace_path) {
+        resp.last_iteration = Some(LastIteration {
+            finished_at: rec.finished_at,
+            outcome_summary: rec.outcome_summary,
+            next_iteration_estimate: Some(
+                rec.finished_at + chrono::Duration::seconds(repo.poll_interval_sec as i64),
+            ),
+            poll_interval_sec: repo.poll_interval_sec,
+        });
     }
 
     Ok(resp)
@@ -561,14 +551,6 @@ fn read_revision_marker(path: &Path) -> DateTime<Utc> {
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<DateTime<Utc>>().ok())
         .unwrap_or_else(Utc::now)
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        s.chars().take(n).collect::<String>() + "…"
-    }
 }
 
 /// The literal wildcard target accepted by the marker-clear actions. A

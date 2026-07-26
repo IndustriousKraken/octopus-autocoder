@@ -19,7 +19,6 @@ use crate::code_reviewer::CodeReviewer;
 use crate::config::{
     ChatOpsConfig, Config, GithubConfig, NotificationsConfig, RepositoryConfig, ReviewerConfig,
 };
-use crate::failure_state;
 use crate::{queue, workspace};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;

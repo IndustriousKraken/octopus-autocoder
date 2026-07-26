@@ -2015,6 +2015,44 @@ pub fn format_status_reply(resp: &RepoStatusResponse) -> String {
             resp.spec_revision_park.as_ref(),
         ));
         out.push('\n');
+
+        // (5) last iteration — sourced EXCLUSIVELY from the durable per-iteration
+        // record (durable-iteration-record). No record yet → the placeholder,
+        // matching the menu's `no iteration yet` wording. This section precedes
+        // the marker / throttled-alert / queue sections below.
+        match &resp.last_iteration {
+            None => out.push_str("\nlast iteration: no iteration yet\n"),
+            Some(li) => {
+                out.push_str("\nlast iteration:\n");
+                out.push_str(&format!(
+                    "  finished: {} ago\n",
+                    human_age_since(li.finished_at)
+                ));
+                if !li.outcome_summary.is_empty() {
+                    out.push_str(&format!("  outcome: {}\n", li.outcome_summary));
+                }
+                if let Some(next) = li.next_iteration_estimate {
+                    let delta = next - Utc::now();
+                    if delta.num_seconds() > 0 {
+                        out.push_str(&format!(
+                            "  next iteration: in ~{} (poll_interval {}s)\n",
+                            human_age_duration(delta),
+                            li.poll_interval_sec,
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  next iteration: due (poll_interval {}s)\n",
+                            li.poll_interval_sec
+                        ));
+                    }
+                } else {
+                    out.push_str(&format!(
+                        "  next iteration: poll_interval {}s\n",
+                        li.poll_interval_sec
+                    ));
+                }
+            }
+        }
     }
 
     let has_markers =
@@ -2056,37 +2094,6 @@ pub fn format_status_reply(resp: &RepoStatusResponse) -> String {
             out.push_str(&format!(
                 "  • {} — last fired {last_fired} ago ({remaining}h remaining)\n",
                 a.label
-            ));
-        }
-    }
-
-    if let Some(li) = &resp.last_iteration {
-        out.push_str("\nlast iteration:\n");
-        out.push_str(&format!(
-            "  finished: {} ago\n",
-            human_age_since(li.finished_at)
-        ));
-        if !li.outcome_summary.is_empty() {
-            out.push_str(&format!("  outcome: {}\n", li.outcome_summary));
-        }
-        if let Some(next) = li.next_iteration_estimate {
-            let delta = next - Utc::now();
-            if delta.num_seconds() > 0 {
-                out.push_str(&format!(
-                    "  next iteration: in ~{} (poll_interval {}s)\n",
-                    human_age_duration(delta),
-                    li.poll_interval_sec,
-                ));
-            } else {
-                out.push_str(&format!(
-                    "  next iteration: due (poll_interval {}s)\n",
-                    li.poll_interval_sec
-                ));
-            }
-        } else {
-            out.push_str(&format!(
-                "  next iteration: poll_interval {}s\n",
-                li.poll_interval_sec
             ));
         }
     }
@@ -7029,6 +7036,47 @@ mod tests {
         );
         assert!(out.contains("latest PR: (none)"), "{out}");
         assert!(out.contains("currently: idle"), "{out}");
+    }
+
+    /// durable-iteration-record: a real repo (branches set) with no iteration
+    /// record renders the `no iteration yet` placeholder, matching the menu.
+    #[test]
+    fn format_status_no_record_renders_no_iteration_yet() {
+        let resp = RepoStatusResponse {
+            url: "git@github.com:owner/repo.git".into(),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            last_iteration: None,
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(
+            out.contains("last iteration: no iteration yet"),
+            "no record renders the placeholder: {out}"
+        );
+    }
+
+    /// The last-iteration block renders the record's finished age, outcome
+    /// summary, and next-iteration estimate.
+    #[test]
+    fn format_status_last_iteration_block_reflects_record() {
+        let resp = RepoStatusResponse {
+            url: "git@github.com:owner/repo.git".into(),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            last_iteration: Some(LastIteration {
+                finished_at: Utc::now() - chrono::Duration::minutes(2),
+                outcome_summary: "archived a05-foo".into(),
+                next_iteration_estimate: Some(Utc::now() + chrono::Duration::seconds(30)),
+                poll_interval_sec: 60,
+            }),
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(out.contains("last iteration:\n"), "{out}");
+        assert!(out.contains("finished: 2m ago"), "{out}");
+        assert!(out.contains("outcome: archived a05-foo"), "{out}");
+        assert!(out.contains("next iteration: in ~"), "{out}");
     }
 
     // ---- Issues-lane status section

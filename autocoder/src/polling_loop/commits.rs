@@ -507,6 +507,18 @@ async fn prepare_workspace_for_pass(
     }
     git::recreate_branch(workspace, &repo.agent_branch)?;
 
+    // durable-iteration-record: prune orphaned failure-state entries whose
+    // change directory no longer exists in the freshly-synced base state (a
+    // change merged/archived outside the server's own queue walk leaves a
+    // counter clear-on-archive never runs for). Best-effort — a prune failure
+    // logs WARN and never aborts the pass.
+    if let Err(e) = failure_state::prune_orphans(paths, workspace) {
+        tracing::warn!(
+            url = repo.url.as_str(),
+            "failure-state orphan prune failed (pass continues): {e:#}"
+        );
+    }
+
     // Canonical-spec RAG workspace-init hook (a21). Idempotent: only
     // builds + registers the store on the first iteration of a given
     // workspace (a previously-registered store is left alone). Fail-open

@@ -474,7 +474,7 @@ The dispatcher SHALL recognize `@<bot> help` (case-insensitive) as a verb and re
 - **AND** `text` does NOT contain `wipe-workspace-confirm` NOR `rollback-confirm`
 
 ### Requirement: Status reply always shows live workspace snapshot
-The `status` verb's reply SHALL always include five sections regardless of whether the repo has any markers, throttled alerts, or queued changes: (1) `branches: base=<base>, agent=<agent>`; (2) one `last commit on <branch>` line per branch (base and agent), each rendering as `<short_sha> "<subject>" (<age> ago)` when a commit exists or `(none)` when the branch does not exist or has no commits; (3) `latest PR: ...` with a URL on the following line when a PR exists from the agent branch, or `latest PR: (none)` otherwise; (4) the `currently:` line surfacing the daemon's live state — the busy marker's contents, OR the open-PR park when the agent-branch skip-gate is active (per the branching rules below); (5) the existing `next iteration: in <age> ...` line. These sections SHALL precede the existing marker / throttled-alert / queue sections.
+The `status` verb's reply SHALL always include five sections regardless of whether the repo has any markers, throttled alerts, or queued changes: (1) `branches: base=<base>, agent=<agent>`; (2) one `last commit on <branch>` line per branch (base and agent), each rendering as `<short_sha> "<subject>" (<age> ago)` when a commit exists or `(none)` when the branch does not exist or has no commits; (3) `latest PR: ...` with a URL on the following line when a PR exists from the agent branch, or `latest PR: (none)` otherwise; (4) the `currently:` line surfacing the daemon's live state — the busy marker's contents, OR the open-PR park when the agent-branch skip-gate is active (per the branching rules below); (5) the `last iteration:` block — finished age, outcome summary, and the `next iteration: in <age> ...` estimate — sourced EXCLUSIVELY from the durable per-iteration record (per the orchestrator-cli requirement "Every polling iteration writes a durable iteration record"). When no iteration record exists, section (5) reads `last iteration: no iteration yet` (matching the menu's placeholder wording). The block SHALL NEVER be populated from failure-state residue or any other per-change bookkeeping: a failure appears in the block only when the last iteration itself failed, and the `next iteration:` estimate derives from the record's `finished_at` plus the poll interval. These sections SHALL precede the existing marker / throttled-alert / queue sections.
 
 The `currently:` line's value SHALL be computed by branching on the busy marker's contents in this order:
 
@@ -566,6 +566,21 @@ The age formatting matches the existing convention: `Xs ago` for ages under 1 mi
 - **AND** the status reply composer reads the marker for that workspace
 - **THEN** both code paths use the same resolved `<runtime_dir>` (per `a09`'s state-path-resolution rule)
 - **AND** the status reply never reports `idle` when a marker file exists at the daemon's write path
+
+#### Scenario: Last-iteration block reflects the iteration record, not failure residue
+- **WHEN** the workspace's failure-state store contains an entry from weeks ago AND the iteration record shows an idle iteration finishing 2 minutes ago
+- **THEN** section (5) renders `finished: 2m ago` with the record's idle outcome
+- **AND** the weeks-old failure appears nowhere in the block
+
+#### Scenario: No iteration record renders the placeholder
+- **WHEN** no iteration record exists for the workspace (fresh install, or a daemon that has never completed an iteration for this repo)
+- **THEN** section (5) reads `last iteration: no iteration yet`
+- **AND** no finished age, outcome, or next-iteration estimate is fabricated
+
+#### Scenario: A stale record is a true liveness signal
+- **WHEN** the iteration record's `finished_at` is far older than the poll interval
+- **THEN** the `next iteration:` line renders `due (poll_interval <N>s)`
+- **AND** because every iteration (including idle ones) overwrites the record, the old `finished:` age correctly indicates the polling task has not completed an iteration since then
 
 ### Requirement: Queue one-liner for small queues
 When `pending_changes`, `waiting_changes`, and the marker-excluded set each contain 5 or fewer entries, the status reply SHALL render the queue as a single line: `queue: N pending (<list>), M waiting (<list>), K excluded`. When any of those lists exceeds 5 entries, the reply SHALL fall back to the existing per-line format (one line per change). Empty lists in the one-liner form SHALL render as `N pending` (no parenthetical) rather than `0 pending ()`.

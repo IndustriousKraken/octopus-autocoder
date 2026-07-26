@@ -160,6 +160,67 @@ fn save_entry(
     Ok(())
 }
 
+/// Prune failure-state entries whose change directory no longer exists in the
+/// workspace's active changes (durable-iteration-record). Runs at pass start
+/// AFTER branch sync, so the freshly-pulled base state decides existence.
+///
+/// A change can complete outside the server's own queue walk (implemented on
+/// another machine and pushed, or merged by another host), in which case the
+/// server's clear-on-archive never runs for it AND the orphaned counter lingers
+/// forever. Pruning is safe because the counter's only consumer is perma-stuck
+/// detection, which is meaningless for a change that no longer exists. Entries
+/// for changes whose `openspec/changes/<change>/` directory still exists —
+/// including marker-excluded ones (perma-stuck, needs-revision) — are retained.
+///
+/// Best-effort: a missing failure-state dir is an empty prune (not an error).
+/// Returns the pruned change names (for logging + tests); one INFO line is
+/// logged per removal.
+pub fn prune_orphans(paths: &DaemonPaths, workspace: &Path) -> Result<Vec<String>> {
+    let dir = repo_dir(paths, workspace);
+    let changes_root = workspace.join("openspec").join("changes");
+    let read = match std::fs::read_dir(&dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut pruned = Vec::new();
+    for entry in read {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(dir = %dir.display(), "failure-state: prune read_dir entry error: {e}");
+                continue;
+            }
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let change = match name.strip_suffix(".json") {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        // A change directory that still exists (pending, waiting, or
+        // marker-excluded) keeps its counter. Only truly-gone changes prune.
+        if changes_root.join(&change).is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                tracing::info!(
+                    workspace = %workspace.display(),
+                    change = %change,
+                    "failure-state: pruned orphaned entry for change no longer in workspace"
+                );
+                pruned.push(change);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "failure-state: failed to prune orphan: {e:#}");
+            }
+        }
+    }
+    Ok(pruned)
+}
+
 /// Remove `change`'s entry. Silent on "entry not present" — that's a no-op.
 pub fn clear(paths: &DaemonPaths, workspace: &Path, change: &str) -> Result<()> {
     let path = change_file(paths, workspace, change);
@@ -225,6 +286,46 @@ mod tests {
         let workspace = paths.cache.join("workspaces").join("ws");
         clear(&paths, &workspace, "never-existed").expect("clear of absent entry must succeed");
         clear(&paths, &workspace, "still-absent").expect("second clear is also fine");
+    }
+
+    #[test]
+    fn prune_orphans_removes_absent_retains_present() {
+        let (_temp, paths) = test_daemon_paths();
+        let workspace = paths.cache.join("workspaces").join("ws");
+
+        // Three failure entries: `present` has a live change dir, `excluded`
+        // has a live (marker-excluded) change dir, `gone` has no dir.
+        for change in ["present", "excluded", "gone"] {
+            record_failure(&paths, &workspace, change, "x").unwrap();
+        }
+        // `present` is an ordinary active change; `excluded` is marker-excluded
+        // (perma-stuck) but its DIRECTORY still exists → both retained.
+        for change in ["present", "excluded"] {
+            std::fs::create_dir_all(workspace.join("openspec/changes").join(change)).unwrap();
+        }
+        std::fs::write(
+            workspace.join("openspec/changes/excluded/.perma-stuck.json"),
+            "{}",
+        )
+        .unwrap();
+
+        let pruned = prune_orphans(&paths, &workspace).unwrap();
+        assert_eq!(pruned, vec!["gone".to_string()], "only the absent change is pruned");
+
+        let state = load(&paths, &workspace).unwrap();
+        assert!(state.entries.contains_key("present"), "present change retained");
+        assert!(
+            state.entries.contains_key("excluded"),
+            "marker-excluded change (dir still exists) retained"
+        );
+        assert!(!state.entries.contains_key("gone"), "vanished change pruned");
+    }
+
+    #[test]
+    fn prune_orphans_missing_dir_is_empty() {
+        let (_temp, paths) = test_daemon_paths();
+        let workspace = paths.cache.join("workspaces").join("ws");
+        assert!(prune_orphans(&paths, &workspace).unwrap().is_empty());
     }
 
     #[test]
