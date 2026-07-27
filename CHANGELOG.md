@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.3.7] - 2026-07-26
+
+A logging-conformance release for the audit backoff shipped in v1.3.5.
+
+### Fixed
+
+- Bring the audit-backoff tracing into conformance with the logging contract: the backoff INFO line carries the repository URL, and the log-append WARN does not.
+
+## [v1.3.6] - 2026-07-26
+
+A test-only release; no user-facing behavior changes.
+
+### Also included
+
+- Fix the waiting-park integration test by committing its fixture, so the test's own `git clean -fd` no longer removes it.
+
+## [v1.3.5] - 2026-07-26
+
+This release is mostly about billed work that shouldn't have been billed: a
+deterministically failing audit no longer re-runs every polling iteration, the
+pre-executor gates run once per change instead of once per code iteration, and
+two paths that let completed work be re-implemented from scratch are closed. It
+also replaces the fabricated `last iteration:` status block with a real record
+and makes silent gate retries and review discards legible.
+
+### Highlights
+
+- **Runaway audit spend is capped** — a deterministically failing audit now backs off instead of spawning a fresh billed session on every polling iteration (up to ~288 per day per broken audit, against one throttled alert).
+- **Gates run once per change, not once per iteration** — the three pre-executor gates evaluate a change's spec deltas once per sequence rather than re-judging byte-identical inputs before each of up to 5 code iterations.
+- **Completed work stops being re-implemented** — the archive now rides the completion commit on the waiting-change resume path, and the push-block hold covers PR-creation failure and issue-bearing passes, so neither case can drop finished work back into the queue for a full re-run.
+- **Honest daemon status** — the chatops `last iteration:` block is backed by a durable per-iteration record instead of the newest failure-counter entry, which could report a month-old error as the outcome of a daemon that merged PRs hours earlier.
+- **Silent retries and discards are visible** — a verifier-gate session that never submits now reports its billed re-attempts, and a discarded review names the daemon-side rejection that caused it.
+
+### Added
+
+- Add a durable per-iteration record backing the chatops status reply, so `last iteration:` reports what actually happened rather than the most recent failure-state timestamp.
+- Report verifier-gate retries in chatops, the PR, and the logs, and spec the `executor.verifier_gate_retries` budget (default 2) that governs them.
+- Name the daemon-side validator's rejection reason on a discarded agentic review, and distinguish "attempted and rejected N times" from "never attempted".
+
+### Changed
+
+- Back off a failing audit instead of re-billing it: a `run()` error, a write-policy violation, and a `DidNotComplete` outcome now advance the audit's cadence state.
+- Run the `[in]`, `[canon]`, and `[rules]` gates once per change sequence instead of before every code iteration.
+
+### Fixed
+
+- Commit the archive with the implementation diff on the waiting-change resume path, so dirty-workspace recovery can't destroy the archive rename and re-queue an already-shipped change.
+- Extend the push-block hold to PR-creation failure after a successful push and to passes carrying only issue units; a matching hold retries just the failed step instead of recreating the branch and re-running the executor.
+
+### Also included
+
+- Escape the status reply's outcome line and name the waiting-change park in operator-facing output.
+
+## [v1.3.4] - 2026-07-24
+
+This release closes two fail-open paths that cost redundant billed work — the
+open-PR skip gate and startup fork setup — makes the agentic reviewer honor the
+documented prompt override, and caches canonical-RAG embeddings on disk so a
+restart stops re-embedding the whole corpus.
+
+### Highlights
+
+- **The open-PR gate fails closed** — a GitHub query that fails is no longer read as "no open PR exists", so a transient failure can't green-light a redundant executor run, a force-push over a PR under review, or a duplicate PR.
+- **Reviewer prompt overrides actually apply** — `reviewer.code_review.prompt_path` (and the legacy `reviewer.prompt_template_path`) now drives the agentic reviewer, which is the default transport; configuring it was previously a silent no-op.
+- **Transient startup failures retry** — a DNS blip, a GitHub 5xx, or a fork that takes over 60 seconds to populate no longer sidelines a repository for the daemon's lifetime; only deterministic failures still skip permanently.
+- **RAG embeddings survive restarts** — a disk-backed cache keyed by embedding provider, model, and chunk content means a restart re-embeds only what changed, instead of paying ~30 seconds per workspace (and hosted-provider tokens) for vectors the daemon already computed.
+
+### Added
+
+- Add a disk-backed canonical-RAG embedding cache under the daemon's cache directory, consulted on workspace init and post-archive rebuilds, pruned of dead entries on write and fail-open (a corrupt cache logs a WARN and degrades to a full re-embed).
+
+### Fixed
+
+- Hold the iteration when the open-PR check cannot be answered, instead of proceeding as though no PR were open.
+- Honor the reviewer prompt override in the agentic reviewer, which had built its prompt from hardcoded guidance regardless of configuration.
+- Classify fork-setup failures at startup as transient or permanent and retry the transient ones on the next iteration, matching the daemon's existing mid-iteration recovery behavior.
+
+### Also included
+
+- Correct the issues-lane path in the README, plus general README updates.
+
 ## [v1.3.3] - 2026-07-16
 
 This release hardens the issues lane — a maintainer-promoted issue no longer
