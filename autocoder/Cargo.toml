@@ -36,4 +36,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 mockito = "1"
+# `test-util` for `#[tokio::test(start_paused = true)]` — lets the Slack
+# frame-deadline tests cover a 90s window without waiting 90 seconds.
+tokio = { version = "1.52.2", features = ["test-util"] }
 tracing-test = "0.2"
