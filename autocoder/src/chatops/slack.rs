@@ -1025,10 +1025,17 @@ enum EventLoopExit {
     ConnectionError(String),
 }
 
+/// No WebSocket frame of any kind for this long means the connection
+/// is dead. Slack pings healthy Socket Mode connections every few
+/// seconds, so 90s of total silence is a half-open socket that will
+/// never surface a stream error on its own.
+const FRAME_DEADLINE: Duration = Duration::from_secs(90);
+
 /// Run the event loop on an already-connected stream. Races
-/// `cancel.cancelled()` against the next frame; on cancel sends a
-/// clean Close frame and returns. The function is generic over the
-/// concrete stream type so tests can drive it with a fake stream.
+/// `cancel.cancelled()` and the `FRAME_DEADLINE` against the next
+/// frame; on cancel sends a clean Close frame and returns. The
+/// function is generic over the concrete stream type so tests can
+/// drive it with a fake stream.
 async fn run_event_loop<S>(
     ctx: &InboundListenerContext,
     mut stream: S,
@@ -1042,11 +1049,30 @@ where
     let mut processed_any_event = false;
 
     loop {
+        // The deadline sleep is created fresh on every iteration, so
+        // any frame — event, ping, hello, disconnect, or other —
+        // resets it just by bringing us back around the loop.
         tokio::select! {
             _ = cancel.cancelled() => {
                 let _ = stream.send(WsMessage::Close(None)).await;
                 let _ = stream.close().await;
                 return EventLoopExit::Cancelled;
+            }
+            _ = tokio::time::sleep(FRAME_DEADLINE) => {
+                // Half-open connection. Treat it exactly as a stream
+                // error: returning drops `stream`, closing the socket.
+                // We deliberately do not await a Close handshake with a
+                // peer we have just declared dead — that write is what
+                // hangs forever on a half-open connection.
+                let reason = format!(
+                    "frame deadline: no frame for {}s",
+                    FRAME_DEADLINE.as_secs()
+                );
+                if processed_any_event {
+                    return EventLoopExit::HandledEvent(reason);
+                } else {
+                    return EventLoopExit::ConnectionError(reason);
+                }
             }
             next = stream.next() => {
                 let msg = match next {
@@ -2658,6 +2684,120 @@ mod tests {
             }
             other => panic!("expected ConnectionError, got {other:?}"),
         }
+    }
+
+    /// Half-open connection: the peer is gone but no FIN/RST ever
+    /// arrives, so the stream neither errors nor ends — it just pends.
+    /// The frame deadline must reap it. Paused clock: the 90s window
+    /// passes in virtual time.
+    #[tokio::test(start_paused = true)]
+    async fn event_loop_frame_deadline_reaps_silent_stream() {
+        // `_in_tx` stays alive for the whole test, so the stream pends
+        // forever instead of ending.
+        let (stream, _in_tx, _out_rx) = make_fake_stream();
+        let cancel = CancellationToken::new();
+        let ctx = test_ctx_for_event_loop(
+            "http://unused.invalid".to_string(),
+            "xoxb-x".to_string(),
+            "UBOT",
+            &["C_OPS"],
+        );
+        let start = tokio::time::Instant::now();
+        let exit = run_event_loop(&ctx, stream, &cancel).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= FRAME_DEADLINE && elapsed < FRAME_DEADLINE + Duration::from_secs(1),
+            "expected the exit at the deadline, got {elapsed:?}"
+        );
+        match exit {
+            // No event roundtrip this cycle → same exit a stream error
+            // would produce, so the outer loop grows its backoff.
+            EventLoopExit::ConnectionError(reason) => {
+                assert!(reason.contains("frame deadline"), "{reason}");
+            }
+            other => panic!("expected ConnectionError, got {other:?}"),
+        }
+    }
+
+    /// Frames with sub-deadline gaps — including bare protocol pings
+    /// carrying no event payload — keep the connection alive well past
+    /// the point where a silent stream would have been reaped.
+    #[tokio::test(start_paused = true)]
+    async fn event_loop_frames_within_window_keep_connection_alive() {
+        let (stream, in_tx, _out_rx) = make_fake_stream();
+        let cancel = CancellationToken::new();
+        let ctx = test_ctx_for_event_loop(
+            "http://unused.invalid".to_string(),
+            "xoxb-x".to_string(),
+            "UBOT",
+            &["C_OPS"],
+        );
+        let feeder = tokio::spawn(async move {
+            // Four 60s gaps: 240s total, well past the 90s deadline, but
+            // no single gap reaches it.
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                in_tx.send(Ok(WsMessage::Ping(Vec::new().into()))).unwrap();
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            in_tx
+                .send(Ok(WsMessage::Text(
+                    r#"{"type":"disconnect","reason":"link_disabled"}"#
+                        .to_string()
+                        .into(),
+                )))
+                .unwrap();
+        });
+        let start = tokio::time::Instant::now();
+        let exit = run_event_loop(&ctx, stream, &cancel).await;
+        feeder.await.unwrap();
+        assert!(
+            start.elapsed() > FRAME_DEADLINE,
+            "the loop should have lived past the deadline, ran {:?}",
+            start.elapsed()
+        );
+        match exit {
+            EventLoopExit::HandledEvent(reason) => {
+                assert!(reason.contains("link_disabled"), "{reason}");
+                assert!(!reason.contains("frame deadline"), "{reason}");
+            }
+            other => panic!("expected HandledEvent, got {other:?}"),
+        }
+    }
+
+    /// The deadline arm must not starve the cancel arm: cancellation
+    /// still wins immediately (real clock, real second) while the loop
+    /// waits inside the 90s window, and the close is clean.
+    #[tokio::test]
+    async fn event_loop_cancel_wins_inside_frame_deadline_window() {
+        let (stream, _in_tx, mut out_rx) = make_fake_stream();
+        let cancel = CancellationToken::new();
+        let ctx = test_ctx_for_event_loop(
+            "http://unused.invalid".to_string(),
+            "xoxb-x".to_string(),
+            "UBOT",
+            &["C_OPS"],
+        );
+        let cancel_for_task = cancel.clone();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_for_task.cancel();
+        });
+        let exit = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_event_loop(&ctx, stream, &cancel),
+        )
+        .await
+        .expect("must exit within 1s, not wait out the frame deadline");
+        canceller.await.unwrap();
+        match exit {
+            EventLoopExit::Cancelled => {}
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+        assert!(
+            matches!(out_rx.try_recv(), Ok(WsMessage::Close(_))),
+            "cancel should close the WebSocket cleanly"
+        );
     }
 
     #[tokio::test]

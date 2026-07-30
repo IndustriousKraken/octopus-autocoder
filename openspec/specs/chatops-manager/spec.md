@@ -302,7 +302,7 @@ The dispatcher SHALL return `Option<Reply>` from `handle_message`, where `Reply`
 - **AND** the listener registers `(job_id, channel, message_ts)` so that a later completion event for `job_id` posts a follow-up threaded reply at the same `(channel, message_ts)`
 
 ### Requirement: Slack Socket Mode connection lifecycle
-The Slack inbound listener SHALL obtain a WebSocket URL via `POST https://slack.com/api/apps.connections.open` using the configured app-level token, connect via WebSocket, and remain connected until either the daemon's `cancel` fires or the stream errors. On stream error or Slack `disconnect` envelope, the listener SHALL reconnect with exponential backoff starting at 1 second, doubling, capped at 30 seconds. A successful event roundtrip SHALL reset the backoff to 1 second. On cancel, the listener SHALL close the WebSocket cleanly and return.
+The Slack inbound listener SHALL obtain a WebSocket URL via `POST https://slack.com/api/apps.connections.open` using the configured app-level token, connect via WebSocket, and remain connected until the daemon's `cancel` fires, the stream errors, or the frame deadline elapses. A connection on which no WebSocket frame of any kind (event, ping, hello, disconnect, or other) has arrived for 90 seconds SHALL be treated as a stream error: the listener closes the stream and re-enters the reconnect cycle. (Slack pings healthy Socket Mode connections every few seconds, so 90 seconds of frame silence indicates a dead or half-open connection that will never error on its own.) On stream error or Slack `disconnect` envelope, the listener SHALL reconnect with exponential backoff starting at 1 second, doubling, capped at 30 seconds. A successful event roundtrip SHALL reset the backoff to 1 second. On cancel, the listener SHALL close the WebSocket cleanly and return.
 
 #### Scenario: apps.connections.open is called with the app-level token
 - **WHEN** the listener starts
@@ -327,6 +327,16 @@ The Slack inbound listener SHALL obtain a WebSocket URL via `POST https://slack.
 #### Scenario: Cancel exits within 1 second
 - **WHEN** the daemon's root cancel token fires while the listener is connected to Slack
 - **THEN** the listener closes the WebSocket within 1 second and its `JoinHandle` resolves
+
+#### Scenario: Frame deadline reaps a half-open connection
+- **WHEN** the connected stream delivers no frame of any kind for 90 seconds
+- **THEN** the listener treats the connection as dead, exactly as if the stream had errored
+- **AND** closes the stream and re-enters the `apps.connections.open` + connect cycle with backoff
+- **AND** the disconnect log line names the frame deadline as the reason
+
+#### Scenario: Any frame within the window keeps the connection alive
+- **WHEN** frames arrive on the connected stream (including bare protocol pings with no event payload) with gaps shorter than 90 seconds
+- **THEN** the frame deadline never fires and the connection persists as before
 
 ### Requirement: app_mention-only subscription
 The Slack inbound listener SHALL handle only Slack `app_mention` events from the Socket Mode stream. The Slack app's Events API subscription SHALL be configured for `app_mention` only (operators configure this in the Slack app dashboard; the daemon does not configure it). Other event types received over the WebSocket SHALL be acknowledged (so Slack does not redeliver them) but otherwise ignored.
