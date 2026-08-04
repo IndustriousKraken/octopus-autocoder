@@ -78,6 +78,19 @@ impl DaemonPaths {
         }
     }
 
+    /// app-under-test-e2e: the daemon-owned browser-runtime location.
+    ///
+    /// Deliberately under the resolved cache directory rather than the service
+    /// account's default user cache (`~/.cache/ms-playwright`): the systemd
+    /// unit already provisions `CacheDirectory=autocoder`, so this path is
+    /// predictable, survives across runs, and is the same location whether the
+    /// daemon runs as a system service or in dev mode. Exported to the
+    /// executor session AND the end-to-end command so the browser runtime
+    /// resolves identically inside the OS sandbox.
+    pub fn e2e_browsers_dir(&self) -> PathBuf {
+        self.cache.join("e2e-browsers")
+    }
+
     // ----- Per-state-shape helpers -----
     //
     // Every daemon-side state-file read OR write must route through one
@@ -312,6 +325,29 @@ impl DaemonPaths {
     /// iteration record for the named workspace.
     pub fn iteration_record_path(&self, workspace_basename: &str) -> PathBuf {
         self.iteration_record_dir()
+            .join(format!("{workspace_basename}.json"))
+    }
+
+    /// app-under-test-e2e: `<state>/app-under-test/` — the RUNTIME facts about
+    /// the application started for the current pass (its resolved base URL and
+    /// end-to-end command).
+    ///
+    /// A state file rather than a plumbed-through parameter because the base
+    /// URL is only known once a port is allocated, and the executor is a
+    /// long-lived `Arc<dyn Executor>` shared by every repository's polling
+    /// task. Process-global environment would race between repositories
+    /// polling concurrently; a per-workspace file cannot. Same shape and
+    /// reasoning as `iteration_pending`, which the prompt builder already
+    /// reads this way.
+    pub fn app_under_test_dir(&self) -> PathBuf {
+        self.state.join("app-under-test")
+    }
+
+    /// `<state>/app-under-test/<workspace_basename>.json` — the running
+    /// application's facts for the named workspace, present only while an
+    /// application is up for that pass.
+    pub fn app_under_test_path(&self, workspace_basename: &str) -> PathBuf {
+        self.app_under_test_dir()
             .join(format!("{workspace_basename}.json"))
     }
 

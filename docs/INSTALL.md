@@ -90,4 +90,32 @@ autocoder doctor --config ~/autocoder/config.yaml
 
 The same checks run automatically at `autocoder run` startup, so a misconfigured host fails loudly instead of looping. The assisted installer (`install.sh` → `autocoder install`, see [DEPLOYMENT.md](DEPLOYMENT.md)) offers to install the OS-package dependencies for you with per-step consent.
 
+## 7. End-to-end testing (optional) {#7-end-to-end-testing-optional}
+
+Needed only for repositories configured with an [`app_under_test`](CONFIG.md) block, where autocoder verifies a change by running the application.
+
+The toolchain splits in two, and only one half needs root:
+
+- **System packages** — the shared libraries the browser links against. Requires elevated privileges.
+- **Browser binaries** — a user-space download, placed in a daemon-owned directory under the resolved cache dir (not the service account's `~/.cache`), so the daemon, the executor session, and the end-to-end command all resolve the same location.
+
+The installer provisions both, with a consent step each:
+
+```bash
+sudo autocoder install --reconfigure e2e
+```
+
+`--reconfigure` works against an existing installation, so adding end-to-end verification never requires a reinstall or hand-run package commands. The section is idempotent, and on a host with no supported package manager it reports what it could not provision plus the manual commands, without aborting the rest of the installation.
+
+**Provisioning is operator-initiated only** — never during a pass, never at daemon startup. autocoder will not download a browser runtime as a side effect of polling. When the runtime is missing, `doctor` and the startup preflight warn per declaring repository, naming the command above, and end-to-end verification stays disabled for that repository only. Other repositories are unaffected and the daemon starts normally.
+
+Provisioning delegates to the browser tool's own dependency resolver rather than a package list carried in this repository, because package names are distro-**version**-specific (Ubuntu 24.04's 64-bit `time_t` transition renames `libatk1.0-0` to `libatk1.0-0t64`, for instance). It installs a broad set — roughly 45 packages on Ubuntu 24.04, about a third of them fonts, which materially improve rendering fidelity for screenshot-based debugging. On a constrained host the strictly-required subset is ten packages:
+
+```bash
+apt-get install -y libnss3 libnspr4 libatk1.0-0t64 libatk-bridge2.0-0t64 \
+  libatspi2.0-0t64 libgbm1 libxcomposite1 libxdamage1 libxfixes3 libxrandr2
+```
+
+A headless server needs no display server, GPU, or desktop environment: the browser runs headless, and Playwright's headless shell already passes `--no-sandbox` and `--disable-dev-shm-usage` itself, so no extra flags are required inside autocoder's OS sandbox.
+
 ---

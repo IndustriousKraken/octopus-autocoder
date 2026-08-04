@@ -14,7 +14,7 @@
 //! [`RealProbe`] (PATH lookups + the `sandbox` module's usability probes);
 //! tests inject a fake that returns canned facts.
 
-use crate::config::{CliKind, Config, ReviewerKind};
+use crate::config::{CliKind, Config, RepositoryConfig, ReviewerKind};
 use anyhow::{Result, anyhow};
 
 /// Install hint for the openspec CLI. Mirrors the message the daemon has
@@ -22,6 +22,16 @@ use anyhow::{Result, anyhow};
 pub const OPENSPEC_MISSING_MSG: &str =
     "openspec preflight failed: `openspec` binary not found on PATH. \
      Install openspec and ensure the systemd unit's PATH covers its install directory.";
+
+/// app-under-test-e2e: names the PROVISIONING command that remediates a
+/// missing browser runtime, not merely the missing component — the operator
+/// should never have to work out the host package dance by hand.
+pub const E2E_BROWSERS_MISSING_MSG: &str =
+    "The end-to-end browser runtime is not provisioned, so end-to-end \
+     verification is disabled for this repository. Provision it with \
+     `autocoder install --reconfigure` and select the end-to-end testing \
+     section (it installs the required system packages AND the browser \
+     binaries), OR remove the repository's `app_under_test` block.";
 
 const GIT_HINT: &str =
     "Install git via your platform package manager (e.g. `apt-get install git`, \
@@ -257,6 +267,18 @@ pub trait DepProbe {
     fn toolchain(&self, _tool: &str) -> ToolchainStatus {
         ToolchainStatus::Absent
     }
+    /// app-under-test-e2e: whether the daemon-owned browser runtime is
+    /// provisioned (see `DaemonPaths::e2e_browsers_dir`). This is the ONE
+    /// end-to-end component autocoder itself provisions — the repository's own
+    /// test-runner dependency is out of scope and belongs to its manifest — so
+    /// it is the only part the daemon can meaningfully probe.
+    ///
+    /// Defaults to `Missing` so existing test probes need no wiring; the check
+    /// is only ever emitted for a repository that declares `app_under_test`,
+    /// so the default cannot perturb an unrelated report.
+    fn e2e_browsers(&self) -> DepStatus {
+        DepStatus::Missing
+    }
 }
 
 /// Production probe: PATH lookups + the `sandbox` module's usability probes.
@@ -268,6 +290,27 @@ impl DepProbe for RealProbe {
     }
     fn sandbox(&self) -> crate::sandbox::SandboxAvailability {
         crate::sandbox::sandbox_availability()
+    }
+    fn e2e_browsers(&self) -> DepStatus {
+        // Resolve the daemon-owned browsers dir the same way every other
+        // daemon path is resolved, so the probe checks the location the
+        // runtime will actually use.
+        let Ok(paths) = crate::cli::resolve_paths_from_env() else {
+            return DepStatus::Unusable {
+                reason: "could not resolve the daemon cache directory".to_string(),
+            };
+        };
+        let dir = paths.e2e_browsers_dir();
+        let populated = std::fs::read_dir(&dir)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+        if populated {
+            DepStatus::Satisfied {
+                detail: Some(dir.display().to_string()),
+            }
+        } else {
+            DepStatus::Missing
+        }
     }
     fn binary_present(&self, bin: &str) -> bool {
         if bin.contains('/') {
@@ -500,6 +543,30 @@ pub fn build_report(cfg: &Config, probe: &dyn DepProbe) -> DepReport {
         checks.push(rag_backend_check(rag, probe));
     }
 
+    // --- app-under-test-e2e: browser runtime -------------------------------
+    // Emitted ONLY for repositories that declare `app_under_test`, so a
+    // deployment that does not use the feature sees no new check. Importance
+    // is `Configured`, never `Required`: a missing runtime disables end-to-end
+    // verification for THAT repository and warns; it never aborts startup and
+    // never touches another repository. The probe runs once and its result is
+    // shared, since the runtime is daemon-owned and common to all repos.
+    let declaring: Vec<&RepositoryConfig> = cfg
+        .repositories
+        .iter()
+        .filter(|r| r.app_under_test.is_some())
+        .collect();
+    if !declaring.is_empty() {
+        let status = probe.e2e_browsers();
+        for repo in declaring {
+            checks.push(DepCheck {
+                name: format!("e2e browser runtime ({})", repo.url),
+                importance: Importance::Configured,
+                status: status.clone(),
+                install_hint: E2E_BROWSERS_MISSING_MSG.to_string(),
+            });
+        }
+    }
+
     // --- a014: expected-toolchain runnability in the agent environment ------
     // Beyond presence, verify each expected toolchain RUNS in the agent's
     // actual (captured, credential-filtered) environment, surfacing the
@@ -716,6 +783,8 @@ mod tests {
         /// a014: canned toolchain-runnability facts keyed by tool name; a tool
         /// absent from the map probes as [`ToolchainStatus::Absent`].
         toolchains: std::collections::HashMap<String, ToolchainStatus>,
+        /// app-under-test-e2e: canned browser-runtime fact.
+        e2e_browsers: DepStatus,
     }
 
     impl FakeProbe {
@@ -725,6 +794,7 @@ mod tests {
                 sandbox: SandboxAvailability::Usable { mechanism: "bwrap" },
                 present: vec!["git".into(), "claude".into(), "gh".into(), "ollama".into()],
                 toolchains: std::collections::HashMap::new(),
+                e2e_browsers: DepStatus::Satisfied { detail: None },
             }
         }
     }
@@ -744,6 +814,9 @@ mod tests {
                 .get(tool)
                 .cloned()
                 .unwrap_or(ToolchainStatus::Absent)
+        }
+        fn e2e_browsers(&self) -> DepStatus {
+            self.e2e_browsers.clone()
         }
     }
 
@@ -773,6 +846,89 @@ github:
         r.checks.iter().find(|c| c.name.contains(needle))
     }
 
+    /// `base_cfg` with an `app_under_test` block on the single repository.
+    fn cfg_with_app_under_test() -> Config {
+        const YAML: &str = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 300
+    app_under_test:
+      start_command: "npm run dev"
+      ready_check:
+        http_path: /healthz
+      e2e_command: "npx playwright test"
+executor:
+  kind: claude_cli
+  command: claude
+  timeout_secs: 1800
+github:
+  token_env: GITHUB_TOKEN
+"#;
+        let mut cfg: Config = serde_yml::from_str(YAML).expect("config parses");
+        cfg.features.scout.enabled = false;
+        cfg
+    }
+
+    #[test]
+    fn e2e_browser_check_absent_when_no_repo_declares_app_under_test() {
+        // A deployment not using the feature sees no new check at all.
+        let report = build_report(&base_cfg(), &FakeProbe::all_present());
+        assert!(find(&report, "e2e browser runtime").is_none());
+    }
+
+    #[test]
+    fn missing_e2e_browsers_warns_but_never_blocks() {
+        let mut probe = FakeProbe::all_present();
+        probe.e2e_browsers = DepStatus::Missing;
+        let report = build_report(&cfg_with_app_under_test(), &probe);
+        let check = find(&report, "e2e browser runtime").expect("check emitted for declaring repo");
+        // Configured, never Required: the daemon still starts.
+        assert!(check.is_warning(), "a missing runtime is a warning");
+        assert!(!check.is_blocking(), "it must never abort startup");
+        assert!(!report.has_blocking(), "no blocking dependency is introduced");
+        // The hint names the REMEDIATION, not just the missing component.
+        assert!(
+            check.install_hint.contains("--reconfigure"),
+            "hint names the provisioning command: {}",
+            check.install_hint
+        );
+        // The check names the repository it disables the feature for.
+        assert!(check.name.contains("owner/repo"), "names the repo: {}", check.name);
+    }
+
+    #[test]
+    fn provisioned_e2e_browsers_is_satisfied() {
+        let report = build_report(&cfg_with_app_under_test(), &FakeProbe::all_present());
+        let check = find(&report, "e2e browser runtime").expect("check emitted");
+        assert!(check.is_ok());
+        assert!(!check.is_warning());
+    }
+
+    #[test]
+    fn e2e_browser_check_is_emitted_per_declaring_repository_only() {
+        let mut cfg = cfg_with_app_under_test();
+        // A second repository WITHOUT the block: it must not get a check, and
+        // the first repo's missing runtime must not affect it.
+        let mut plain = cfg.repositories[0].clone();
+        plain.url = "git@github.com:owner/other.git".to_string();
+        plain.app_under_test = None;
+        cfg.repositories.push(plain);
+        let mut probe = FakeProbe::all_present();
+        probe.e2e_browsers = DepStatus::Missing;
+        let report = build_report(&cfg, &probe);
+        let names: Vec<&str> = report
+            .checks
+            .iter()
+            .filter(|c| c.name.contains("e2e browser runtime"))
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names.len(), 1, "exactly one check, for the declaring repo: {names:?}");
+        assert!(names[0].contains("owner/repo"));
+        assert!(!report.has_blocking(), "the other repository is unaffected");
+    }
+
     #[test]
     fn all_satisfied_has_no_blocking() {
         let report = build_report(&base_cfg(), &FakeProbe::all_present());
@@ -789,6 +945,7 @@ github:
             sandbox: SandboxAvailability::Absent,
             present: vec!["claude".into()],
             toolchains: std::collections::HashMap::new(),
+            e2e_browsers: DepStatus::Missing,
         };
         let report = build_report(&base_cfg(), &probe);
         assert_eq!(find(&report, "openspec").unwrap().status, DepStatus::Missing);

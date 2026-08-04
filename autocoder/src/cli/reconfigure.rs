@@ -40,6 +40,14 @@ pub enum ReconfigureSection {
     Audits,
     Reviewer,
     Chatops,
+    /// app-under-test-e2e: (re-)provision the end-to-end browser runtime.
+    ///
+    /// Structurally unlike its siblings: it mutates the HOST, not the config
+    /// file. That is precisely why it belongs here — the privileged half of
+    /// the toolchain needs root, and this is the one place autocoder already
+    /// runs privileged, so an existing deployment can adopt end-to-end
+    /// verification without hand-running package commands.
+    E2e,
 }
 
 const RECONFIGURE_NO_INSTALL_HINT: &str =
@@ -141,8 +149,45 @@ pub(crate) async fn execute_reconfigure(
                 io.print("no changes made\n");
             }
         }
+        // Provisions the HOST; writes no config. So it neither patches nor
+        // diffs — and it deliberately does not require any repository to
+        // declare `app_under_test` yet, so an operator can provision first
+        // and configure repositories afterwards.
+        ReconfigureSection::E2e => {
+            let paths = crate::paths::resolve_daemon_paths(&existing)?;
+            let report = crate::cli::e2e_provision::provision_e2e_toolchain(
+                io,
+                actions,
+                &paths.e2e_browsers_dir(),
+                service_account_for_mode(mode),
+                args.non_interactive,
+            )
+            .await?;
+            if report.fully_provisioned() {
+                io.print(
+                    "\nEnd-to-end runtime provisioned. Add an `app_under_test` block to any\n\
+                     repository that should be verified by running it, then restart the daemon\n\
+                     so the dependency preflight re-probes.\n",
+                );
+            } else {
+                io.print(
+                    "\nEnd-to-end runtime is NOT fully provisioned; verification stays disabled\n\
+                     for every repository declaring `app_under_test`.\n",
+                );
+            }
+        }
     }
     Ok(())
+}
+
+/// The account the daemon reads the browser runtime as. Server mode runs as
+/// the dedicated system user; dev mode runs as the invoking operator, who
+/// already owns the cache directory, so no ownership change applies.
+fn service_account_for_mode(mode: InstallMode) -> Option<&'static str> {
+    match mode {
+        InstallMode::Server => Some("autocoder"),
+        InstallMode::Dev => None,
+    }
 }
 
 fn section_label(section: ReconfigureSection) -> &'static str {
@@ -150,6 +195,7 @@ fn section_label(section: ReconfigureSection) -> &'static str {
         ReconfigureSection::Audits => "audits.defaults.*",
         ReconfigureSection::Reviewer => "reviewer:",
         ReconfigureSection::Chatops => "chatops:",
+        ReconfigureSection::E2e => "end-to-end browser runtime (host packages, not config)",
     }
 }
 

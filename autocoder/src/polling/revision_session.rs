@@ -2034,6 +2034,7 @@ mod tests {
     fn test_repo(ws: &Path) -> RepositoryConfig {
         RepositoryConfig {
             forge: None,
+            app_under_test: None,
             url: "git@github.com:o/r.git".into(),
             local_path: Some(ws.to_path_buf()),
             base_branch: "main".into(),

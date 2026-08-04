@@ -5,6 +5,8 @@ mod agent_env;
 mod agentic_run;
 mod alert_state;
 mod alert_state_migration;
+mod app_under_test;
+mod e2e_replay;
 mod alerts;
 mod attribution;
 mod audits;

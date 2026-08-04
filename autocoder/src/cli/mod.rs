@@ -87,6 +87,7 @@ pub mod blame;
 pub mod changelog;
 pub mod check_config;
 pub mod doctor;
+pub mod e2e_provision;
 pub mod inspect;
 pub mod install;
 pub mod log;

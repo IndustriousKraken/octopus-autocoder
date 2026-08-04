@@ -2635,7 +2635,7 @@ github:
         // hold the URL in the "cancelled-but-present" state we replace
         // the seeded handle with one whose backing task is parked
         // forever.
-        let parked_repo = RepositoryConfig { forge: None,
+        let parked_repo = RepositoryConfig { forge: None, app_under_test: None,
             url: url.to_string(),
             local_path: None,
             base_branch: "main".into(),
@@ -2899,7 +2899,7 @@ github:
             .expect(1)
             .create_async()
             .await;
-        let repo = RepositoryConfig { forge: None,
+        let repo = RepositoryConfig { forge: None, app_under_test: None,
             url: "git@github.com:owner/repo.git".to_string(),
             local_path: None,
             base_branch: "main".into(),
@@ -2942,6 +2942,7 @@ github:
     fn open_pr_park_repo() -> RepositoryConfig {
         RepositoryConfig {
             forge: None,
+            app_under_test: None,
             url: "git@github.com:owner/repo.git".to_string(),
             local_path: None,
             base_branch: "main".into(),

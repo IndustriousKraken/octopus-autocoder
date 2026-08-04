@@ -596,6 +596,7 @@ mod tests {
     fn repo_cfg() -> RepositoryConfig {
         RepositoryConfig {
             forge: None,
+            app_under_test: None,
             url: "https://example.com/o/r".to_string(),
             local_path: None,
             base_branch: "main".into(),

@@ -612,7 +612,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn cfg(url: &str) -> RepositoryConfig {
-        RepositoryConfig { forge: None,
+        RepositoryConfig { forge: None, app_under_test: None,
             url: url.to_string(),
             local_path: None,
             base_branch: "main".into(),
@@ -630,7 +630,7 @@ mod tests {
     }
 
     fn cfg_with_local(url: &str, local: &str) -> RepositoryConfig {
-        RepositoryConfig { forge: None,
+        RepositoryConfig { forge: None, app_under_test: None,
             url: url.to_string(),
             local_path: Some(PathBuf::from(local)),
             base_branch: "main".into(),
@@ -1546,7 +1546,7 @@ mod tests {
     }
 
     fn repo_cfg(url: &str) -> RepositoryConfig {
-        RepositoryConfig { forge: None,
+        RepositoryConfig { forge: None, app_under_test: None,
             url: url.into(),
             local_path: None,
             base_branch: "main".into(),

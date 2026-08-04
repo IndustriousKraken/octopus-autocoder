@@ -30,6 +30,37 @@ repositories:
     # to `executor.max_changes_per_pr`, then 3):
     # max_changes_per_pr: 3
     #
+    # End-to-end verification (opt-in, per repository). When present, the
+    # DAEMON — not the agent — starts this application for each pass on an
+    # ephemeral port, waits for `ready_check`, runs `e2e_command` after the
+    # executor, and guarantees teardown. The EXIT CODE of `e2e_command` is
+    # the authoritative verification signal.
+    #
+    # This block is deliberately operator-owned: it is never read from the
+    # target repository's working tree, so a session cannot alter the terms
+    # on which its own work is verified.
+    #
+    # Requires the browser runtime; provision it with
+    # `autocoder install --reconfigure` (end-to-end testing section).
+    # Absent (the default) → no application, no e2e run, no PR section.
+    # app_under_test:
+    #   start_command: "npm run dev"
+    #   # Exactly ONE of `http_path` or `command`:
+    #   ready_check:
+    #     http_path: /healthz
+    #     # command: "./scripts/ready.sh"
+    #   e2e_command: "npx playwright test"
+    #   # Workspace-relative; defaults to the workspace root:
+    #   working_dir: web
+    #   ready_timeout_secs: 60
+    #   e2e_timeout_secs: 600
+    #   # Which changed files count as end-to-end tests, for the red-green
+    #   # replay that catches tests passing without the change. Omit to use
+    #   # the built-in defaults (**/*.spec.*, **/*.test.*, **/e2e/**,
+    #   # **/tests/e2e/**). A configured list REPLACES those defaults.
+    #   e2e_test_paths:
+    #     - "tests/e2e/**"
+    #
     # Per-repo audit cadence overrides. Keys are audit type slugs (see the
     # `audits:` block below for the full list). Each entry overrides the
     # global `audits.defaults` cadence for this repo only. Cadence values:

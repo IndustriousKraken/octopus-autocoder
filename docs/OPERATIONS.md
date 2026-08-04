@@ -1031,6 +1031,58 @@ embed + cosine sim across O(1000) chunks).
 - `canonical RAG post-archive re-embed failed: <error>; prior embeds
   retained` — WARN at archive.
 
+## End-to-end verification {#end-to-end-verification}
+
+For repositories with an [`app_under_test`](CONFIG.md) block, each pass starts
+the application, hands the executor its URL, runs the suite afterwards, and
+reports the result in the pull request under `## End-to-end verification`.
+
+**What drafts a PR.** Only outcomes where something actually ran and did not
+pass:
+
+| Outcome | Pass? | Drafts the PR? |
+|---|---|---|
+| Suite exits zero | yes | no |
+| Suite exits non-zero | no | **yes** |
+| Suite times out | no | **yes** |
+| New e2e test passes against the base commit | no | **yes** |
+| No application ran (unconfigured, unprovisioned, would not start) | no | no |
+
+The last row is deliberate. An unverified change is always *visibly* unverified
+— the PR section says verification did not run and why — but a host that cannot
+run the suite does not get every PR drafted, because the feature is opt-in and
+degrades by design.
+
+**The vacuous-test replay.** A test written in the same session as the feature
+can pass without exercising it. After a passing suite, autocoder replays the
+pass's new end-to-end tests against the base commit in a scratch worktree,
+overlaying **only** the test files, and requires them to fail there. A test that
+passes without the change is not evidence: the PR drafts and names the offending
+files. The result is ambiguous by nature — the test may be vacuous, or the
+behavior may have already existed — so the work is kept and a human decides.
+
+**Cost.** Each pass with an application adds an app boot plus a suite run, and a
+replay adds a second boot and run. Bound them with `ready_timeout_secs` and
+`e2e_timeout_secs`; a timeout terminates the whole process group and is never
+reported as a pass.
+
+**Failure modes worth recognising:**
+
+- *"End-to-end verification did NOT run (…did not become ready…)"* — the dev
+  server failed to start or the readiness probe never succeeded. The pass
+  proceeds and nothing is held; check `start_command` and `ready_check` against
+  the workspace, remembering `working_dir` is workspace-relative.
+- *"…could NOT run (…)"* under the replay — the replay itself failed (a bad base
+  commit, or the app would not start from the base tree). This never drafts: an
+  unrunnable replay is not evidence of a vacuous test.
+- *Browser runtime warnings at startup* — the toolchain is unprovisioned for
+  that repository. See [INSTALL.md](INSTALL.md#7-end-to-end-testing-optional).
+
+No application process outlives its pass: the daemon owns the lifecycle and
+tears the process group down on completion, timeout, failure, panic, and
+shutdown alike. Ports are allocated per instance, so concurrently-polling
+repositories — and a pass and its replay — never contend.
+
 ## OSS contribution workflow
 
 Autocoder's default deployment model assumes the operator owns every

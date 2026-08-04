@@ -242,7 +242,7 @@ mod tests {
     }
 
     fn cfg(url: &str) -> RepositoryConfig {
-        RepositoryConfig { forge: None,
+        RepositoryConfig { forge: None, app_under_test: None,
             url: url.to_string(),
             local_path: None,
             base_branch: "main".into(),
@@ -260,7 +260,7 @@ mod tests {
     }
 
     fn cfg_local(url: &str, local: &Path) -> RepositoryConfig {
-        RepositoryConfig { forge: None,
+        RepositoryConfig { forge: None, app_under_test: None,
             url: url.to_string(),
             local_path: Some(local.to_path_buf()),
             base_branch: "main".into(),

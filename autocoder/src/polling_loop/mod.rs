@@ -32,6 +32,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
+mod e2e_step;
 mod alerts_throttle;
 pub(crate) use alerts_throttle::*;
 mod alerts_comment;

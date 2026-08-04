@@ -61,6 +61,17 @@ pub struct PushBlock {
     /// Rendered `## Gate verdicts` PR body section from the original pass.
     #[serde(default)]
     pub gate_verdicts_section: Option<String>,
+    /// app-under-test-e2e: rendered `## End-to-end verification` PR body
+    /// section from the original pass.
+    ///
+    /// Carried on the marker for the same reason as the sections above: the
+    /// held work is delivered by a LATER pass, which will not re-run the
+    /// suite (the application for that earlier pass is long gone). Re-deriving
+    /// it later would be impossible; omitting it would silently drop the
+    /// verification record from the eventual PR. `#[serde(default)]` keeps
+    /// markers written before this field readable.
+    #[serde(default)]
+    pub e2e_section: Option<String>,
 }
 
 fn basename(workspace: &Path) -> String {
@@ -131,6 +142,7 @@ mod tests {
             review_report: None,
             spec_verification_section: None,
             gate_verdicts_section: None,
+            e2e_section: None,
         };
         write(&paths, &ws, &marker).unwrap();
         assert!(exists(&paths, &ws));

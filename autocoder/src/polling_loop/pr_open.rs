@@ -133,6 +133,7 @@ pub(crate) async fn open_pull_request(
     workspace: &Path,
     spec_verification_section: Option<&str>,
     gate_verdicts_section: Option<&str>,
+    e2e_section: Option<&str>,
 ) -> Result<()> {
     let (owner, repo_name) = github::parse_repo_url(&repo.url)?;
     // PAT routing uses the UPSTREAM owner, not the fork owner — the PR is
@@ -150,6 +151,7 @@ pub(crate) async fn open_pull_request(
         workspace,
         spec_verification_section,
         gate_verdicts_section,
+        e2e_section,
     );
 
     // In fork-PR mode the `head` is namespaced `<fork-owner>:<branch>` for
@@ -289,6 +291,7 @@ fn build_open_pr_title_body(
     workspace: &Path,
     spec_verification_section: Option<&str>,
     gate_verdicts_section: Option<&str>,
+    e2e_section: Option<&str>,
 ) -> (String, String) {
     let (title, mut body) = if changes.is_empty() {
         let range = format!("{}..{}", repo.base_branch, repo.agent_branch);
@@ -319,6 +322,16 @@ fn build_open_pr_title_body(
     // `## Code Review` block (which is appended downstream from
     // `review_report`). Absent when the gate is disabled, produced no verdict
     // (advisory failure), OR the iteration is audit-only.
+    // app-under-test-e2e: splice the `## End-to-end verification` section —
+    // what running the software actually established, as opposed to what
+    // reading it suggested. Emitted even when nothing ran, because silence
+    // would read as "no end-to-end concern".
+    if let Some(section) = e2e_section
+        && !section.trim().is_empty()
+    {
+        body.push_str("\n\n");
+        body.push_str(section.trim_end());
+    }
     if let Some(section) = spec_verification_section
         && !section.trim().is_empty()
     {

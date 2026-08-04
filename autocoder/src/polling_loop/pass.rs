@@ -153,6 +153,15 @@ pub async fn execute_one_pass(
             park: "open agent-branch PR — skip-iteration gate active".to_string(),
         });
     }
+    // app-under-test-e2e: capture the commit the agent branch was recreated
+    // from BEFORE any work lands on it — the red-green replay needs the
+    // pre-change tree, and after commits `HEAD` is no longer it.
+    let e2e_base = git::rev_parse(workspace, &format!("origin/{}", repo.base_branch)).ok();
+    // Start the application BEFORE the executor so the implementer prompt can
+    // carry the "Application under test" block. Held for the rest of the pass:
+    // dropping it tears the process group down.
+    let pass_app = super::e2e_step::start_app_for_pass(paths, workspace, repo).await;
+
     let (processed, processed_issues, includes_self_heal) = run_pass_through_commits(
         paths,
         workspace,
@@ -173,7 +182,7 @@ pub async fn execute_one_pass(
         return Ok(outcome);
     }
 
-    let (review_report, draft, reviewer_revision_concerns) = run_reviewer_step(
+    let (review_report, mut draft, reviewer_revision_concerns) = run_reviewer_step(
         workspace,
         repo,
         &processed,
@@ -191,6 +200,18 @@ pub async fn execute_one_pass(
     // during the queue walk (persisted under `.git/`); seed the PR ledger from
     // the processed changes so a `PASS` is VISIBLE in the PR (not inferred from
     // the silent absence of an alert).
+    // app-under-test-e2e: run the suite against the application, then replay
+    // the pass's new end-to-end tests against the base commit. A failing suite,
+    // a timeout, or a test that passes without the change drafts the PR; an
+    // application that never ran is reported but never drafts.
+    let e2e_verification =
+        super::e2e_step::verify_pass(paths, workspace, repo, &pass_app, e2e_base.as_deref()).await;
+    super::e2e_step::finish_pass_app(paths, workspace, pass_app);
+    let e2e_section = e2e_verification.as_ref().map(|v| v.section.clone());
+    if e2e_verification.as_ref().is_some_and(|v| v.drafts_pr) {
+        draft = true;
+    }
+
     let mut gate_ledger = seed_ledger_from_processed(workspace, &processed);
 
     // a63: the `[out]` gate — code-implements-spec verification. Runs AFTER
@@ -250,6 +271,7 @@ pub async fn execute_one_pass(
             review_report.as_ref(),
             spec_verification_section.as_deref(),
             gate_verdicts_section.as_deref(),
+            e2e_section.as_deref(),
         );
         handle_predictable_failure(
             paths,
@@ -281,6 +303,7 @@ pub async fn execute_one_pass(
         workspace,
         spec_verification_section.as_deref(),
         gate_verdicts_section.as_deref(),
+        e2e_section.as_deref(),
     )
     .await
     {
@@ -302,6 +325,7 @@ pub async fn execute_one_pass(
             review_report.as_ref(),
             spec_verification_section.as_deref(),
             gate_verdicts_section.as_deref(),
+            e2e_section.as_deref(),
         );
         return Err(e);
     }
@@ -437,6 +461,7 @@ async fn resume_push_block(
         workspace,
         marker.spec_verification_section.as_deref(),
         marker.gate_verdicts_section.as_deref(),
+        marker.e2e_section.as_deref(),
     )
     .await
     {
@@ -490,6 +515,7 @@ pub(crate) fn write_push_block_hold(
     review_report: Option<&ReviewReport>,
     spec_verification_section: Option<&str>,
     gate_verdicts_section: Option<&str>,
+    e2e_section: Option<&str>,
 ) {
     if processed.is_empty() && processed_issues.is_empty() {
         return;
@@ -506,6 +532,7 @@ pub(crate) fn write_push_block_hold(
                 review_report: review_report.cloned(),
                 spec_verification_section: spec_verification_section.map(str::to_string),
                 gate_verdicts_section: gate_verdicts_section.map(str::to_string),
+                e2e_section: e2e_section.map(str::to_string),
             };
             match crate::push_block::write(paths, workspace, &marker) {
                 Ok(()) => tracing::warn!(

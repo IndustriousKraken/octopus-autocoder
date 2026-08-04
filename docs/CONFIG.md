@@ -591,6 +591,58 @@ executor:
   max_revise_triggers_per_pr: 10   # opt-in; default is unlimited (None)
 ```
 
+## `app_under_test:` (optional, per repository)
+
+Declares a runnable application so autocoder can verify a change by **running**
+the software, not only by reading the diff. Without it, every check in the
+pipeline is a static reader — which is exactly how a feature that is
+implemented but never wired to the interface passes review and reaches you
+broken.
+
+Opt-in per repository. A repository without the block behaves exactly as it did
+before this feature existed: no application, no end-to-end run, no PR section.
+
+```yaml
+repositories:
+  - url: "git@github.com:you/app.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 300
+    app_under_test:
+      start_command: "npm run dev"
+      ready_check:
+        http_path: /healthz        # OR: command: "./scripts/ready.sh"
+      e2e_command: "npx playwright test"
+      working_dir: web             # optional, workspace-relative
+      ready_timeout_secs: 60       # optional
+      e2e_timeout_secs: 600        # optional
+      e2e_test_paths:              # optional; REPLACES the defaults
+        - "tests/e2e/**"
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `start_command` | yes | Starts the application. The allocated port arrives as `$PORT`; the base URL as `$APP_UNDER_TEST_URL`. |
+| `ready_check` | yes | Exactly one of `http_path` (polled until 2xx) or `command` (exits zero when ready). |
+| `e2e_command` | yes | Runs the suite. **Its exit code is the authoritative verification signal.** |
+| `working_dir` | no | Workspace-relative; defaults to the workspace root. Absolute paths and `..` are rejected. |
+| `ready_timeout_secs` | no | Default 60. |
+| `e2e_timeout_secs` | no | Default 600. A timeout is never a pass. |
+| `e2e_test_paths` | no | Globs identifying end-to-end tests. Defaults: `**/*.spec.*`, `**/*.test.*`, `**/e2e/**`, `**/tests/e2e/**`. A configured list **replaces** the defaults. |
+
+**This block is operator-owned by design.** It is read only from autocoder's
+own configuration and never from the target repository's working tree, so a
+working session cannot alter the terms on which its own work is verified —
+the same principle that keeps canon and the gates out of agent reach.
+
+**The daemon owns the application lifecycle**, not the agent: it allocates an
+ephemeral port per instance (so concurrently-polling repositories cannot
+collide), starts the app, waits for readiness, and tears the process group down
+on every exit path including timeout, failure, panic, and shutdown.
+
+Requires the browser runtime when the suite drives a browser — see
+[INSTALL.md](INSTALL.md#7-end-to-end-testing-optional).
+
 ## `paths:` (optional)
 
 Operator-visible overrides for the four daemon data directories. Each

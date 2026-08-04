@@ -470,7 +470,9 @@ impl ClaudeCliExecutor {
             ));
         }
         let rendered = self.template.replace(PROMPT_BODY_PLACEHOLDER, &body);
-        Ok(append_iteration_continuation_block(&self.paths, workspace, change, rendered))
+        let rendered =
+            append_iteration_continuation_block(&self.paths, workspace, change, rendered);
+        Ok(append_app_under_test_block(&self.paths, workspace, rendered))
     }
 
     /// Build the revision-mode prompt for `change` by running `openspec
@@ -1278,6 +1280,62 @@ pub(crate) fn append_iteration_continuation_block(
             rendered
         }
     }
+}
+
+/// app-under-test-e2e: append the "Application under test" block when the
+/// daemon has an application running for this pass.
+///
+/// Presence of the session record IS the condition — no application, no block,
+/// and the prompt renders byte-identically to its pre-feature form. Mirrors
+/// [`append_iteration_continuation_block`]: conditional, read from the state
+/// dir, and degrading to "absent" on a corrupt record.
+pub(crate) fn append_app_under_test_block(
+    paths: &crate::paths::DaemonPaths,
+    workspace: &Path,
+    rendered: String,
+) -> String {
+    let basename = crate::workspace::basename(workspace);
+    match crate::app_under_test::read_session_record(paths, basename) {
+        Some(record) => {
+            let block = render_app_under_test_block(&record);
+            format!("{rendered}\n{block}")
+        }
+        None => rendered,
+    }
+}
+
+/// Canonical "Application under test" block.
+///
+/// States the exit-code contract explicitly because it is the whole point of
+/// the feature: the agent must not conclude the work is verified from a
+/// screenshot or its own reading. Deliberately carries no instruction that
+/// depends on reading images, so the block means the same thing through every
+/// `CliStrategy` regardless of that CLI's image support.
+fn render_app_under_test_block(record: &crate::app_under_test::AppSessionRecord) -> String {
+    format!(
+        "--- BEGIN APPLICATION UNDER TEST ---\n\
+\n\
+A running instance of this application is available at {base_url} for the\n\
+duration of this run. The daemon started it and will stop it; do NOT assume\n\
+it persists beyond this run.\n\
+\n\
+Behavior described by the change's scenarios SHALL be verified by an\n\
+end-to-end test that actually exercises it, NOT asserted in prose. A feature\n\
+that is implemented but never wired to the interface passes a reading of the\n\
+diff and fails a run of the application — running it is the point.\n\
+\n\
+The verification command is: {e2e_command}\n\
+Its EXIT CODE is the authoritative signal. Screenshots and other captured\n\
+artifacts are debugging aids for your own loop; they are never the pass/fail\n\
+signal, and neither is your own summary of what you did.\n\
+\n\
+A test that passes without your change is not evidence. New end-to-end tests\n\
+are replayed against the pre-change tree AND are expected to FAIL there; one\n\
+that passes against the base commit will be reported as such.\n\
+--- END APPLICATION UNDER TEST ---\n",
+        base_url = record.base_url,
+        e2e_command = record.e2e_command,
+    )
 }
 
 /// Canonical "Prior iteration summary" block. Mirrors the executor
@@ -2534,6 +2592,91 @@ mod tests {
         assert!(
             !prompt.contains("--- BEGIN PRIOR ITERATION SUMMARY ---"),
             "first-iteration prompt must not contain continuation block: {prompt}"
+        );
+    }
+
+    /// app-under-test-e2e: no running application → the block is absent AND
+    /// the prompt is BYTE-IDENTICAL to its pre-feature rendering. The
+    /// byte-equality is the point: a repository not using the feature must be
+    /// unaffected, and "roughly the same" would let the block leak in.
+    #[tokio::test]
+    async fn build_prompt_without_running_app_is_byte_identical() {
+        let (_dir, ws) = fixture_workspace();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let paths = std::sync::Arc::new(paths);
+        let executor =
+            ClaudeCliExecutor::new("/bin/true".into(), 30, paths.clone());
+
+        let baseline = executor.build_prompt(&ws, "x").unwrap();
+        assert!(!baseline.contains("--- BEGIN APPLICATION UNDER TEST ---"));
+
+        // Write then clear a record: the cleared state must render exactly
+        // like the never-written state.
+        let basename = crate::workspace::basename(&ws);
+        crate::app_under_test::write_session_record(
+            &paths,
+            basename,
+            &crate::app_under_test::AppSessionRecord {
+                base_url: "http://127.0.0.1:5555".into(),
+                e2e_command: "npx playwright test".into(),
+            },
+        )
+        .unwrap();
+        let with_app = executor.build_prompt(&ws, "x").unwrap();
+        assert!(with_app.contains("--- BEGIN APPLICATION UNDER TEST ---"));
+
+        crate::app_under_test::clear_session_record(&paths, basename);
+        let after_clear = executor.build_prompt(&ws, "x").unwrap();
+        assert_eq!(after_clear, baseline, "cleared record renders byte-identically");
+    }
+
+    /// app-under-test-e2e: the block carries the runtime facts verbatim AND
+    /// states the exit-code contract, which is the whole point of the feature.
+    #[tokio::test]
+    async fn build_prompt_with_running_app_states_the_exit_code_contract() {
+        let (_dir, ws) = fixture_workspace();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let paths = std::sync::Arc::new(paths);
+        let executor = ClaudeCliExecutor::new("/bin/true".into(), 30, paths.clone());
+        crate::app_under_test::write_session_record(
+            &paths,
+            crate::workspace::basename(&ws),
+            &crate::app_under_test::AppSessionRecord {
+                base_url: "http://127.0.0.1:53124".into(),
+                e2e_command: "npx playwright test".into(),
+            },
+        )
+        .unwrap();
+
+        let prompt = executor.build_prompt(&ws, "x").unwrap();
+        assert!(prompt.contains("http://127.0.0.1:53124"), "base URL verbatim");
+        assert!(prompt.contains("npx playwright test"), "e2e command verbatim");
+        assert!(prompt.contains("EXIT CODE"), "names the authoritative signal");
+        // Nothing in the block may depend on the CLI being able to read
+        // images — the contract must mean the same through every strategy.
+        assert!(
+            !prompt.to_lowercase().contains("look at the screenshot"),
+            "no instruction that presumes image reading"
+        );
+    }
+
+    /// A corrupt record degrades to the no-application prompt rather than
+    /// failing the pass.
+    #[tokio::test]
+    async fn corrupt_app_record_renders_as_no_application() {
+        let (_dir, ws) = fixture_workspace();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let paths = std::sync::Arc::new(paths);
+        let basename = crate::workspace::basename(&ws);
+        let path = paths.app_under_test_path(basename);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+
+        let executor = ClaudeCliExecutor::new("/bin/true".into(), 30, paths.clone());
+        let prompt = executor.build_prompt(&ws, "x").unwrap();
+        assert!(
+            !prompt.contains("--- BEGIN APPLICATION UNDER TEST ---"),
+            "corrupt record omits the block instead of failing"
         );
     }
 

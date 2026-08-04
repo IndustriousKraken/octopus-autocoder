@@ -2244,7 +2244,7 @@ mod tests {
     use std::sync::Mutex;
 
     fn make_repo(url: &str) -> RepositoryConfig {
-        RepositoryConfig { forge: None,
+        RepositoryConfig { forge: None, app_under_test: None,
             url: url.to_string(),
             local_path: None,
             base_branch: "main".to_string(),

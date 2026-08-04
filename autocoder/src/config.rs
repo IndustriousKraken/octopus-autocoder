@@ -1036,10 +1036,199 @@ pub struct RepositoryConfig {
     /// configurations need no block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forge: Option<ForgeConfig>,
+    /// app-under-test-e2e: optional declaration of a runnable application the
+    /// daemon starts for a pass so end-to-end verification can execute. Absent
+    /// (the default) → no application, no e2e run, no prompt block, no PR
+    /// section: byte-identical behavior to before the feature existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_under_test: Option<AppUnderTestConfig>,
 }
 
 fn default_auto_submit_pr() -> bool {
     true
+}
+
+/// Floor for both `app_under_test` timeouts. Only a configured `0` is
+/// rejected; any positive value is the operator's deliberate choice and is
+/// honored verbatim (mirrors the `max_changes_per_pr` zero-clamp precedent).
+pub const APP_UNDER_TEST_TIMEOUT_FLOOR_SECS: u64 = 1;
+
+pub fn default_app_ready_timeout_secs() -> u64 {
+    60
+}
+
+pub fn default_app_e2e_timeout_secs() -> u64 {
+    600
+}
+
+/// Clamp an `app_under_test` timeout to `[1, ..)`. Returns
+/// `(clamped, Option<warn_message>)`; `field` names the full config path so
+/// the WARN is actionable (e.g. `repositories[2].app_under_test.e2e_timeout_secs`).
+pub fn clamp_app_under_test_timeout(requested: u64, field: &str) -> (u64, Option<String>) {
+    if requested < APP_UNDER_TEST_TIMEOUT_FLOOR_SECS {
+        let msg = format!(
+            "{field} ({requested}) is below the floor of \
+             {APP_UNDER_TEST_TIMEOUT_FLOOR_SECS}; clamping to \
+             {APP_UNDER_TEST_TIMEOUT_FLOOR_SECS}"
+        );
+        tracing::warn!("{msg}");
+        (APP_UNDER_TEST_TIMEOUT_FLOOR_SECS, Some(msg))
+    } else {
+        (requested, None)
+    }
+}
+
+/// How the daemon decides the application under test is ready to serve.
+/// Exactly ONE field is set; the other is `None`.
+///
+/// Deliberately a two-optional-field struct rather than a Rust enum:
+/// `serde_yml` renders an externally-tagged enum as a YAML *tag*
+/// (`ready_check: !http_path /healthz`), which is an unusual shape to ask an
+/// operator to write. A struct keeps the conventional map form:
+///
+/// ```yaml
+/// ready_check:
+///   http_path: /healthz     # OR: command: "./scripts/ready.sh"
+/// ```
+///
+/// "Exactly one" is enforced by [`AppUnderTestConfig::validate`] at config
+/// load, so neither-set and both-set are load-time errors rather than
+/// surprises at pass time.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadyCheck {
+    /// An HTTP path polled against the allocated port until it responds 2xx.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_path: Option<String>,
+    /// A shell command that exits zero once the application is ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+impl ReadyCheck {
+    /// Validate the exactly-one-non-empty invariant. `prefix` names the
+    /// config path for the error message.
+    fn validate(&self, prefix: &str) -> Result<()> {
+        let http = self.http_path.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let cmd = self.command.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        match (self.http_path.is_some(), self.command.is_some()) {
+            (true, true) => anyhow::bail!(
+                "{prefix}.ready_check sets both `http_path` and `command`; set exactly one"
+            ),
+            (false, false) => anyhow::bail!(
+                "{prefix}.ready_check must set either `http_path` or `command`"
+            ),
+            _ => {}
+        }
+        if http.is_none() && cmd.is_none() {
+            anyhow::bail!("{prefix}.ready_check value must not be empty");
+        }
+        Ok(())
+    }
+}
+
+/// app-under-test-e2e: per-repo declaration of a runnable application the
+/// daemon starts for a pass so end-to-end verification can execute against
+/// real behavior rather than a static reading of the diff.
+///
+/// Operator-owned by design: this block is read ONLY from autocoder's own
+/// configuration, NEVER from the target repository's working tree, so a
+/// working session cannot alter the terms on which its own work is verified
+/// — the same principle that keeps canon and the gates out of agent reach.
+///
+/// The daemon (not the agent) owns the lifecycle: it allocates an ephemeral
+/// port per application instance, runs `start_command`, waits for
+/// `ready_check`, and guarantees teardown on every exit path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppUnderTestConfig {
+    /// Shell command that starts the application. The allocated ephemeral
+    /// port is supplied to it through the environment.
+    pub start_command: String,
+    /// How the daemon decides the application is ready to serve.
+    pub ready_check: ReadyCheck,
+    /// Shell command that runs the end-to-end suite. Its EXIT CODE is the
+    /// authoritative verification signal — no agent narrative, screenshot
+    /// interpretation, or self-report substitutes for it.
+    pub e2e_command: String,
+    /// Workspace-relative working directory for the three commands.
+    /// Absent → the workspace root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// Seconds to wait for `ready_check` to succeed before giving up on the
+    /// application for this pass. A readiness failure never holds the queue.
+    #[serde(default = "default_app_ready_timeout_secs")]
+    pub ready_timeout_secs: u64,
+    /// Wall-clock bound on `e2e_command`. A timeout is a non-passing outcome,
+    /// never reported as a pass.
+    #[serde(default = "default_app_e2e_timeout_secs")]
+    pub e2e_timeout_secs: u64,
+    /// Workspace-relative glob patterns identifying this repository's
+    /// end-to-end tests, used by the red-green replay to decide which changed
+    /// files to overlay onto the base tree.
+    ///
+    /// Absent → [`DEFAULT_E2E_TEST_PATHS`]. Present → REPLACES the defaults
+    /// rather than extending them, so an operator whose layout the defaults
+    /// misidentify can state the truth for their repository instead of
+    /// fighting an inherited pattern.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e2e_test_paths: Option<Vec<String>>,
+}
+
+/// Built-in glob patterns identifying end-to-end tests when a repository does
+/// not declare `e2e_test_paths`. Covers the conventional JS/TS layouts this
+/// feature primarily targets; anything else declares its own.
+pub const DEFAULT_E2E_TEST_PATHS: &[&str] =
+    &["**/*.spec.*", "**/*.test.*", "**/e2e/**", "**/tests/e2e/**"];
+
+impl AppUnderTestConfig {
+    /// The effective end-to-end test patterns: the operator's list when
+    /// declared, else the built-in defaults.
+    pub fn resolved_e2e_test_paths(&self) -> Vec<String> {
+        match self.e2e_test_paths.as_ref() {
+            Some(p) if !p.is_empty() => p.clone(),
+            // An explicitly-empty list is treated as "unset" rather than
+            // "match nothing": the latter would silently disable the replay
+            // in a way that reads like configuration.
+            _ => DEFAULT_E2E_TEST_PATHS.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Resolved readiness timeout with the zero-clamp applied. `repo_index`
+    /// composes the field path named in the WARN.
+    pub fn resolved_ready_timeout_secs(&self, repo_index: usize) -> u64 {
+        clamp_app_under_test_timeout(
+            self.ready_timeout_secs,
+            &format!("repositories[{repo_index}].app_under_test.ready_timeout_secs"),
+        )
+        .0
+    }
+
+    /// Resolved end-to-end timeout with the zero-clamp applied.
+    pub fn resolved_e2e_timeout_secs(&self, repo_index: usize) -> u64 {
+        clamp_app_under_test_timeout(
+            self.e2e_timeout_secs,
+            &format!("repositories[{repo_index}].app_under_test.e2e_timeout_secs"),
+        )
+        .0
+    }
+
+    /// Reject a present-but-empty command or readiness probe. Serde already
+    /// rejects an ABSENT required field; this catches the whitespace-only
+    /// form serde accepts. `repo_index` names the offending entry.
+    pub fn validate(&self, repo_index: usize) -> Result<()> {
+        let prefix = format!("repositories[{repo_index}].app_under_test");
+        for (field, value) in [
+            ("start_command", self.start_command.as_str()),
+            ("e2e_command", self.e2e_command.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                anyhow::bail!("{prefix}.{field} must not be empty");
+            }
+        }
+        self.ready_check.validate(&prefix)?;
+        Ok(())
+    }
 }
 
 /// a008: which forge-provider implementation serves a repository's forge
@@ -3355,6 +3544,19 @@ impl Config {
             let (clamped, _) = clamp_busy_marker_stale_threshold_secs(raw);
             cfg.executor.busy_marker_stale_threshold_secs = Some(clamped);
         }
+        // app-under-test-e2e: reject a present-but-empty command AND surface
+        // the zero-clamp WARN once, here at load. The raw timeout values are
+        // deliberately RETAINED on the loaded `Config` (the
+        // `max_changes_per_pr` precedent) so operator-visible diagnostics show
+        // what was configured; `resolved_*_timeout_secs` applies the clamp at
+        // use time.
+        for (idx, repo) in cfg.repositories.iter().enumerate() {
+            if let Some(app) = repo.app_under_test.as_ref() {
+                app.validate(idx)?;
+                let _ = app.resolved_ready_timeout_secs(idx);
+                let _ = app.resolved_e2e_timeout_secs(idx);
+            }
+        }
         if let Some(slack) = cfg
             .chatops
             .as_mut()
@@ -4785,6 +4987,15 @@ github:
             "chatops",
             "audits",
             // `RepositoryConfig`.
+            // app-under-test-e2e: the per-repo e2e block and its sub-fields.
+            "app_under_test",
+            "start_command",
+            "ready_check",
+            "http_path",
+            "e2e_command",
+            "ready_timeout_secs",
+            "e2e_timeout_secs",
+            "e2e_test_paths",
             "local_path",
             "base_branch",
             "agent_branch",
@@ -5071,6 +5282,146 @@ github:
             exec.agentic_session_timeout(),
             std::time::Duration::from_secs(default_agentic_session_timeout())
         );
+    }
+
+    /// A single-repo config carrying an `app_under_test` block. `extra` is
+    /// spliced into the block so each test varies one facet.
+    fn app_under_test_yaml(extra: &str) -> String {
+        format!(
+            r#"
+repositories:
+  - url: "git@github.com:owner/repo-a.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 300
+    app_under_test:
+      start_command: "npm run dev"
+      ready_check:
+        http_path: /healthz
+      e2e_command: "npx playwright test"
+{extra}
+executor:
+  kind: claude_cli
+  command: claude
+github:
+  token_env: GITHUB_TOKEN
+"#
+        )
+    }
+
+    #[test]
+    fn app_under_test_absent_is_none() {
+        let (_dir, path) = write_config(VALID_TWO_REPO_YAML);
+        let cfg = Config::load_from(&path).expect("config without the block parses");
+        // Absent config is never an error and never synthesizes a block.
+        assert!(cfg.repositories.iter().all(|r| r.app_under_test.is_none()));
+    }
+
+    #[test]
+    fn app_under_test_parses_with_documented_defaults() {
+        let (_dir, path) = write_config(&app_under_test_yaml(""));
+        let cfg = Config::load_from(&path).expect("block parses");
+        let app = cfg.repositories[0]
+            .app_under_test
+            .as_ref()
+            .expect("block present");
+        assert_eq!(app.start_command, "npm run dev");
+        assert_eq!(app.e2e_command, "npx playwright test");
+        assert_eq!(app.ready_check.http_path.as_deref(), Some("/healthz"));
+        assert!(app.ready_check.command.is_none());
+        assert!(app.working_dir.is_none(), "working_dir defaults to the workspace root");
+        assert_eq!(app.ready_timeout_secs, default_app_ready_timeout_secs());
+        assert_eq!(app.e2e_timeout_secs, default_app_e2e_timeout_secs());
+    }
+
+    #[test]
+    fn app_under_test_ready_check_accepts_command_variant() {
+        let yaml = app_under_test_yaml("").replace(
+            "      ready_check:\n        http_path: /healthz\n",
+            "      ready_check:\n        command: \"./scripts/ready.sh\"\n",
+        );
+        let (_dir, path) = write_config(&yaml);
+        let cfg = Config::load_from(&path).expect("command variant parses");
+        let rc = &cfg.repositories[0].app_under_test.as_ref().unwrap().ready_check;
+        assert_eq!(rc.command.as_deref(), Some("./scripts/ready.sh"));
+        assert!(rc.http_path.is_none());
+    }
+
+    #[test]
+    fn ready_check_requires_exactly_one_probe() {
+        // Neither set.
+        let neither = app_under_test_yaml("").replace(
+            "      ready_check:\n        http_path: /healthz\n",
+            "      ready_check: {}\n",
+        );
+        let (_d1, p1) = write_config(&neither);
+        let e1 = format!("{:#}", Config::load_from(&p1).expect_err("neither probe is an error"));
+        assert!(e1.contains("either `http_path` or `command`"), "got: {e1}");
+
+        // Both set.
+        let both = app_under_test_yaml("").replace(
+            "        http_path: /healthz\n",
+            "        http_path: /healthz\n        command: \"./ready.sh\"\n",
+        );
+        let (_d2, p2) = write_config(&both);
+        let e2 = format!("{:#}", Config::load_from(&p2).expect_err("both probes is an error"));
+        assert!(e2.contains("set exactly one"), "got: {e2}");
+    }
+
+    #[test]
+    fn app_under_test_empty_command_is_rejected_naming_the_entry() {
+        let yaml = app_under_test_yaml("")
+            .replace("start_command: \"npm run dev\"", "start_command: \"   \"");
+        let (_dir, path) = write_config(&yaml);
+        let err = Config::load_from(&path).expect_err("whitespace-only command is rejected");
+        let msg = format!("{err:#}");
+        // Names the offending repository entry AND the field.
+        assert!(msg.contains("repositories[0].app_under_test.start_command"), "got: {msg}");
+    }
+
+    #[test]
+    fn app_under_test_missing_required_field_is_rejected() {
+        let yaml = app_under_test_yaml("").replace(
+            "      e2e_command: \"npx playwright test\"\n",
+            "",
+        );
+        let (_dir, path) = write_config(&yaml);
+        Config::load_from(&path).expect_err("a missing required command is rejected, not defaulted");
+    }
+
+    #[test]
+    fn app_under_test_unknown_field_is_rejected() {
+        let (_dir, path) = write_config(&app_under_test_yaml("      browser: firefox"));
+        Config::load_from(&path).expect_err("deny_unknown_fields rejects a stray key");
+    }
+
+    #[test]
+    fn app_under_test_zero_timeout_clamps_but_retains_the_raw_value() {
+        let (_dir, path) = write_config(&app_under_test_yaml(
+            "      ready_timeout_secs: 0\n      e2e_timeout_secs: 0",
+        ));
+        let cfg = Config::load_from(&path).expect("zero is clamped, not rejected");
+        let app = cfg.repositories[0].app_under_test.as_ref().unwrap();
+        // Raw values survive on the loaded Config so diagnostics show what
+        // was configured (the `max_changes_per_pr` precedent)...
+        assert_eq!(app.ready_timeout_secs, 0);
+        assert_eq!(app.e2e_timeout_secs, 0);
+        // ...while the resolved accessors apply the floor.
+        assert_eq!(app.resolved_ready_timeout_secs(0), APP_UNDER_TEST_TIMEOUT_FLOOR_SECS);
+        assert_eq!(app.resolved_e2e_timeout_secs(0), APP_UNDER_TEST_TIMEOUT_FLOOR_SECS);
+    }
+
+    #[test]
+    fn app_under_test_clamp_warns_naming_the_field_path() {
+        let (clamped, warn) = clamp_app_under_test_timeout(
+            0,
+            "repositories[2].app_under_test.e2e_timeout_secs",
+        );
+        assert_eq!(clamped, APP_UNDER_TEST_TIMEOUT_FLOOR_SECS);
+        let msg = warn.expect("a clamped value produces a warning");
+        assert!(msg.contains("repositories[2].app_under_test.e2e_timeout_secs"), "got: {msg}");
+        // A positive value is the operator's deliberate choice: honored, no warning.
+        assert_eq!(clamp_app_under_test_timeout(3, "f"), (3, None));
     }
 
     #[test]
@@ -6101,7 +6452,7 @@ chatops:
 
     #[test]
     fn repo_overrides_channel() {
-        let repo_with_override = RepositoryConfig { forge: None,
+        let repo_with_override = RepositoryConfig { forge: None, app_under_test: None,
             url: "x".into(),
             local_path: None,
             base_branch: "main".into(),
@@ -6118,7 +6469,7 @@ chatops:
         };
         assert_eq!(repo_with_override.chatops_channel("C_DEFAULT"), "C_REPO_LEVEL");
 
-        let repo_default = RepositoryConfig { forge: None,
+        let repo_default = RepositoryConfig { forge: None, app_under_test: None,
             url: "x".into(),
             local_path: None,
             base_branch: "main".into(),
@@ -8216,7 +8567,7 @@ github: {}
     // -----------------------------------------------------------------
 
     fn make_repo(url: &str, audits: Option<HashMap<String, Cadence>>) -> RepositoryConfig {
-        RepositoryConfig { forge: None,
+        RepositoryConfig { forge: None, app_under_test: None,
             url: url.into(),
             local_path: None,
             base_branch: "main".into(),

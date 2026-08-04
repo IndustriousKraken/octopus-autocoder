@@ -294,7 +294,7 @@ async fn pr_opened_notification_fires_when_enabled() {
         failure_alerts_enabled: true,
         pr_opened_enabled: true,
     };
-    let repo = RepositoryConfig { forge: None,
+    let repo = RepositoryConfig { forge: None, app_under_test: None,
         url: "git@github.com:owner/repo.git".into(),
         local_path: None,
         base_branch: "main".into(),
@@ -337,7 +337,7 @@ async fn pr_opened_notification_suppressed_when_disabled() {
         failure_alerts_enabled: true,
         pr_opened_enabled: false,
     };
-    let repo = RepositoryConfig { forge: None,
+    let repo = RepositoryConfig { forge: None, app_under_test: None,
         url: "git@github.com:owner/repo.git".into(),
         local_path: None,
         base_branch: "main".into(),
@@ -381,7 +381,7 @@ async fn pr_opened_notification_failure_does_not_propagate() {
         failure_alerts_enabled: true,
         pr_opened_enabled: true,
     };
-    let repo = RepositoryConfig { forge: None,
+    let repo = RepositoryConfig { forge: None, app_under_test: None,
         url: "git@github.com:owner/repo.git".into(),
         local_path: None,
         base_branch: "main".into(),
@@ -433,7 +433,7 @@ async fn refork_notification_fires_when_failure_alerts_enabled() {
         failure_alerts_enabled: true,
         pr_opened_enabled: true,
     };
-    let repo = RepositoryConfig { forge: None,
+    let repo = RepositoryConfig { forge: None, app_under_test: None,
         url: "git@github.com:owner/repo.git".into(),
         local_path: None,
         base_branch: "main".into(),
@@ -471,7 +471,7 @@ async fn refork_notification_suppressed_when_failure_alerts_disabled() {
         failure_alerts_enabled: false,
         pr_opened_enabled: true,
     };
-    let repo = RepositoryConfig { forge: None,
+    let repo = RepositoryConfig { forge: None, app_under_test: None,
         url: "git@github.com:owner/repo.git".into(),
         local_path: None,
         base_branch: "main".into(),

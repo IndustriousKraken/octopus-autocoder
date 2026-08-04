@@ -2501,7 +2501,7 @@ mod tests {
     }
 
     fn cfg_with(local: PathBuf) -> RepositoryConfig {
-        RepositoryConfig { forge: None,
+        RepositoryConfig { forge: None, app_under_test: None,
             url: format!("git@github.com:fixture/{}.git", local.file_name().unwrap().to_string_lossy()),
             local_path: Some(local),
             base_branch: "main".into(),
@@ -2526,7 +2526,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn repo(url: &str) -> RepositoryConfig {
-        RepositoryConfig { forge: None,
+        RepositoryConfig { forge: None, app_under_test: None,
             url: url.into(),
             local_path: None,
             base_branch: "main".into(),

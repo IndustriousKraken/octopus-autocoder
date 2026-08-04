@@ -221,6 +221,7 @@ async fn committed_guide_files_ride_auto_submit_pr_false_as_branch_pushed_no_pr(
         &ws,
         None,
         None,
+        None,
     )
     .await;
     test_hooks::set_github_api_base(None);
@@ -279,6 +280,7 @@ async fn committed_guide_files_ride_auto_submit_pr_true_to_pr_open() {
         &[],
         Some(&ctx),
         &ws,
+        None,
         None,
         None,
     )

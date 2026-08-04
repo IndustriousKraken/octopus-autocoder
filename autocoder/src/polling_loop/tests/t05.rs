@@ -28,7 +28,7 @@ async fn cancellation_during_sleep_exits() {
     let ws = dir.path().join("ws");
     std::fs::create_dir_all(&ws).unwrap();
 
-    let repo = RepositoryConfig { forge: None,
+    let repo = RepositoryConfig { forge: None, app_under_test: None,
         url: "git@github.com:owner/empty.git".into(),
         local_path: Some(ws.clone()),
         base_branch: "main".into(),
@@ -179,6 +179,7 @@ async fn fork_pending_loop_breaks_on_permanent_reattempt() {
 
     let repo = RepositoryConfig {
         forge: None,
+        app_under_test: None,
         url: "git@github.com:orgA/a.git".into(),
         local_path: None,
         base_branch: "main".into(),
@@ -855,6 +856,7 @@ async fn stale_push_block_marker_is_cleared_and_pass_proceeds() {
             review_report: None,
             spec_verification_section: None,
             gate_verdicts_section: None,
+        e2e_section: None,
         },
     )
     .unwrap();
@@ -1054,6 +1056,7 @@ async fn issue_only_pass_hold_records_issue_slugs() {
         None,
         None,
         None,
+        None,
     );
 
     let marker = crate::push_block::read(&paths, &ws)
@@ -1079,6 +1082,7 @@ async fn issue_only_pass_hold_records_issue_slugs() {
         &[],
         &[],
         "reason".into(),
+        None,
         None,
         None,
         None,
@@ -1138,6 +1142,7 @@ async fn issue_only_push_hold_resume_skips_executor() {
             review_report: None,
             spec_verification_section: None,
             gate_verdicts_section: None,
+        e2e_section: None,
         },
     )
     .unwrap();
@@ -1228,6 +1233,7 @@ async fn pr_creation_hold_push_retry_failure_rewrites_failed_step_to_push() {
             review_report: None,
             spec_verification_section: None,
             gate_verdicts_section: None,
+        e2e_section: None,
         },
     )
     .unwrap();
@@ -1277,6 +1283,7 @@ async fn stale_pr_creation_marker_is_cleared_and_pass_proceeds() {
             review_report: None,
             spec_verification_section: None,
             gate_verdicts_section: None,
+        e2e_section: None,
         },
     )
     .unwrap();

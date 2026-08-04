@@ -298,7 +298,7 @@ async fn iteration_error_continues() {
     let executor_dyn: Arc<dyn Executor> = executor.clone();
     let invoked = executor.invoked.clone();
 
-    let repo = RepositoryConfig { forge: None,
+    let repo = RepositoryConfig { forge: None, app_under_test: None,
         url: "git@github.com:owner/fixture.git".into(),
         local_path: Some(ws.clone()),
         base_branch: "main".into(),

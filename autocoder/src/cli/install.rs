@@ -417,7 +417,26 @@ pub enum LoadState {
 #[async_trait]
 pub trait SystemActions: Send + Sync {
     async fn which(&self, command: &str) -> Option<PathBuf>;
-    async fn run_install_command(&self, cmd: &str, args: &[&str]) -> Result<InstallCommandOutcome>;
+    /// Run an install command with extra environment variables.
+    ///
+    /// The env-carrying form is the REQUIRED method (and
+    /// [`SystemActions::run_install_command`] delegates to it with an empty
+    /// set) because a provisioning step that silently dropped its environment
+    /// would still exit zero while doing the wrong thing — e.g. installing the
+    /// browser runtime into the service account's default user cache instead
+    /// of the daemon-owned path, leaving a "successful" install the daemon
+    /// cannot find.
+    async fn run_install_command_env(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Result<InstallCommandOutcome>;
+
+    /// Run an install command with no additional environment.
+    async fn run_install_command(&self, cmd: &str, args: &[&str]) -> Result<InstallCommandOutcome> {
+        self.run_install_command_env(cmd, args, &[]).await
+    }
     async fn create_user(&self, name: &str, home_dir: &Path, shell: &str) -> Result<()>;
     async fn chown(&self, path: &Path, owner: &str, group: &str) -> Result<()>;
     async fn chmod(&self, path: &Path, mode: u32) -> Result<()>;
@@ -444,9 +463,15 @@ impl SystemActions for RealSystemActions {
         if s.is_empty() { None } else { Some(PathBuf::from(s)) }
     }
 
-    async fn run_install_command(&self, cmd: &str, args: &[&str]) -> Result<InstallCommandOutcome> {
+    async fn run_install_command_env(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Result<InstallCommandOutcome> {
         let out = tokio::process::Command::new(cmd)
             .args(args)
+            .envs(env.iter().map(|(k, v)| (*k, *v)))
             .output()
             .await
             .with_context(|| format!("failed to run `{cmd}`"))?;
@@ -646,7 +671,7 @@ fn extract_config_arg(exec_start: &str) -> Option<PathBuf> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordedCall {
     Which(String),
-    RunSubprocess { cmd: String, args: Vec<String> },
+    RunSubprocess { cmd: String, args: Vec<String>, env: Vec<(String, String)> },
     CreateUser { name: String, home_dir: PathBuf, shell: String },
     Chown { path: PathBuf, owner: String, group: String },
     Chmod { path: PathBuf, mode: u32 },
@@ -662,11 +687,21 @@ pub struct RecordingActions {
     pub which_overrides: Mutex<std::collections::HashMap<String, Option<PathBuf>>>,
     pub apt_get_available: bool,
     pub probe_systemd_unit_responses: Mutex<HashMap<String, SystemdUnitProbe>>,
+    /// Exit status every recorded install command reports. Defaults to `0`;
+    /// set non-zero to exercise the failure paths (a provisioning step that
+    /// fails must be reported, never fatal).
+    pub install_status: Mutex<i32>,
 }
 
 impl RecordingActions {
     pub fn new() -> Self {
         Self::default()
+    }
+    /// Make every recorded install command report `status`, for the
+    /// failure-path tests.
+    pub fn with_install_status(self, status: i32) -> Self {
+        *self.install_status.lock().unwrap() = status;
+        self
     }
     pub fn with_which(self, command: &str, result: Option<PathBuf>) -> Self {
         self.which_overrides
@@ -710,12 +745,23 @@ impl SystemActions for RecordingActions {
         }
         None
     }
-    async fn run_install_command(&self, cmd: &str, args: &[&str]) -> Result<InstallCommandOutcome> {
+    async fn run_install_command_env(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Result<InstallCommandOutcome> {
         self.record(RecordedCall::RunSubprocess {
             cmd: cmd.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
+            env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         });
-        Ok(InstallCommandOutcome { status: 0, stdout: String::new(), stderr: String::new() })
+        let status = *self.install_status.lock().unwrap();
+        Ok(InstallCommandOutcome {
+            status,
+            stdout: String::new(),
+            stderr: if status == 0 { String::new() } else { "simulated failure".to_string() },
+        })
     }
     async fn create_user(&self, name: &str, home_dir: &Path, shell: &str) -> Result<()> {
         self.record(RecordedCall::CreateUser {
@@ -1865,6 +1911,30 @@ pub(crate) async fn execute_inner(
         actions.chown(&secrets_path, "autocoder", "autocoder").await?;
     }
 
+    // app-under-test-e2e: offer to provision the end-to-end browser runtime.
+    // Placed AFTER the config is written because the browser location is
+    // derived from the resolved cache directory, which only exists once
+    // `paths:` (dev mode) or the systemd unit's CacheDirectory (server mode)
+    // is settled. Declining leaves end-to-end verification simply
+    // unprovisioned; the install completes either way, and the dependency
+    // preflight warns per declaring repository at startup.
+    match crate::paths::resolve_daemon_paths(&cfg) {
+        Ok(paths) => {
+            if let Err(e) = crate::cli::e2e_provision::provision_e2e_toolchain(
+                io,
+                actions,
+                &paths.e2e_browsers_dir(),
+                if mode == InstallMode::Server { Some("autocoder") } else { None },
+                args.non_interactive,
+            )
+            .await
+            {
+                eprintln!("WARN: end-to-end provisioning could not run: {e}");
+            }
+        }
+        Err(e) => eprintln!("WARN: skipping end-to-end provisioning (paths unresolved): {e}"),
+    }
+
     // Canonical-spec RAG (a21): if the operator chose the docker
     // quick-start path AND a wired ollama compose file ships with the
     // binary, copy it to the config dir AND print the operator's next
@@ -2497,7 +2567,7 @@ mod tests {
         execute_inner(args, &mut io, &actions, tmp.path().to_path_buf()).await.unwrap();
         let calls = actions.calls();
         let saw_claude_install = calls.iter().any(|c| {
-            matches!(c, RecordedCall::RunSubprocess { cmd, args }
+            matches!(c, RecordedCall::RunSubprocess { cmd, args, .. }
                 if cmd == "bash" && args.iter().any(|a| a.contains("claude.ai/install.sh")))
         });
         assert!(
@@ -2529,7 +2599,7 @@ mod tests {
             .calls()
             .into_iter()
             .filter_map(|c| match c {
-                RecordedCall::RunSubprocess { cmd, args } if cmd == "apt-get" => {
+                RecordedCall::RunSubprocess { cmd, args, .. } if cmd == "apt-get" => {
                     Some(args.join(" "))
                 }
                 _ => None,
@@ -3343,6 +3413,24 @@ ExecStart={ argv[]=/usr/local/bin/autocoder run --config --verbose ; ignore_erro
             msg.contains("audits") && msg.contains("reviewer") && msg.contains("chatops"),
             "clap usage error should list valid values: {msg}"
         );
+        // app-under-test-e2e: the provisioning section joins the allowlist.
+        assert!(msg.contains("e2e"), "e2e is an offered section: {msg}");
+    }
+
+    /// app-under-test-e2e: `--reconfigure e2e` is accepted by clap, so an
+    /// existing deployment can adopt end-to-end verification without a
+    /// reinstall or hand-run package commands.
+    #[test]
+    fn reconfigure_accepts_e2e_section() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct Wrapper {
+            #[command(flatten)]
+            inst: InstallArgs,
+        }
+        let parsed = Wrapper::try_parse_from(["test", "--reconfigure", "e2e"])
+            .expect("clap accepts the e2e section");
+        assert_eq!(parsed.inst.reconfigure, Some(ReconfigureSection::E2e));
     }
 
     #[test]

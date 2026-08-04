@@ -211,7 +211,7 @@ async fn run_standalone(paths: &crate::paths::DaemonPaths, workspace: &Path, aud
 }
 
 fn fake_repo_for_workspace(workspace: &Path) -> RepositoryConfig {
-    RepositoryConfig { forge: None,
+    RepositoryConfig { forge: None, app_under_test: None,
         url: "standalone://audit-run".to_string(),
         local_path: Some(workspace.to_path_buf()),
         base_branch: "main".to_string(),
