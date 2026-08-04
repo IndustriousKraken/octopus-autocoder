@@ -591,7 +591,8 @@ mod tests {
             "guide must state scenarios are verified by an executed test, not prose"
         );
         assert!(
-            OCTOPUS_MD.contains("expected") && OCTOPUS_MD.contains("FAIL there"),
+            OCTOPUS_MD.contains("replayed against the pre-change tree")
+                && OCTOPUS_MD.contains("FAIL there"),
             "guide must state a new e2e test is replayed against the pre-change tree \
              AND expected to fail there"
         );

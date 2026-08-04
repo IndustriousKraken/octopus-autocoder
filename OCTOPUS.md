@@ -141,6 +141,29 @@ running the daemon via the check-only install. A gate that reports it
 resolvable rule corpus) is an environment/config condition, not a spec defect —
 fix the config, not the change.
 
+## End-to-end verification (when this repository is configured for it)
+
+A repository MAY be configured so that autocoder verifies a change by RUNNING
+the application, not only by reading the diff. This is per-repository operator
+configuration held outside the repository, so you cannot enable it from in here
+— and where it is absent, nothing else in this guide changes.
+
+Where it IS configured:
+
+- Behavior described by your scenarios is expected to be verified by an
+  end-to-end test that actually exercises it, NOT asserted in prose. A feature
+  that is implemented but never wired to the interface passes a reading of the
+  diff and fails a run of the application.
+- The end-to-end command's EXIT CODE is the authoritative signal. Screenshots
+  and captured output are debugging aids, never the pass/fail verdict.
+- A new end-to-end test is replayed against the pre-change tree AND is expected
+  to FAIL there. A test that passes without your change is not evidence that
+  your change works, and is reported rather than accepted.
+
+Write scenarios you could hand to someone as a script to run. `WHEN the user
+submits the form THEN a confirmation appears` is verifiable by an executed
+test; `the form is wired correctly` is not.
+
 ## Further reading
 
 For the fuller OpenSpec documentation, see https://github.com/Fission-AI/OpenSpec.
